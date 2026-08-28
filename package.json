@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "scripts": {
     "build": "tsc",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
     "watch": "tsc -w",
-    "test": "jest",
+    "test": "jest --runInBand",
     "cdk": "cdk"
   },
   "devDependencies": {

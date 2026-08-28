@@ -1,16 +1,25 @@
 import * as cdk from 'aws-cdk-lib/core';
 import { Construct } from 'constructs';
-// import * as sqs from 'aws-cdk-lib/aws-sqs';
+
+export interface AqwCharRenderingInfraStackProps extends cdk.StackProps {
+  readonly stageName: string;
+}
 
 export class AqwCharRenderingInfraStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: AqwCharRenderingInfraStackProps) {
     super(scope, id, props);
 
-    // The code that defines your stack goes here
+    // Resources are intentionally added in reviewed implementation phases.
+    // Keeping the initial stack empty lets us validate account targeting and
+    // synthesis without creating chargeable AWS resources.
+    new cdk.CfnOutput(this, 'DeploymentEnvironment', {
+      description: 'Environment represented by this stack',
+      value: props.stageName,
+    });
 
-    // example resource
-    // const queue = new sqs.Queue(this, 'AqwCharRenderingInfraQueue', {
-    //   visibilityTimeout: cdk.Duration.seconds(300)
-    // });
+    cdk.Validations.of(this).acknowledge({
+      id: 'CloudFormation-Validate::F0001',
+      reason: 'The initial scaffold intentionally has no deployable resources yet.',
+    });
   }
 }

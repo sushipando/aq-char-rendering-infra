@@ -6,3 +6,19 @@ node_modules
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Python / uv
+.venv
+.python-version.local
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local configuration and generated rendering data
+.env
+.env.*
+!.env.example
+render_outputs/
+jobs/
