@@ -597,28 +597,22 @@ def prepare_export_source(
         parts: list[dict[str, Any]] = []
         archive_bytes = 0
         batch_size = config.batch_size
+        # One archive per (source, chunk ordinal) containing every symbol of
+        # this source, so a batch worker fetches ~1 GET per source instead of
+        # ~1 GET per symbol. Entries are namespaced <symbol>/<frame>.svg.
+        frame_count = int(prepared["export_frame_count"])
+        chunk_count = max(1, (frame_count + batch_size - 1) // batch_size)
+        bundle_paths: dict[int, Path] = {}
+        for ordinal in range(chunk_count):
+            bundle_paths[ordinal] = archive_directory / f"source.{ordinal}.tar.gz"
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
-            # Each batch worker only consumes its own frame range plus the
-            # overlap frame, so split each symbol into per-batch archives:
-            # a probe/raster worker then downloads a few hundred KB instead
-            # of the whole 100+ MiB corpus.
-            chunked: dict[int, str] = {}
-            for batch_index in range(0, len(frames), batch_size):
-                chunk = frames[batch_index:batch_index + batch_size]
-                archive_path = archive_directory / f"{symbol.key}.{len(chunked)}.tar.gz"
-                with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
-                    for index, path in enumerate(chunk, start=batch_index + 1):
-                        archive.add(path, arcname=f"{index:06d}.svg")
-                archive_bytes += archive_path.stat().st_size
-                archive_key = f"jobs/{job_id}/prepare/parts/{symbol.key}.{len(chunked)}.tar.gz"
-                store.upload_file(
-                    archive_path,
-                    config.work_bucket,
-                    archive_key,
-                    content_type="application/gzip",
-                )
-                chunked[batch_index // batch_size] = archive_key
+            for ordinal in range(chunk_count):
+                start = ordinal * batch_size
+                chunk = frames[start:start + batch_size]
+                with tarfile.open(bundle_paths[ordinal], "w:gz", compresslevel=1) as archive:
+                    for index, path in enumerate(chunk, start=start + 1):
+                        archive.add(path, arcname=f"{symbol.key}/{index:06d}.svg")
             # Keep a full per-symbol archive so the finish phase can rebuild
             # every frame for loop detection and the shared viewbox.
             full_path = archive_directory / f"{symbol.key}.full.tar.gz"
@@ -632,12 +626,29 @@ def prepare_export_source(
                 full_key,
                 content_type="application/gzip",
             )
+
+        # Upload the per-source bundles.
+        source_bundles: dict[str, str] = {}
+        for ordinal, bundle_path in sorted(bundle_paths.items()):
+            archive_bytes += bundle_path.stat().st_size
+            bundle_key = f"jobs/{job_id}/prepare/source-bundles/{source_idx}.{ordinal}.tar.gz"
+            store.upload_file(
+                bundle_path,
+                config.work_bucket,
+                bundle_key,
+                content_type="application/gzip",
+            )
+            source_bundles[str(ordinal)] = bundle_key
+        for symbol in sorted(requests, key=lambda item: item.key):
+            frames = exported[symbol.key]
             parts.append(
                 {
                     "key": symbol.key,
                     "root_class": symbol.class_name,
                     "character_id": symbol.character_id,
-                    "archive_key": full_key,
+                    "archive_key": (
+                        f"jobs/{job_id}/prepare/parts/{symbol.key}.full.tar.gz"
+                    ),
                     "frame_count": len(frames),
                 }
             )
@@ -728,6 +739,7 @@ def prepare_finish(
                 )
                 raw_exports[part["key"]] = frames
                 part_manifest[part["key"]] = {
+                    "source_idx": int(result["source_idx"]),
                     "root_class": part["root_class"],
                     "character_id": part["character_id"],
                     "archive_key": part["archive_key"],
@@ -848,6 +860,21 @@ def prepare_finish(
             "aliases": dict(sorted(prepared["aliases"].items())),
             "weapon_type": prepared["weapon_type"],
             "parts": part_manifest,
+            # Reconstruct the per-source bundle keys deterministically instead
+            # of shipping ~5000 entries through Step Functions state.
+            "source_bundles": {
+                str(int(result["source_idx"])): {
+                    str(ordinal): (
+                        f"jobs/{request.job_id}/prepare/source-bundles/"
+                        f"{int(result['source_idx'])}.{ordinal}.tar.gz"
+                    )
+                    for ordinal in range(
+                        (int(prepared["export_frame_count"]) + config.batch_size - 1)
+                        // config.batch_size
+                    )
+                }
+                for result in export_key_to_result.values()
+            },
             "all_color_rules": sorted(all_color_rules),
             "settings": request.render.to_dict(),
             "batches": batches,

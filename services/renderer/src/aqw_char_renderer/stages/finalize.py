@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import tarfile
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,6 +14,12 @@ from PIL import Image
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.hashing import file_sha256
+
+
+def _extract_archive(archive_path: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(target, filter="data")
 
 
 class StageStore(Protocol):
@@ -38,12 +45,14 @@ def _ordered_frames(
     *,
     store: StageStore,
     config: RuntimeConfig,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     by_number: dict[int, dict[str, Any]] = {}
+    batches: list[dict[str, Any]] = []
     for result in render_results:
         batch = store.read_json(config.work_bucket, result["batch_manifest_key"])
         if batch.get("job_id") != job_id:
             raise character_svg.CharacterSvgError("Render batch manifest belongs to another job")
+        batches.append(batch)
         for frame in batch["frames"]:
             number = int(frame["frame"])
             if number in by_number:
@@ -56,7 +65,7 @@ def _ordered_frames(
     canvases = {(int(frame["canvas_width"]), int(frame["canvas_height"])) for frame in frames}
     if len(canvases) != 1:
         raise character_svg.CharacterSvgError("Encoded frames do not share one canvas")
-    return frames
+    return frames, batches
 
 
 def _validate_animation(
@@ -94,7 +103,9 @@ def finalize_job(
     if prepared.get("job_id") != job_id:
         raise character_svg.CharacterSvgError("Prepare manifest belongs to another job")
     frame_count = int(prepared["frame_count"])
-    frames = _ordered_frames(job_id, frame_count, render_results, store=store, config=config)
+    frames, batch_manifests = _ordered_frames(
+        job_id, frame_count, render_results, store=store, config=config
+    )
     canvas = (int(frames[0]["canvas_width"]), int(frames[0]["canvas_height"]))
     final_key = str(prepared["final_key"])
     cached = (
@@ -118,14 +129,32 @@ def finalize_job(
     with tempfile.TemporaryDirectory(prefix=f"aqw-finalize-{job_id}-") as temporary:
         root = Path(temporary)
         local_frames: list[tuple[Path, dict[str, Any]]] = []
-        for frame in frames:
-            path = store.download(
+        # Download each render batch's WebP bundle once (one GET per batch)
+        # instead of one GET per frame; fall back to per-frame keys for
+        # legacy manifests written without a bundle.
+        for batch in batch_manifests:
+            bundle_key = batch.get("webp_bundle_key")
+            group = [frame for frame in batch["frames"]]
+            if not bundle_key:
+                for frame in group:
+                    path = store.download(
+                        config.work_bucket,
+                        frame["webp_key"],
+                        root / "frames" / f"{int(frame['frame']):06d}.webp",
+                        expected_sha256=frame["sha256"],
+                    )
+                    local_frames.append((path, frame))
+                continue
+            bundle_path = store.download(
                 config.work_bucket,
-                frame["webp_key"],
-                root / "frames" / f"{int(frame['frame']):06d}.webp",
-                expected_sha256=frame["sha256"],
+                bundle_key,
+                root / "bundles" / f"batch-{int(batch['batch']):04d}.tar.gz",
             )
-            local_frames.append((path, frame))
+            extract_dir = root / "extracted" / f"batch-{int(batch['batch']):04d}"
+            _extract_archive(bundle_path, extract_dir)
+            for frame in group:
+                path = extract_dir / f"{int(frame['frame']):06d}.webp"
+                local_frames.append((path, frame))
         output = root / "result.webp"
         command = [config.webpmux]
         for path, frame in local_frames:

@@ -188,7 +188,7 @@ def test_finalizer_orders_batches_and_rejects_duplicates() -> None:
             },
         }
     )
-    ordered = _ordered_frames(
+    ordered, _batches = _ordered_frames(
         "job",
         2,
         [{"batch_manifest_key": "batch-1"}, {"batch_manifest_key": "batch-0"}],

@@ -187,56 +187,64 @@ def render_batch(
                     return zero_based + 1
                 return frame_number
 
+            # Per-source bundles: collect every (source_idx, ordinal) this
+            # batch needs, download each bundle once, extract all symbols.
+            needed_pairs: set[tuple[int, int]] = set()
             for key, part in prepared["parts"].items():
-                needed_frames = set()
-                for output_frame in range(frame_start, frame_end + 1):
-                    needed_frames.add(source_frame_for(key, output_frame))
-                # Chunks are (symbol x batch) at batch_size; resolve the
-                # ordinals that contain the needed source frames plus the
-                # overlap frame.
-                needed_ordinals = {
-                    (source_frame - 1) // config.batch_size
-                    for source_frame in needed_frames
-                    if source_frame >= 1
-                }
-                part_roots[key] = root / "parts" / key
-                batch_archives = part.get("batch_archives") or {}
-                if not batch_archives:
-                    download_started = time.perf_counter()
-                    archive_path = store.download(
-                        config.work_bucket,
-                        part["archive_key"],
-                        root / "archives" / f"{key}.full.tar.gz",
-                    )
-                    timings["archive_download_ms"] += (
-                        time.perf_counter() - download_started
-                    ) * 1000
-                    archive_bytes += archive_path.stat().st_size
-                    extract_started = time.perf_counter()
-                    _extract_archive(archive_path, part_roots[key])
-                    timings["archive_extract_ms"] += (
-                        time.perf_counter() - extract_started
-                    ) * 1000
+                source_idx = int(part.get("source_idx", 0))
+                source_bundles = (prepared.get("source_bundles") or {}).get(str(source_idx), {})
+                if not source_bundles:
                     continue
-                for ordinal in sorted(needed_ordinals):
-                    scoped = batch_archives.get(str(ordinal))
-                    archive_key = scoped or part["archive_key"]
-                    suffix = str(ordinal) if scoped else "full"
-                    download_started = time.perf_counter()
-                    archive_path = store.download(
-                        config.work_bucket,
-                        archive_key,
-                        root / "archives" / f"{key}.{suffix}.tar.gz",
-                    )
-                    timings["archive_download_ms"] += (
-                        time.perf_counter() - download_started
-                    ) * 1000
-                    archive_bytes += archive_path.stat().st_size
-                    extract_started = time.perf_counter()
-                    _extract_archive(archive_path, part_roots[key])
-                    timings["archive_extract_ms"] += (
-                        time.perf_counter() - extract_started
-                    ) * 1000
+                for output_frame in range(frame_start, frame_end + 1):
+                    source_frame = source_frame_for(key, output_frame)
+                    if source_frame >= 1:
+                        needed_pairs.add(
+                            (source_idx, (source_frame - 1) // config.batch_size)
+                        )
+            for source_idx, ordinal in sorted(needed_pairs):
+                source_bundles = (prepared.get("source_bundles") or {}).get(
+                    str(source_idx), {}
+                )
+                scoped = source_bundles.get(str(ordinal))
+                if not scoped:
+                    continue
+                download_started = time.perf_counter()
+                archive_path = store.download(
+                    config.work_bucket,
+                    scoped,
+                    root / "archives" / f"source-{source_idx}-{ordinal}.tar.gz",
+                )
+                timings["archive_download_ms"] += (
+                    time.perf_counter() - download_started
+                ) * 1000
+                archive_bytes += archive_path.stat().st_size
+                extract_started = time.perf_counter()
+                _extract_archive(archive_path, root / "parts" / f"src{source_idx}")
+                timings["archive_extract_ms"] += (
+                    time.perf_counter() - extract_started
+                ) * 1000
+            for key, part in prepared["parts"].items():
+                source_idx = int(part.get("source_idx", 0))
+                part_roots[key] = root / "parts" / f"src{source_idx}" / key
+            # Fallback for legacy manifests without bundles: fetch the full
+            # per-symbol archive once.
+            for key, part in prepared["parts"].items():
+                if part_roots[key].is_dir() and any(part_roots[key].glob("*.svg")):
+                    continue
+                download_started = time.perf_counter()
+                archive_path = store.download(
+                    config.work_bucket,
+                    part["archive_key"],
+                    root / "archives" / f"{key}.full.tar.gz",
+                )
+                timings["archive_download_ms"] += (
+                    time.perf_counter() - download_started
+                ) * 1000
+                extract_started = time.perf_counter()
+                _extract_archive(archive_path, part_roots[key])
+                timings["archive_extract_ms"] += (
+                    time.perf_counter() - extract_started
+                ) * 1000
 
             def compose_frame(frame_number: int) -> Path:
                 imported: dict[str, character_svg.ImportedSymbol] = {}
@@ -406,6 +414,20 @@ def render_batch(
                 )
 
             batch_manifest_key = f"jobs/{job_id}/render/batch-{batch_index:04d}.json"
+            # Bundle the batch's encoded WebPs into one archive so finalize
+            # does one GET per batch instead of N serial frame GETs.
+            bundle_path = root / "webp" / f"{job_id}.{batch_index}.tar.gz"
+            with tarfile.open(bundle_path, "w:gz", compresslevel=1) as archive:
+                for frame in records:
+                    frame_path = root / "webp" / f"{frame['frame']:06d}.webp"
+                    archive.add(frame_path, arcname=f"{frame['frame']:06d}.webp")
+            bundle_key = f"jobs/{job_id}/webp-batches/{batch_index:04d}.tar.gz"
+            store.upload_file(
+                bundle_path,
+                config.work_bucket,
+                bundle_key,
+                content_type="application/gzip",
+            )
             manifest_write_started = time.perf_counter()
             store.write_json(
                 config.work_bucket,
@@ -415,6 +437,7 @@ def render_batch(
                     "job_id": job_id,
                     "batch": batch_index,
                     "frames": records,
+                    "webp_bundle_key": bundle_key,
                     "warnings": all_warnings,
                 },
             )
