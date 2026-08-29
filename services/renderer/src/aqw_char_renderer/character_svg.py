@@ -1148,6 +1148,47 @@ def detect_complete_loop_frame_count(
     return math.lcm(*periods) if periods else 1
 
 
+def symbol_loop_info(
+    exports: Mapping[str, Sequence[Path]],
+    *,
+    max_frames: int,
+    validation_frames: int = LOOP_VALIDATION_FRAMES,
+) -> dict[str, dict[str, int | str | None]]:
+    """Per-symbol loop geometry to diagnose which item caps a render.
+
+    For each exported symbol key, report the detected repeat period (or None
+    when it never repeats within the scan window), the number of distinct
+    exported states observed, and a compact pattern preview (state ids like
+    "0,1,2,1,2") so operators can see how the timeline moves.
+    """
+    info: dict[str, dict[str, int | str | None]] = {}
+    for key, paths in sorted(exports.items()):
+        pattern = frame_state_pattern(paths)
+        unique = len(set(pattern))
+        period: int | None = None
+        search_limit = min(max_frames, len(pattern) - 1)
+        if search_limit >= 1:
+            period = next(
+                (
+                    candidate
+                    for candidate in range(1, search_limit + 1)
+                    if len(pattern) - candidate >= min(validation_frames, candidate)
+                    and all(
+                        pattern[index] == pattern[index % candidate]
+                        for index in range(candidate, len(pattern))
+                    )
+                ),
+                None,
+            )
+        preview = ",".join(str(value) for value in pattern[:24])
+        info[key] = {
+            "period": period,
+            "unique_states": unique,
+            "preview": preview,
+        }
+    return info
+
+
 def detect_blink_frame_count(
     exports: Mapping[str, Sequence[Path]],
     *,

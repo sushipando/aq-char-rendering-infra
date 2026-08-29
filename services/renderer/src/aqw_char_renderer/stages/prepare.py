@@ -615,9 +615,15 @@ def prepare_job(
                 detected_item_loop, detected_blink_frames
             ) if detected_item_loop is not None and detected_blink_frames is not None else None
             loop_capped = frame_count < natural_loop if natural_loop is not None else True
+            symbol_loops = character_svg.symbol_loop_info(
+                raw_exports,
+                max_frames=request.render.max_frames,
+                validation_frames=character_svg.LOOP_VALIDATION_FRAMES,
+            )
         else:
             natural_loop = None
             loop_capped = False
+            symbol_loops = {}
         log_event(
             "prepare_profile",
             job_id=request.job_id,
@@ -627,6 +633,7 @@ def prepare_job(
             detected_blink_frames=detected_blink_frames,
             natural_loop=natural_loop,
             loop_capped=loop_capped,
+            symbol_loops=symbol_loops,
             symbol_count=len(requests),
             source_count=len(source_records),
             archive_bytes=archive_total_bytes,

@@ -397,6 +397,30 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
                 )
             )
 
+    def test_symbol_loop_info_reports_per_key_period_and_states(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exports: dict[str, list[Path]] = {"two": [], "static": []}
+            for frame_index in range(8):
+                for key, body in (
+                    ("two", str(frame_index % 2)),
+                    ("static", "x"),
+                ):
+                    path = root / f"{key}-{frame_index}.svg"
+                    path.write_text(body, encoding="utf-8")
+                    exports[key].append(path)
+
+            info = character_svg.symbol_loop_info(
+                exports,
+                max_frames=4,
+                validation_frames=4,
+            )
+            self.assertEqual(info["two"]["period"], 2)
+            self.assertEqual(info["two"]["unique_states"], 2)
+            self.assertIsInstance(info["two"]["preview"], str)
+            self.assertEqual(info["static"]["period"], 1)
+            self.assertEqual(info["static"]["unique_states"], 1)
+
     def test_combined_loop_can_exceed_per_timeline_scan_cap(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
