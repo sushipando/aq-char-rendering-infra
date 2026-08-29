@@ -21,6 +21,7 @@ from PIL import Image
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.hashing import file_sha256
+from aqw_char_renderer.legacy import render_swf_items as item_renderer
 from aqw_char_renderer.structured_logging import log_event
 
 
@@ -100,7 +101,17 @@ def render_batch(
     batch: dict[str, int],
     store: StageStore,
     config: RuntimeConfig,
+    mode: str = "raster",
+    store_viewbox_key: str | None = None,
 ) -> dict[str, Any]:
+    """Render one batch.
+
+    mode="probe" composes each frame, computes its tight visible viewbox via
+    a low-res alpha probe, uploads the composed SVG, and records per-frame
+    tight bounds. mode="raster" downloads the composed SVGs, applies the
+    globally fitted canvas from the manifest, rasterizes once, and delta-
+    encodes the WebP frames.
+    """
     batch_started = time.perf_counter()
     timings: dict[str, float] = {
         "manifest_ms": 0.0,
@@ -125,7 +136,17 @@ def render_batch(
             f"Invalid render batch {frame_start}-{frame_end} for {frame_count} frames"
         )
     layers = character_svg.build_layers(prepared["aliases"], weapon_type=prepared["weapon_type"])
-    viewbox = tuple(float(value) for value in prepared["viewbox"])
+    if mode == "raster" and store_viewbox_key:
+        fitted = store.read_json(
+            config.work_bucket, store_viewbox_key
+        )
+        if fitted.get("job_id") != job_id:
+            raise character_svg.CharacterSvgError(
+                "Fitted canvas belongs to another job"
+            )
+        viewbox = tuple(float(value) for value in fitted["viewbox"])
+    else:
+        viewbox = tuple(float(value) for value in prepared["viewbox"])
     if len(viewbox) != 4:
         raise character_svg.CharacterSvgError("Prepare manifest has no usable shared viewbox")
     settings = prepared["settings"]
@@ -220,74 +241,131 @@ def render_batch(
         # frame of the batch can delta against its predecessor.
         pngs: dict[int, Path] = {}
         first_needed = frame_start - 1 if frame_start > 1 else frame_start
+        svg_cache: dict[int, Path] = {}
+        frame_bounds: dict[int, tuple[float, float, float, float]] = {}
         for frame_number in range(first_needed, frame_end + 1):
-            compose_started = time.perf_counter()
-            svg = compose_frame(frame_number)
-            timings["compose_ms"] += (time.perf_counter() - compose_started) * 1000
-            png = root / "png" / f"{frame_number:06d}.png"
-            rasterize_started = time.perf_counter()
-            _rasterize(
-                svg,
-                png,
-                viewbox=viewbox,  # type: ignore[arg-type]
-                max_size=max_size,
-                rsvg_convert=config.rsvg_convert,
-            )
-            timings["rasterize_ms"] += (time.perf_counter() - rasterize_started) * 1000
-            pngs[frame_number] = png
+            if mode == "probe":
+                compose_started = time.perf_counter()
+                svg = compose_frame(frame_number)
+                timings["compose_ms"] += (time.perf_counter() - compose_started) * 1000
+                # Probe the composed SVG to get the tight visible bounds.
+                tight = item_renderer.detect_svg_visible_viewbox(
+                    svg, config.rsvg_convert, probe_size=max(1024, max_size * 2)
+                )
+                # Fall back to the prepare-time vector canvas if the probe
+                # fails for this frame; FitCanvas unions across frames anyway.
+                frame_bounds[frame_number] = tight if tight is not None else viewbox
+                # Upload the composed SVG so the raster phase reuses it.
+                svg_key = f"jobs/{job_id}/svg/{frame_number:06d}.svg"
+                store.upload_file(
+                    svg, config.work_bucket, svg_key, content_type="image/svg+xml"
+                )
+                svg_cache[frame_number] = svg
+            else:
+                svg_key = f"jobs/{job_id}/svg/{frame_number:06d}.svg"
+                store.download(
+                    config.work_bucket,
+                    svg_key,
+                    root / "svg" / f"{frame_number:06d}.svg",
+                )
+                svg_cache[frame_number] = root / "svg" / f"{frame_number:06d}.svg"
 
-        canvas_size: tuple[int, int] | None = None
-        for frame_number in range(frame_start, frame_end + 1):
-            encoded = root / "webp" / f"{frame_number:06d}.webp"
-            encoded.parent.mkdir(parents=True, exist_ok=True)
-            encode_started = time.perf_counter()
-            x, y, width, height, frame_canvas = _encode_frame(
-                pngs[frame_number],
-                pngs.get(frame_number - 1),
-                encoded,
-                quality=float(settings["webp_quality"]),
-                method=int(settings["webp_method"]),
-                cwebp=config.cwebp,
-            )
-            timings["encode_ms"] += (time.perf_counter() - encode_started) * 1000
-            if canvas_size is None:
-                canvas_size = frame_canvas
-            elif frame_canvas != canvas_size:
-                raise character_svg.CharacterSvgError("Raster frames do not share one canvas")
-            output_key = f"jobs/{job_id}/webp-frames/{frame_number:06d}.webp"
-            upload_started = time.perf_counter()
-            store.upload_file(encoded, config.work_bucket, output_key, content_type="image/webp")
-            timings["upload_ms"] += (time.perf_counter() - upload_started) * 1000
-            records.append(
+        if mode == "probe":
+            # Record per-frame tight bounds; raster phase will consume them.
+            batch_manifest_key = f"jobs/{job_id}/probe/batch-{batch_index:04d}.json"
+            manifest_write_started = time.perf_counter()
+            store.write_json(
+                config.work_bucket,
+                batch_manifest_key,
                 {
-                    "frame": frame_number,
-                    "webp_key": output_key,
-                    "x": x,
-                    "y": y,
-                    "width": width,
-                    "height": height,
-                    "canvas_width": frame_canvas[0],
-                    "canvas_height": frame_canvas[1],
-                    "duration": durations[frame_number - 1],
-                    "sha256": file_sha256(encoded),
-                    "bytes": encoded.stat().st_size,
-                }
+                    "schema_version": 1,
+                    "job_id": job_id,
+                    "batch": batch_index,
+                    "frames": [
+                        {"frame": n, "bounds": list(frame_bounds[n])}
+                        for n in sorted(frame_bounds)
+                    ],
+                    "warnings": all_warnings,
+                },
             )
+            timings["manifest_write_ms"] = (
+                time.perf_counter() - manifest_write_started
+            ) * 1000
+        else:
+            # Rasterize each frame at the fitted (tight) canvas.
+            for frame_number in range(first_needed, frame_end + 1):
+                png = root / "png" / f"{frame_number:06d}.png"
+                rasterize_started = time.perf_counter()
+                _rasterize(
+                    svg_cache[frame_number],
+                    png,
+                    viewbox=viewbox,  # type: ignore[arg-type]
+                    max_size=max_size,
+                    rsvg_convert=config.rsvg_convert,
+                )
+                timings["rasterize_ms"] += (
+                    time.perf_counter() - rasterize_started
+                ) * 1000
+                pngs[frame_number] = png
 
-    batch_manifest_key = f"jobs/{job_id}/render/batch-{batch_index:04d}.json"
-    manifest_write_started = time.perf_counter()
-    store.write_json(
-        config.work_bucket,
-        batch_manifest_key,
-        {
-            "schema_version": 1,
-            "job_id": job_id,
-            "batch": batch_index,
-            "frames": records,
-            "warnings": all_warnings,
-        },
-    )
-    timings["manifest_write_ms"] = (time.perf_counter() - manifest_write_started) * 1000
+            canvas_size: tuple[int, int] | None = None
+            for frame_number in range(frame_start, frame_end + 1):
+                encoded = root / "webp" / f"{frame_number:06d}.webp"
+                encoded.parent.mkdir(parents=True, exist_ok=True)
+                encode_started = time.perf_counter()
+                x, y, width, height, frame_canvas = _encode_frame(
+                    pngs[frame_number],
+                    pngs.get(frame_number - 1),
+                    encoded,
+                    quality=float(settings["webp_quality"]),
+                    method=int(settings["webp_method"]),
+                    cwebp=config.cwebp,
+                )
+                timings["encode_ms"] += (time.perf_counter() - encode_started) * 1000
+                if canvas_size is None:
+                    canvas_size = frame_canvas
+                elif frame_canvas != canvas_size:
+                    raise character_svg.CharacterSvgError(
+                        "Raster frames do not share one canvas"
+                    )
+                output_key = f"jobs/{job_id}/webp-frames/{frame_number:06d}.webp"
+                upload_started = time.perf_counter()
+                store.upload_file(
+                    encoded, config.work_bucket, output_key, content_type="image/webp"
+                )
+                timings["upload_ms"] += (time.perf_counter() - upload_started) * 1000
+                records.append(
+                    {
+                        "frame": frame_number,
+                        "webp_key": output_key,
+                        "x": x,
+                        "y": y,
+                        "width": width,
+                        "height": height,
+                        "canvas_width": frame_canvas[0],
+                        "canvas_height": frame_canvas[1],
+                        "duration": durations[frame_number - 1],
+                        "sha256": file_sha256(encoded),
+                        "bytes": encoded.stat().st_size,
+                    }
+                )
+
+            batch_manifest_key = f"jobs/{job_id}/render/batch-{batch_index:04d}.json"
+            manifest_write_started = time.perf_counter()
+            store.write_json(
+                config.work_bucket,
+                batch_manifest_key,
+                {
+                    "schema_version": 1,
+                    "job_id": job_id,
+                    "batch": batch_index,
+                    "frames": records,
+                    "warnings": all_warnings,
+                },
+            )
+            timings["manifest_write_ms"] = (
+                time.perf_counter() - manifest_write_started
+            ) * 1000
 
     total_ms = (time.perf_counter() - batch_started) * 1000
     frames_rendered = frame_end - first_needed + 1
@@ -296,6 +374,7 @@ def render_batch(
         "render_batch_profile",
         job_id=job_id,
         batch=batch_index,
+        mode=mode,
         frame_start=frame_start,
         frame_end=frame_end,
         frames_rendered=frames_rendered,
@@ -311,4 +390,5 @@ def render_batch(
         "job_id": job_id,
         "batch": batch_index,
         "batch_manifest_key": batch_manifest_key,
+        "mode": mode,
     }

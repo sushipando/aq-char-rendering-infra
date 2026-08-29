@@ -42,6 +42,7 @@ export interface InfrastructureTuning {
     launcher: FunctionTuning;
     prepare: FunctionTuning;
     render: FunctionTuning;
+    fit: FunctionTuning;
     finalizer: FunctionTuning;
     complete: FunctionTuning;
     cleanup: FunctionTuning;
@@ -76,6 +77,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // This new AWS account currently enforces a 3008 MiB Lambda memory cap.
     prepare: mib(3008, 4096, 900),
     render: mib(3008, 4096, 900),
+    fit: mib(1024, 1024, 120),
     finalizer: mib(3008, 4096, 300),
     complete: mib(512, 512, 60),
     cleanup: mib(512, 512, 60),

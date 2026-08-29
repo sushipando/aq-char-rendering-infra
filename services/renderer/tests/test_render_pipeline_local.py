@@ -157,12 +157,42 @@ def test_render_then_finalize_produces_valid_animation() -> None:
         )
         config = pipeline_config()
 
+        # Phase 1: probe tight per-frame bounds.
+        probe = render_batch(
+            job_id=job_id,
+            manifest_key=manifest_key,
+            batch={"index": 0, "frame_start": 1, "frame_end": frame_count},
+            store=store,
+            config=config,
+            mode="probe",
+        )
+        probe_manifest = store.read_json("work", probe["batch_manifest_key"])
+        assert {frame["frame"] for frame in probe_manifest["frames"]} == {1, 2, 3}
+        tight_bounds = [frame["bounds"] for frame in probe_manifest["frames"]]
+        # Probing a mostly-empty synthetic frame yields a small bounds box.
+        for bounds in tight_bounds:
+            assert bounds[2] > 0 and bounds[3] > 0
+
+        # Phase 2: fit the global canvas.
+        from aqw_char_renderer.stages.fit import fit_canvas
+
+        fit = fit_canvas(
+            job_id=job_id,
+            manifest_key=manifest_key,
+            probe_results=[probe],
+            store=store,
+            config=config,
+        )
+
+        # Phase 3: rasterize at the fitted canvas and encode.
         result = render_batch(
             job_id=job_id,
             manifest_key=manifest_key,
             batch={"index": 0, "frame_start": 1, "frame_end": frame_count},
             store=store,
             config=config,
+            mode="raster",
+            store_viewbox_key=fit["fitted_canvas_key"],
         )
         batch_manifest = store.read_json("work", result["batch_manifest_key"])
         assert [frame["frame"] for frame in batch_manifest["frames"]] == [1, 2, 3]
