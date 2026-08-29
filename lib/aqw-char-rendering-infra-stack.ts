@@ -291,7 +291,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       ),
       CHAR_RENDER_CACHE_ENABLED: String(tuning.render.renderCacheEnabled),
       CHAR_RENDER_FFDEC_PATH: '/opt/ffdec/ffdec-cli.jar',
-      CHAR_RENDER_RSVG_CONVERT: '/usr/bin/rsvg-convert',
+      CHAR_RENDER_RSVG_CONVERT: '/opt/resvg/resvg',
       CHAR_RENDER_CWEBP: '/opt/libwebp/bin/cwebp',
       CHAR_RENDER_WEBPMUX: '/opt/libwebp/bin/webpmux',
     };

@@ -145,8 +145,13 @@ const ROOT_TUNING: InfrastructureTuning = {
   },
   render: {
     ...DEV_TUNING.render,
-    frameBatchSize: 30,
-    mapConcurrency: 12,
+    // Small batches + high concurrency is the correct way to exploit the
+    // 400-slot ceiling: a 360-frame job becomes 90 batches of 4, each ~16s,
+    // all in one wave, so the Map wall approaches the single-batch time
+    // instead of a fixed 120s+ chunk. (On the 10-slot dev account this just
+    // contends; it only works because root has headroom.)
+    frameBatchSize: 4,
+    mapConcurrency: 90,
     renderCacheEnabled: false,
   },
 };

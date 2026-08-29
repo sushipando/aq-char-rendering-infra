@@ -1039,6 +1039,37 @@ def alpha_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
     return img.convert("RGBA").getchannel("A").getbbox()
 
 
+def _render_svg_with_resvg(
+    svg_path: Path,
+    output_path: Path,
+    maximum: int,
+    resvg: str,
+) -> tuple[int, int] | None:
+    """Rasterize with resvg (single static binary, much faster than librsvg).
+
+    Passes the dominant dimension to resvg exactly like the rsvg-convert
+    invocation. resvg fits the full viewBox into that bound, so no content is
+    clipped; the only difference from rsvg-convert is a possible 1px rounding
+    of the derived dimension, which is consistent across every frame of a job
+    (the shared viewbox is fixed), so delta-cropping remains aligned.
+    """
+    viewbox = svg_canvas_viewbox(svg_path)
+    if viewbox is None or maximum < 1:
+        return None
+    _, _, width, height = viewbox
+    if width <= 0 or height <= 0:
+        return None
+    size_flag = "--width" if width >= height else "--height"
+    command = [resvg, size_flag, str(maximum), str(svg_path), str(output_path)]
+    try:
+        subprocess.run(command, check=True, capture_output=True, timeout=120)
+        with Image.open(output_path) as rendered:
+            rendered.load()
+            return rendered.size
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def render_svg_to_maximum(
     svg_path: Path,
     output_path: Path,
@@ -1051,7 +1082,11 @@ def render_svg_to_maximum(
     When ``square_canvas_size`` is supplied, the tightly framed SVG is placed
     directly on a centered transparent square output page. This changes only
     the PNG framing; callers can still retain the original tight SVG.
+
+    Dispatches to resvg when the configured binary is resvg.
     """
+    if Path(rsvg_convert).name.startswith("resvg"):
+        return _render_svg_with_resvg(svg_path, output_path, maximum, rsvg_convert)
     viewbox = svg_canvas_viewbox(svg_path)
     if viewbox is None or maximum < 1:
         return None
