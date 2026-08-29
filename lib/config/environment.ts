@@ -139,9 +139,12 @@ const ROOT_TUNING: InfrastructureTuning = {
   ...DEV_TUNING,
   functions: {
     ...DEV_TUNING.functions,
-    // 400 slots are available, so reserve a generous render pool and let the
-    // serial stages share the rest.
-    render: { memoryMiB: 3008, ephemeralStorageMiB: 4096, timeoutSeconds: 900, reservedConcurrency: 100 },
+    // More memory = more vCPU (Lambda scales CPU by memory). The serial
+    // prepare FFDec export is CPU-bound, so give it ~3 vCPU; render workers
+    // get ~3 vCPU each to speed up the per-frame rasterize. Root has no
+    // 3008 MiB cap.
+    prepare: { memoryMiB: 5308, ephemeralStorageMiB: 4096, timeoutSeconds: 900 },
+    render: { memoryMiB: 5308, ephemeralStorageMiB: 4096, timeoutSeconds: 900, reservedConcurrency: 100 },
   },
   render: {
     ...DEV_TUNING.render,
