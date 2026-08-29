@@ -83,9 +83,9 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
-    // v4: shared canvas now comes from vector bounds computed in Prepare
-    // (the compose-stage alpha probe rasterization was removed).
-    rendererVersion: 'v4',
+    // v5: restore authored PlaceObject colors and blink-aligned loops from
+    // the aq-image-search port, so v4 cache entries are invalidated.
+    rendererVersion: 'v5',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
