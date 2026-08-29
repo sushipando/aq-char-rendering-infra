@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import tarfile
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
+
+from botocore.exceptions import ClientError
 
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.batching import partition_frames
@@ -20,6 +24,8 @@ from aqw_char_renderer.hashing import canonical_sha256, render_key
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
 from aqw_char_renderer.legacy import render_swf_items as item_renderer
 from aqw_char_renderer.source_assets import SourceAssetCatalog, SourceObject
+from aqw_char_renderer.storage import StorageError
+from aqw_char_renderer.structured_logging import log_event
 
 
 class StageStore(Protocol):
@@ -195,6 +201,55 @@ def _override(
     return {synthetic.casefold(): source}, {source: source_record}
 
 
+def _source_color_rules(
+    source: Path,
+    record: SourceObject,
+    *,
+    store: StageStore,
+    config: RuntimeConfig,
+    scripts_root: Path,
+) -> dict[str, tuple[str, str]]:
+    """Color rules for one source SWF, cached by content hash.
+
+    Rules are a pure function of the SWF bytes, so computing them once per
+    source SHA-256 and reusing across jobs removes a serial FFDec ActionScript
+    export (~2s each) from every repeat render.
+    """
+    cache_key = f"color-rules/{record.sha256}.json"
+    cached: dict[str, tuple[str, str]] | None = None
+    try:
+        payload = store.read_json(config.work_bucket, cache_key)
+        cached = {name: tuple(rule) for name, rule in payload.items()}
+    except ClientError as error:
+        # NoSuchKey is a normal cache miss; anything else means we cannot
+        # trust the cache and must recompute.
+        if error.response.get("Error", {}).get("Code") not in {"NoSuchKey", "NoSuchBucket", "404"}:
+            log_event(
+                "color_rules_cache_read_failed",
+                key=cache_key,
+                error=str(error),
+            )
+    except (StorageError, KeyError, json.JSONDecodeError, OSError) as error:
+        log_event("color_rules_cache_corrupt", key=cache_key, error=str(error))
+    if cached is not None:
+        return cached
+    computed = character_svg.parse_color_scripts(
+        source,
+        ffdec=config.ffdec_path,
+        destination=scripts_root,
+    )
+    try:
+        store.write_json(
+            config.work_bucket,
+            cache_key,
+            {k: list(v) for k, v in computed.items()},
+        )
+    except (StorageError, ClientError, OSError) as error:
+        # A failed cache write must never fail the render.
+        log_event("color_rules_cache_write_failed", key=cache_key, error=str(error))
+    return computed
+
+
 def prepare_job(
     request: JobRequest,
     *,
@@ -204,8 +259,16 @@ def prepare_job(
     work_root: Path | None = None,
 ) -> dict[str, Any]:
     """Execute the expensive serial preparation stage for one job."""
+    job_started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def mark(name: str, started: float) -> None:
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - started) * 1000
+
+    phase = time.perf_counter()
     manifest_payload = store.read_json(config.source_bucket, config.asset_manifest_key)
     catalog = SourceAssetCatalog(manifest_payload)
+    mark("manifest_read_ms", phase)
     if catalog.dataset_version != config.asset_dataset_version:
         raise character_svg.CharacterSvgError(
             "Configured asset dataset does not match its source manifest"
@@ -219,6 +282,7 @@ def prepare_job(
         root = work_root
         root.mkdir(parents=True, exist_ok=True)
     try:
+        phase = time.perf_counter()
         fields = (
             {str(key): str(value) for key, value in flashvars.items()}
             if flashvars is not None
@@ -226,14 +290,17 @@ def prepare_job(
         )
         if request.render.show_hidden:
             fields["ia1"] = str(character_svg._visibility_flags(fields) & ~0b111)
+        mark("flashvars_ms", phase)
 
         asset_root = root / "assets"
+        phase = time.perf_counter()
         database = store.download(
             config.source_bucket,
             catalog.item_database.key,
             root / "item_db.json",
             expected_sha256=catalog.item_database.sha256,
         )
+        mark("item_db_download_ms", phase)
         explicit, source_records = _override(
             request, fields, catalog, store, config, asset_root, database
         )
@@ -241,6 +308,7 @@ def prepare_job(
             fields, use_cosmetics=not request.render.base_items
         )
         sources: dict[str, Path] = {}
+        phase = time.perf_counter()
         for slot, asset in assets.items():
             source = explicit.get(asset.remote_path.casefold())
             if source is None:
@@ -254,7 +322,9 @@ def prepare_job(
                 )
                 source_records[source] = record
             sources[slot] = source
+        mark("asset_download_ms", phase)
 
+        phase = time.perf_counter()
         character_renderer = store.download(
             config.source_bucket,
             catalog.character_renderer.key,
@@ -270,6 +340,7 @@ def prepare_job(
             character_renderer=character_renderer,
             gender=gender,
         )
+        mark("renderer_download_and_symbol_ms", phase)
         weapon_type = assets.get(
             "weapon", character_svg.AppearanceAsset("", "", "", "Sword")
         ).weapon_type
@@ -344,6 +415,7 @@ def prepare_job(
             if request.render.complete_loop
             else 1
         )
+        phase = time.perf_counter()
         raw_exports = character_svg.export_requested_symbol_frames(
             requests,
             ffdec=config.ffdec_path,
@@ -352,9 +424,11 @@ def prepare_job(
             subframe_start=request.render.subframe_start,
             frame_count=export_frame_count,
         )
+        mark("ffdec_export_ms", phase)
         detected_loop: int | None = None
         ignored_loop_keys: tuple[str, ...] = ()
         if request.render.complete_loop:
+            phase = time.perf_counter()
             loop_exports, ignored_loop_keys = character_svg.loop_driver_exports(raw_exports)
             detected_loop = character_svg.detect_complete_loop_frame_count(
                 loop_exports, max_frames=request.render.max_frames
@@ -366,17 +440,27 @@ def prepare_job(
             )
             if detected_loop is None:
                 warnings.append("At least one nested timeline did not repeat within the frame cap")
+            mark("loop_detection_ms", phase)
         else:
             frame_count = 1
 
-        rules_by_source: dict[Path, dict[str, tuple[str, str]]] = {}
-        for source in sorted({symbol.source for symbol in requests}):
-            rules_by_source[source] = character_svg.parse_color_scripts(
+        phase = time.perf_counter()
+        # Serial execution is correct and cheap here: nearly every source hits
+        # the color-rules cache, so no real FFDec work remains to parallelize.
+        unique_sources = sorted({symbol.source for symbol in requests})
+        rules_by_source = {
+            source: _source_color_rules(
                 source,
-                ffdec=config.ffdec_path,
-                destination=root / "scripts",
+                source_records[source],
+                store=store,
+                config=config,
+                scripts_root=root / "scripts" / source.name,
             )
+            for source in unique_sources
+        }
+        mark("color_scripts_ms", phase)
 
+        phase = time.perf_counter()
         layers = character_svg.build_layers(aliases, weapon_type=weapon_type)
         viewbox = shared_viewbox(
             layers,
@@ -387,6 +471,7 @@ def prepare_job(
             max_size=request.render.max_size,
             padding=request.render.padding,
         )
+        mark("viewbox_ms", phase)
 
         # Upload one compressed archive per symbol part instead of one object
         # per frame: downstream workers fetch a handful of archives rather
@@ -394,19 +479,28 @@ def prepare_job(
         archive_directory = root / "archives"
         archive_directory.mkdir(parents=True, exist_ok=True)
         part_manifest: dict[str, Any] = {}
+        archive_total_bytes = 0
         for symbol in requests:
+            phase = time.perf_counter()
             frames = raw_exports[symbol.key][:frame_count]
             archive_path = archive_directory / f"{symbol.key}.tar.gz"
-            with tarfile.open(archive_path, "w:gz") as archive:
+            # Level 1 gzip is several times faster than the default (6) and
+            # these archives are transient (downloaded once per worker), so
+            # compression time matters more than ratio here.
+            with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
                 for index, path in enumerate(frames, start=1):
                     archive.add(path, arcname=f"{index:06d}.svg")
+            archive_total_bytes += archive_path.stat().st_size
+            mark("archive_create_ms", phase)
             archive_key = f"jobs/{request.job_id}/prepare/parts/{symbol.key}.tar.gz"
+            phase = time.perf_counter()
             store.upload_file(
                 archive_path,
                 config.work_bucket,
                 archive_key,
                 content_type="application/gzip",
             )
+            mark("archive_upload_ms", phase)
             part_manifest[symbol.key] = {
                 "root_class": symbol.class_name,
                 "archive_key": archive_key,
@@ -455,7 +549,24 @@ def prepare_job(
                 for record in sorted(source_records.values(), key=lambda value: value.key)
             ],
         }
+        phase = time.perf_counter()
         store.write_json(config.work_bucket, manifest_key, manifest)
+        mark("manifest_write_ms", phase)
+
+        total_ms = (time.perf_counter() - job_started) * 1000
+        accounted = sum(timings.values())
+        log_event(
+            "prepare_profile",
+            job_id=request.job_id,
+            frame_count=frame_count,
+            export_frame_count=export_frame_count,
+            symbol_count=len(requests),
+            source_count=len(source_records),
+            archive_bytes=archive_total_bytes,
+            total_ms=round(total_ms, 1),
+            unaccounted_ms=round(total_ms - accounted, 1),
+            **{key: round(value, 1) for key, value in sorted(timings.items())},
+        )
         return {
             "schema_version": 1,
             "job_id": request.job_id,

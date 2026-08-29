@@ -727,10 +727,12 @@ def export_requested_symbol_frames(
     for request in requests:
         grouped[request.source].append(request)
     exported: dict[str, list[Path]] = {}
-    ffdec_home = destination / ".ffdec-home"
     subframe_end = subframe_start + frame_count - 1
 
     for index, (source, group) in enumerate(grouped.items()):
+        # Each source gets its own FFDec home so a stray pre-existing home
+        # directory never leaks mutable JVM state between exports.
+        ffdec_home = destination / f".ffdec-home-{index:02d}"
         output = destination / f"asset_{index:02d}"
         selected_ids = ",".join(str(request.character_id) for request in group)
         selected_frames = ",".join(
