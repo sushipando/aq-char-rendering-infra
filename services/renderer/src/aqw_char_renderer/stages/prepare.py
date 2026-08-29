@@ -605,11 +605,28 @@ def prepare_job(
 
         total_ms = (time.perf_counter() - job_started) * 1000
         accounted = sum(timings.values())
+        # Report the uncapped loop geometry so operators can see how much the
+        # frame cap truncated a render. detected_item_loop is the raw repeating
+        # item period; detected_blink_frames is the one-shot blink span; the
+        # aligned loop is either the natural full loop or None when the items
+        # never repeat within the scan window.
+        if request.render.complete_loop:
+            natural_loop = character_svg.aligned_animation_frame_count(
+                detected_item_loop, detected_blink_frames
+            ) if detected_item_loop is not None and detected_blink_frames is not None else None
+            loop_capped = frame_count < natural_loop if natural_loop is not None else True
+        else:
+            natural_loop = None
+            loop_capped = False
         log_event(
             "prepare_profile",
             job_id=request.job_id,
             frame_count=frame_count,
             export_frame_count=export_frame_count,
+            detected_item_loop=detected_item_loop,
+            detected_blink_frames=detected_blink_frames,
+            natural_loop=natural_loop,
+            loop_capped=loop_capped,
             symbol_count=len(requests),
             source_count=len(source_records),
             archive_bytes=archive_total_bytes,
