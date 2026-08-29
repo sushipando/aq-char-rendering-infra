@@ -238,7 +238,9 @@ def render_batch(
             return output
 
         # Compose and rasterize one extra leading frame so the first encoded
-        # frame of the batch can delta against its predecessor.
+        # frame of the batch can delta against its predecessor. The overlap
+        # frame is never reported for bounds (it belongs to the previous
+        # batch), but it IS uploaded so the raster phase can delta against it.
         pngs: dict[int, Path] = {}
         first_needed = frame_start - 1 if frame_start > 1 else frame_start
         svg_cache: dict[int, Path] = {}
@@ -254,7 +256,10 @@ def render_batch(
                 )
                 # Fall back to the prepare-time vector canvas if the probe
                 # fails for this frame; FitCanvas unions across frames anyway.
-                frame_bounds[frame_number] = tight if tight is not None else viewbox
+                if frame_number >= frame_start:
+                    frame_bounds[frame_number] = (
+                        tight if tight is not None else viewbox
+                    )
                 # Upload the composed SVG so the raster phase reuses it.
                 svg_key = f"jobs/{job_id}/svg/{frame_number:06d}.svg"
                 store.upload_file(

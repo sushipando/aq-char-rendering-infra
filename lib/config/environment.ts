@@ -85,9 +85,9 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
-    // v5: restore authored PlaceObject colors and blink-aligned loops from
-    // the aq-image-search port, so v4 cache entries are invalidated.
-    rendererVersion: 'v5',
+    // v6: probe-fit-raster canvas tightening fills the output instead of the
+    // ~45%-of-width vector-bound canvas, so v5 cache entries are invalidated.
+    rendererVersion: 'v6',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
