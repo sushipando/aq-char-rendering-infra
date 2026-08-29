@@ -154,14 +154,40 @@ def render_batch(
             timings["archive_extract_ms"] += (time.perf_counter() - extract_started) * 1000
             part_roots[key] = target
 
+        # Blink timelines play once and then hold their final frame, so item
+        # loops (not the eye blink) drive the animation period.
+        detected_blink_frames = prepared.get("detected_blink_frames")
+        ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
+
+        def source_frame_for(key: str, frame_number: int) -> int:
+            if (
+                detected_blink_frames
+                and key in ignored_loop_keys
+                and detected_blink_frames > 0
+            ):
+                # one_shot_source_frame_index is 0-based; convert between the
+                # 1-based archive file names and the 0-based blink timeline.
+                zero_based = character_svg.one_shot_source_frame_index(
+                    frame_number - 1,
+                    one_shot_frames=detected_blink_frames,
+                )
+                return zero_based + 1
+            return frame_number
+
         def compose_frame(frame_number: int) -> Path:
             imported: dict[str, character_svg.ImportedSymbol] = {}
             for key, part in prepared["parts"].items():
-                raw_path = part_roots[key] / f"{frame_number:06d}.svg"
+                source_frame = source_frame_for(key, frame_number)
+                raw_path = part_roots[key] / f"{source_frame:06d}.svg"
                 if not raw_path.is_file():
                     raise character_svg.CharacterSvgError(
-                        f"Part archive for {key} is missing frame {frame_number}"
+                        f"Part archive for {key} is missing frame {source_frame}"
                     )
+                placement_colors = {
+                    tuple(int(component) for component in pair.split(",")):
+                    character_svg.AuthoredColorTransform(**values)
+                    for pair, values in part.get("placement_colors", {}).items()
+                }
                 imported[key] = character_svg.import_ffdec_symbol(
                     key,
                     raw_path,
@@ -170,6 +196,8 @@ def render_batch(
                         name: tuple(rule) for name, rule in part["color_rules"].items()
                     },
                     root_class=part["root_class"],
+                    placement_colors=placement_colors,
+                    root_character_id=part.get("character_id"),
                 )
             output = root / "svg" / f"{frame_number:06d}.svg"
             warnings = character_svg.compose_svg(

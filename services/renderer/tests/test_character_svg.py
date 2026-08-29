@@ -5,8 +5,8 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
-from unittest import mock
 from urllib.error import HTTPError
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 from PIL import Image
@@ -190,6 +190,70 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
             )
             self.assertEqual(imported.bounds, (0.0, 0.0, 0.0, 0.0))
             self.assertEqual(imported.definition.get("id"), "symbol_unarmed")
+
+    def test_import_restores_nested_authored_color_transform(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "part.svg"
+            source.write_text(
+                """<?xml version="1.0"?>
+                <svg xmlns="http://www.w3.org/2000/svg"
+                     xmlns:xlink="http://www.w3.org/1999/xlink"
+                     xmlns:ffdec="https://www.free-decompiler.com/flash"
+                     width="20px" height="10px">
+                  <g transform="matrix(1,0,0,1,0,0)">
+                    <use ffdec:characterId="31" xlink:href="#sprite0"/>
+                  </g>
+                  <defs>
+                    <g id="sprite0">
+                      <use ffdec:characterId="19" xlink:href="#shape0"/>
+                    </g>
+                    <g id="shape0"><rect width="2" height="3"/></g>
+                  </defs>
+                </svg>""",
+                encoding="utf-8",
+            )
+            black = character_svg.AuthoredColorTransform(
+                red_mult=0,
+                green_mult=0,
+                blue_mult=0,
+            )
+
+            imported = character_svg.import_ffdec_symbol(
+                "armor",
+                source,
+                zoom=1,
+                color_rules={},
+                root_class="Armor",
+                placement_colors={(31, 19): black},
+                root_character_id=32,
+            )
+
+            root = ET.Element("root")
+            root.extend(imported.definitions)
+            root.append(imported.definition)
+            authored_filters = [
+                element
+                for element in root.iter()
+                if element.tag.endswith("filter")
+                and "authored_cxform" in (element.get("id") or "")
+            ]
+            self.assertEqual(len(authored_filters), 1)
+            self.assertEqual(
+                next(iter(authored_filters[0])).get("values"),
+                "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0",
+            )
+            wrappers = [
+                element
+                for element in root.iter()
+                if "authored_cxform" in element.get("filter", "")
+            ]
+            self.assertEqual(len(wrappers), 1)
+            self.assertEqual(
+                next(iter(wrappers[0])).get(
+                    f"{{{character_svg.FFDEC_NS}}}characterId"
+                ),
+                "19",
+            )
 
     def test_multi_frame_export_selects_nested_svg_states(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -383,6 +447,23 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
                 ),
                 4,
             )
+            self.assertEqual(
+                character_svg.detect_blink_frame_count(
+                    exports,
+                    max_frames=4,
+                    validation_frames=4,
+                ),
+                3,
+            )
+
+    def test_one_blink_is_aligned_to_repeating_item_periods(self):
+        self.assertEqual(character_svg.aligned_animation_frame_count(1, 87), 87)
+        self.assertEqual(character_svg.aligned_animation_frame_count(10, 87), 90)
+        self.assertEqual(character_svg.aligned_animation_frame_count(40, 87), 120)
+        self.assertEqual(character_svg.one_shot_source_frame_index(0, one_shot_frames=87), 0)
+        self.assertEqual(character_svg.one_shot_source_frame_index(86, one_shot_frames=87), 86)
+        self.assertEqual(character_svg.one_shot_source_frame_index(87, one_shot_frames=87), 86)
+        self.assertEqual(character_svg.one_shot_source_frame_index(119, one_shot_frames=87), 86)
 
     def test_complete_loop_and_fixed_frames_are_mutually_exclusive(self):
         parser = character_svg.build_parser()
@@ -711,6 +792,33 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         self.assertEqual(character_svg.tint_rgb(0x123456, "Light"), (118, 152, 186))
         self.assertEqual(character_svg.tint_rgb(0x123456, "Dark"), (0, 2, 36))
         self.assertEqual(character_svg.tint_rgb(0x123456, "Darker"), (0, 0, 0))
+
+    def test_filters_use_exact_character_hair_eye_and_skin_colors(self):
+        defs = ET.Element(f"{{{character_svg.SVG_NS}}}defs")
+        warnings = character_svg.add_color_filters(
+            defs,
+            {("Hair", "None"), ("Eye", "None"), ("Skin", "None")},
+            {
+                "intColorHair": str(0x663300),
+                "intColorEye": str(0x663300),
+                "intColorSkin": str(0xE6BC93),
+            },
+        )
+        self.assertEqual(warnings, [])
+        matrices = {
+            element.get("id"): next(iter(element)).get("values")
+            for element in defs
+        }
+        self.assertEqual(
+            matrices["aqw_tint_hair_none"],
+            "0 0 0 0 0.4 0 0 0 0 0.2 0 0 0 0 0 0 0 0 1 0",
+        )
+        self.assertEqual(matrices["aqw_tint_eye_none"], matrices["aqw_tint_hair_none"])
+        self.assertEqual(
+            matrices["aqw_tint_skin_none"],
+            "0 0 0 0 0.901960784 0 0 0 0 0.737254902 "
+            "0 0 0 0 0.576470588 0 0 0 1 0",
+        )
 
     def test_nested_flashvars_json_is_supported(self):
         with tempfile.TemporaryDirectory() as temporary:

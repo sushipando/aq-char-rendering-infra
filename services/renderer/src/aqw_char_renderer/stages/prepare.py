@@ -431,20 +431,35 @@ def prepare_job(
         )
         mark("ffdec_export_ms", phase)
         detected_loop: int | None = None
+        detected_item_loop: int | None = None
+        detected_blink_frames: int | None = None
         ignored_loop_keys: tuple[str, ...] = ()
         if request.render.complete_loop:
             phase = time.perf_counter()
             loop_exports, ignored_loop_keys = character_svg.loop_driver_exports(raw_exports)
-            detected_loop = character_svg.detect_complete_loop_frame_count(
+            detected_item_loop = character_svg.detect_complete_loop_frame_count(
                 loop_exports, max_frames=request.render.max_frames
             )
-            frame_count = (
-                min(detected_loop, request.render.max_frames)
-                if detected_loop
-                else request.render.max_frames
+            detected_blink_frames = character_svg.detect_blink_frame_count(
+                raw_exports,
+                max_frames=request.render.max_frames,
             )
-            if detected_loop is None:
-                warnings.append("At least one nested timeline did not repeat within the frame cap")
+            if detected_item_loop is not None and detected_blink_frames is not None:
+                detected_loop = character_svg.aligned_animation_frame_count(
+                    detected_item_loop,
+                    detected_blink_frames,
+                )
+                frame_count = min(detected_loop, request.render.max_frames)
+            else:
+                frame_count = request.render.max_frames
+            if detected_item_loop is None:
+                warnings.append(
+                    "At least one nested item timeline did not repeat within the frame cap"
+                )
+            if detected_blink_frames is None:
+                warnings.append(
+                    "The natural eye-blink timeline did not repeat within the frame cap"
+                )
             mark("loop_detection_ms", phase)
         else:
             frame_count = 1
@@ -483,6 +498,15 @@ def prepare_job(
         # than thousands of individual SVGs.
         archive_directory = root / "archives"
         archive_directory.mkdir(parents=True, exist_ok=True)
+        # FFDec SVG exports omit authored PlaceObject color transforms, which
+        # are what restore the exact character skin/eye/hair colors. Parse the
+        # SWF once per source and pass the mapping to the workers.
+        phase = time.perf_counter()
+        placement_colors_by_source = {
+            source: character_svg.authored_swf_color_transforms(source)
+            for source in sorted({symbol.source for symbol in requests})
+        }
+        mark("placement_colors_ms", phase)
         part_manifest: dict[str, Any] = {}
         archive_total_bytes = 0
         for symbol in requests:
@@ -506,13 +530,33 @@ def prepare_job(
                 content_type="application/gzip",
             )
             mark("archive_upload_ms", phase)
+            # Convert the (parent_id, child_id) integer keys to strings for
+            # JSON manifest transport.
+            placement = placement_colors_by_source.get(symbol.source, {})
             part_manifest[symbol.key] = {
                 "root_class": symbol.class_name,
+                "character_id": symbol.character_id,
                 "archive_key": archive_key,
                 "frame_count": len(frames),
                 "color_rules": {
                     key: list(value)
                     for key, value in sorted(rules_by_source.get(symbol.source, {}).items())
+                },
+                "placement_colors": {
+                    f"{parent_id},{child_id}": {
+                        field: getattr(transform, field)
+                        for field in (
+                            "red_mult",
+                            "green_mult",
+                            "blue_mult",
+                            "alpha_mult",
+                            "red_add",
+                            "green_add",
+                            "blue_add",
+                            "alpha_add",
+                        )
+                    }
+                    for (parent_id, child_id), transform in sorted(placement.items())
                 },
             }
 
@@ -543,6 +587,7 @@ def prepare_job(
             "batches": batches,
             "warnings": warnings,
             "detected_loop": detected_loop,
+            "detected_blink_frames": detected_blink_frames,
             "ignored_loop_keys": list(ignored_loop_keys),
             "sources": [
                 {

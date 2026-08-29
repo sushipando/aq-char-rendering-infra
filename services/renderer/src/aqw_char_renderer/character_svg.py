@@ -1,36 +1,3 @@
-#!/usr/bin/env python3
-"""Compose a complete AQW character as SVG without Flash/AIR.
-
-The official ``characterB.swf`` does not contain a single, exportable character
-symbol. At runtime it loads an armor library, inserts eleven separately exported
-body-part classes into fixed holders, then interleaves the cape, weapons, helm,
-and ground item in the display list. This script reproduces that assembly using
-FFDec SVG exports and the exact matrices from ``characterB.swf``.
-
-Unlike :mod:`pipeline.preview_aqw_tryon`, this renderer never executes AIR. It
-also handles AQW's common ``mcSetColor(this, location, shade)`` frame scripts by
-translating them into SVG color-matrix filters. Other ActionScript-driven
-animation or runtime effects remain static at the selected Ready/Idle frame.
-With ``--frames`` or ``--complete-loop``, FFDec advances nested item timelines
-while that character pose remains fixed, producing aligned SVG/PNG frames and
-an optional WebP.
-
-Example using a locally saved character response::
-
-    ./venv/bin/python pipeline/render_swf_character_svg.py Tdnq \
-      --flashvars-json bot/assets/tdnq_render/tdnq_flashvars.json \
-      --base-items \
-      --output render_outputs/character_svg/tdnq.svg \
-      --preview-png render_outputs/character_svg/tdnq.png
-
-One item can be overridden in the same way as the native try-on proof of
-concept::
-
-    ./venv/bin/python pipeline/render_swf_character_svg.py Tdnq \
-      --item-id 12345 \
-      --output render_outputs/character_svg/tdnq_tryon.svg
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -45,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -71,6 +39,7 @@ FFDEC_NS = item_renderer.FFDEC_NAMESPACE
 ET.register_namespace("", SVG_NS)
 ET.register_namespace("xlink", XLINK_NS)
 ET.register_namespace("ffdec", FFDEC_NS)
+
 
 Matrix = tuple[float, float, float, float, float, float]
 IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
@@ -201,6 +170,50 @@ class Layer:
     darken: bool = False
 
 
+@dataclass(frozen=True)
+class AuthoredColorTransform:
+    """One SWF placement color transform in Flash's integer units."""
+
+    red_mult: int = 256
+    green_mult: int = 256
+    blue_mult: int = 256
+    alpha_mult: int = 256
+    red_add: int = 0
+    green_add: int = 0
+    blue_add: int = 0
+    alpha_add: int = 0
+
+    def is_identity(self) -> bool:
+        return self == AuthoredColorTransform()
+
+
+class _SwfBitReader:
+    def __init__(self, data: bytes, byte_offset: int = 0) -> None:
+        self.data = data
+        self.bit_offset = byte_offset * 8
+
+    def unsigned(self, count: int) -> int:
+        if count < 0 or self.bit_offset + count > len(self.data) * 8:
+            raise ValueError("Truncated SWF bit field")
+        value = 0
+        for _ in range(count):
+            byte = self.data[self.bit_offset // 8]
+            shift = 7 - self.bit_offset % 8
+            value = (value << 1) | ((byte >> shift) & 1)
+            self.bit_offset += 1
+        return value
+
+    def signed(self, count: int) -> int:
+        value = self.unsigned(count)
+        if count and value & (1 << (count - 1)):
+            value -= 1 << count
+        return value
+
+    @property
+    def byte_offset(self) -> int:
+        return (self.bit_offset + 7) // 8
+
+
 def matrix_text(matrix: Matrix) -> str:
     return "matrix(" + " ".join(f"{value:.12g}" for value in matrix) + ")"
 
@@ -240,6 +253,209 @@ def parse_matrix(value: str | None) -> Matrix | None:
     if not all(math.isfinite(value) for value in values):
         return None
     return values  # type: ignore[return-value]
+
+
+def _skip_swf_matrix(data: bytes, offset: int) -> int:
+    bits = _SwfBitReader(data, offset)
+    if bits.unsigned(1):
+        count = bits.unsigned(5)
+        bits.signed(count)
+        bits.signed(count)
+    if bits.unsigned(1):
+        count = bits.unsigned(5)
+        bits.signed(count)
+        bits.signed(count)
+    count = bits.unsigned(5)
+    bits.signed(count)
+    bits.signed(count)
+    return bits.byte_offset
+
+
+def _read_swf_color_transform(
+    data: bytes,
+    offset: int,
+    *,
+    include_alpha: bool,
+) -> tuple[AuthoredColorTransform, int]:
+    bits = _SwfBitReader(data, offset)
+    has_add = bool(bits.unsigned(1))
+    has_mult = bool(bits.unsigned(1))
+    count = bits.unsigned(4)
+    channels = 4 if include_alpha else 3
+    multipliers = [bits.signed(count) for _ in range(channels)] if has_mult else [256] * channels
+    additions = [bits.signed(count) for _ in range(channels)] if has_add else [0] * channels
+    if not include_alpha:
+        multipliers.append(256)
+        additions.append(0)
+    return (
+        AuthoredColorTransform(
+            red_mult=multipliers[0],
+            green_mult=multipliers[1],
+            blue_mult=multipliers[2],
+            alpha_mult=multipliers[3],
+            red_add=additions[0],
+            green_add=additions[1],
+            blue_add=additions[2],
+            alpha_add=additions[3],
+        ),
+        bits.byte_offset,
+    )
+
+
+def _swf_tag_payloads(data: bytes, offset: int = 0) -> Iterable[tuple[int, bytes]]:
+    while offset + 2 <= len(data):
+        header = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+        tag_code = header >> 6
+        length = header & 0x3F
+        if length == 0x3F:
+            if offset + 4 > len(data):
+                return
+            length = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
+        end = offset + length
+        if end > len(data):
+            return
+        yield tag_code, data[offset:end]
+        offset = end
+        if tag_code == 0:
+            return
+
+
+def _cstring_end(data: bytes, offset: int) -> int:
+    end = data.find(b"\0", offset)
+    if end < 0:
+        raise ValueError("Truncated SWF string")
+    return end + 1
+
+
+def _swf_placement(
+    tag_code: int,
+    payload: bytes,
+) -> tuple[int, int | None, AuthoredColorTransform | None, bool] | None:
+    """Return depth, character id, explicit color transform, and move flag."""
+    try:
+        if tag_code == 4:  # PlaceObject
+            if len(payload) < 4:
+                return None
+            character_id, depth = struct.unpack_from("<HH", payload, 0)
+            offset = _skip_swf_matrix(payload, 4)
+            color = (
+                _read_swf_color_transform(payload, offset, include_alpha=False)[0]
+                if offset < len(payload)
+                else None
+            )
+            return depth, character_id, color, False
+
+        if tag_code == 26:  # PlaceObject2
+            if len(payload) < 3:
+                return None
+            flags = payload[0]
+            depth = struct.unpack_from("<H", payload, 1)[0]
+            offset = 3
+            character_id = None
+            if flags & 0x02:
+                if offset + 2 > len(payload):
+                    return None
+                character_id = struct.unpack_from("<H", payload, offset)[0]
+                offset += 2
+            if flags & 0x04:
+                offset = _skip_swf_matrix(payload, offset)
+            color = None
+            if flags & 0x08:
+                color, offset = _read_swf_color_transform(
+                    payload, offset, include_alpha=True
+                )
+            return depth, character_id, color, bool(flags & 0x01)
+
+        if tag_code in {70, 94}:  # PlaceObject3 / PlaceObject4
+            if len(payload) < 4:
+                return None
+            flags = payload[0]
+            flags2 = payload[1]
+            depth = struct.unpack_from("<H", payload, 2)[0]
+            offset = 4
+            has_character = bool(flags & 0x02)
+            has_image = bool(flags2 & 0x10)
+            if flags2 & 0x08 or (has_image and has_character):
+                offset = _cstring_end(payload, offset)
+            character_id = None
+            if has_character:
+                if offset + 2 > len(payload):
+                    return None
+                character_id = struct.unpack_from("<H", payload, offset)[0]
+                offset += 2
+            if flags & 0x04:
+                offset = _skip_swf_matrix(payload, offset)
+            color = None
+            if flags & 0x08:
+                color, offset = _read_swf_color_transform(
+                    payload, offset, include_alpha=True
+                )
+            return depth, character_id, color, bool(flags & 0x01)
+    except (IndexError, struct.error, ValueError):
+        return None
+    return None
+
+
+def authored_swf_color_transforms(
+    source: Path,
+) -> dict[tuple[int, int], AuthoredColorTransform]:
+    """Return unambiguous nested placement transforms omitted by FFDec SVG.
+
+    A mapping is emitted only when a parent/child pair has one authored color
+    transform across its timeline. Animated alpha/color changes are left to
+    FFDec's selected-frame exporter instead of guessing a state.
+    """
+    try:
+        data = tryon.decompressed_swf(source)
+    except (OSError, tryon.TryOnError):
+        return {}
+    if len(data) < 12:
+        return {}
+    rect_bits = 5 + 4 * (data[8] >> 3)
+    tags_offset = 8 + (rect_bits + 7) // 8 + 4
+    observed: dict[
+        tuple[int, int], set[AuthoredColorTransform]
+    ] = defaultdict(set)
+
+    for tag_code, payload in _swf_tag_payloads(data, tags_offset):
+        if tag_code != 39 or len(payload) < 4:  # DefineSprite
+            continue
+        parent_id = struct.unpack_from("<H", payload, 0)[0]
+        display_list: dict[int, int] = {}
+        for nested_code, nested_payload in _swf_tag_payloads(payload, 4):
+            placement = _swf_placement(nested_code, nested_payload)
+            if placement is not None:
+                depth, character_id, color, _move = placement
+                previous_id = display_list.get(depth)
+                effective_id = character_id if character_id is not None else previous_id
+                if effective_id is None:
+                    continue
+                if character_id is not None:
+                    display_list[depth] = character_id
+                    # A newly placed/replaced character without CXFORM starts
+                    # with the identity transform. A move-only update retains
+                    # the previous value when CXFORM is absent.
+                    if color is None:
+                        observed[(parent_id, character_id)].add(
+                            AuthoredColorTransform()
+                        )
+                if color is not None:
+                    observed[(parent_id, effective_id)].add(color)
+                continue
+            if nested_code == 5 and len(nested_payload) >= 4:  # RemoveObject
+                depth = struct.unpack_from("<H", nested_payload, 2)[0]
+                display_list.pop(depth, None)
+            elif nested_code == 28 and len(nested_payload) >= 2:  # RemoveObject2
+                depth = struct.unpack_from("<H", nested_payload, 0)[0]
+                display_list.pop(depth, None)
+
+    return {
+        pair: next(iter(transforms))
+        for pair, transforms in observed.items()
+        if len(transforms) == 1 and not next(iter(transforms)).is_identity()
+    }
 
 
 def swf_frame_rate(path: Path) -> float:
@@ -724,9 +940,8 @@ def export_requested_symbol_frames(
     """Export one or more nested timeline states for every requested symbol.
 
     With workers > 1, the per-source FFDec exports run concurrently. Each
-    source already uses an isolated FFDec home, so this is thread-safe.
-    Helpful when the caller has spare vCPU; on the ~1.7 vCPU dev cap it adds
-    little, but on 3+ vCPU it cuts the serial export roughly by source count.
+    source uses its own isolated FFDec home, so this is thread-safe. Helpful
+    when the caller has spare vCPU; on the ~1.7 vCPU dev cap it adds little.
     """
     if subframe_start < 1 or frame_count < 1:
         raise CharacterSvgError("Subframe start and frame count must be positive")
@@ -931,6 +1146,41 @@ def detect_complete_loop_frame_count(
             return None
         periods.append(symbol_period)
     return math.lcm(*periods) if periods else 1
+
+
+def detect_blink_frame_count(
+    exports: Mapping[str, Sequence[Path]],
+    *,
+    max_frames: int,
+    validation_frames: int = LOOP_VALIDATION_FRAMES,
+) -> int | None:
+    """Detect the armor-head cycle used as a one-shot natural blink."""
+    head_paths = exports.get("armor_head")
+    if head_paths is None:
+        return 1
+    return detect_complete_loop_frame_count(
+        {"armor_head": head_paths},
+        max_frames=max_frames,
+        validation_frames=validation_frames,
+    )
+
+
+def aligned_animation_frame_count(repeat_period: int, one_shot_frames: int) -> int:
+    """Round one one-shot span up to a complete repeating-item period."""
+    if repeat_period < 1 or one_shot_frames < 1:
+        raise CharacterSvgError("Animation periods must be positive")
+    return math.ceil(one_shot_frames / repeat_period) * repeat_period
+
+
+def one_shot_source_frame_index(
+    output_frame_index: int,
+    *,
+    one_shot_frames: int,
+) -> int:
+    """Freeze a one-shot timeline on its final frame instead of replaying it."""
+    if output_frame_index < 0 or one_shot_frames < 1:
+        raise CharacterSvgError("Animation frame indexes must be nonnegative")
+    return min(output_frame_index, one_shot_frames - 1)
 
 
 def parse_color_scripts(
@@ -1157,6 +1407,130 @@ def _apply_color_rules(
     visit(root)
 
 
+def _authored_color_filter_id(transform: AuthoredColorTransform) -> str:
+    values = (
+        transform.red_mult,
+        transform.green_mult,
+        transform.blue_mult,
+        transform.alpha_mult,
+        transform.red_add,
+        transform.green_add,
+        transform.blue_add,
+        transform.alpha_add,
+    )
+    digest = hashlib.sha1(",".join(map(str, values)).encode()).hexdigest()[:12]
+    return f"aqw_authored_cxform_{digest}"
+
+
+def _authored_color_filter(
+    filter_id: str,
+    transform: AuthoredColorTransform,
+) -> ET.Element:
+    multipliers = (
+        transform.red_mult / 256,
+        transform.green_mult / 256,
+        transform.blue_mult / 256,
+        transform.alpha_mult / 256,
+    )
+    additions = (
+        transform.red_add / 255,
+        transform.green_add / 255,
+        transform.blue_add / 255,
+        transform.alpha_add / 255,
+    )
+    values = (
+        f"{multipliers[0]:.12g} 0 0 0 {additions[0]:.12g} "
+        f"0 {multipliers[1]:.12g} 0 0 {additions[1]:.12g} "
+        f"0 0 {multipliers[2]:.12g} 0 {additions[2]:.12g} "
+        f"0 0 0 {multipliers[3]:.12g} {additions[3]:.12g}"
+    )
+    element = ET.Element(
+        f"{{{SVG_NS}}}filter",
+        {
+            "id": filter_id,
+            "x": "-100%",
+            "y": "-100%",
+            "width": "300%",
+            "height": "300%",
+            "color-interpolation-filters": "sRGB",
+        },
+    )
+    ET.SubElement(
+        element,
+        f"{{{SVG_NS}}}feColorMatrix",
+        {"type": "matrix", "values": values},
+    )
+    return element
+
+
+def _apply_authored_color_transforms(
+    root: ET.Element,
+    *,
+    root_frame: ET.Element,
+    root_character_id: int | None,
+    transforms: Mapping[tuple[int, int], AuthoredColorTransform],
+    definitions: list[ET.Element],
+) -> int:
+    """Restore nested PlaceObject CXFORMs that FFDec omits from SVG."""
+    if root_character_id is None or not transforms:
+        return 0
+    character_attr = f"{{{FFDEC_NS}}}characterId"
+    target_characters: dict[str, set[int]] = defaultdict(set)
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "use":
+            continue
+        raw_character = element.get(character_attr)
+        href = element.get(f"{{{XLINK_NS}}}href") or element.get("href")
+        if raw_character is None or not href or not href.startswith("#"):
+            continue
+        try:
+            target_characters[href[1:]].add(int(raw_character))
+        except ValueError:
+            continue
+    id_to_character = {
+        target: next(iter(characters))
+        for target, characters in target_characters.items()
+        if len(characters) == 1
+    }
+
+    filters: dict[AuthoredColorTransform, str] = {}
+    applied = 0
+    for parent in list(root.iter()):
+        parent_character = (
+            root_character_id
+            if parent is root_frame
+            else id_to_character.get(parent.get("id", ""))
+        )
+        if parent_character is None:
+            continue
+        for index, child in list(enumerate(list(parent))):
+            if child.tag.rsplit("}", 1)[-1] != "use":
+                continue
+            raw_character = child.get(character_attr)
+            if raw_character is None:
+                continue
+            try:
+                child_character = int(raw_character)
+            except ValueError:
+                continue
+            transform = transforms.get((parent_character, child_character))
+            if transform is None:
+                continue
+            filter_id = filters.get(transform)
+            if filter_id is None:
+                filter_id = _authored_color_filter_id(transform)
+                filters[transform] = filter_id
+                definitions.append(_authored_color_filter(filter_id, transform))
+            wrapper = ET.Element(
+                f"{{{SVG_NS}}}g", {"filter": f"url(#{filter_id})"}
+            )
+            parent.remove(child)
+            wrapper.append(child)
+            parent.insert(index, wrapper)
+            applied += 1
+    return applied
+
+
 def import_ffdec_symbol(
     key: str,
     source_svg: Path,
@@ -1164,6 +1538,10 @@ def import_ffdec_symbol(
     zoom: float,
     color_rules: Mapping[str, tuple[str, str]],
     root_class: str,
+    placement_colors: Mapping[
+        tuple[int, int], AuthoredColorTransform
+    ] | None = None,
+    root_character_id: int | None = None,
 ) -> ImportedSymbol:
     try:
         tree = ET.parse(source_svg)
@@ -1244,6 +1622,18 @@ def import_ffdec_symbol(
     for definition in definitions:
         temporary_root.append(definition)
     temporary_root.append(root_definition)
+    _apply_authored_color_transforms(
+        temporary_root,
+        root_frame=frame,
+        root_character_id=root_character_id,
+        transforms=placement_colors or {},
+        definitions=definitions,
+    )
+    # Newly created filter definitions were appended after temporary_root was
+    # assembled, so add just those definitions to the rewrite tree as well.
+    for definition in definitions:
+        if definition not in list(temporary_root):
+            temporary_root.insert(len(temporary_root) - 1, definition)
     _apply_color_rules(temporary_root, color_rules)
     _rewrite_references(temporary_root, f"part_{key}")
 
@@ -2308,6 +2698,8 @@ def run(args: argparse.Namespace) -> Path:
         else fixed_frame_count
     )
     detected_loop: int | None = None
+    detected_item_loop: int | None = None
+    detected_blink_frames: int | None = None
     ignored_loop_keys: tuple[str, ...] = ()
     frame_count = fixed_frame_count
     output_paths: list[Path] = []
@@ -2332,23 +2724,35 @@ def run(args: argparse.Namespace) -> Path:
         )
         if args.complete_loop:
             loop_exports, ignored_loop_keys = loop_driver_exports(raw_exports)
-            detected_loop = detect_complete_loop_frame_count(
+            detected_item_loop = detect_complete_loop_frame_count(
                 loop_exports,
                 max_frames=args.max_frames,
             )
-            frame_count = (
-                min(detected_loop, args.max_frames)
-                if detected_loop
-                else args.max_frames
+            detected_blink_frames = detect_blink_frame_count(
+                raw_exports,
+                max_frames=args.max_frames,
             )
-            if detected_loop is None:
+            if detected_item_loop is not None and detected_blink_frames is not None:
+                detected_loop = aligned_animation_frame_count(
+                    detected_item_loop,
+                    detected_blink_frames,
+                )
+                frame_count = min(detected_loop, args.max_frames)
+            else:
+                frame_count = args.max_frames
+            if detected_item_loop is None:
                 warnings.append(
                     "At least one nested timeline did not repeat within the "
                     f"{args.max_frames}-frame scan cap; the output is capped"
                 )
-            elif detected_loop > args.max_frames:
+            if detected_blink_frames is None:
                 warnings.append(
-                    f"The complete nested loop is {detected_loop} frames; "
+                    "The natural eye-blink timeline did not repeat within the "
+                    f"{args.max_frames}-frame scan cap; the output is capped"
+                )
+            elif detected_loop is not None and detected_loop > args.max_frames:
+                warnings.append(
+                    f"The blink-aligned item loop is {detected_loop} frames; "
                     f"the output is capped at {args.max_frames}"
                 )
         output_paths = numbered_output_paths(output, frame_count)
@@ -2371,13 +2775,17 @@ def run(args: argparse.Namespace) -> Path:
             else:
                 duration = detected_loop / character_rate
                 print(
-                    f"Complete nested loop: {detected_loop} frames at "
+                    f"Blink-aligned item loop: {detected_loop} frames at "
                     f"{character_rate:g} FPS ({duration:.3f} seconds)"
                     + (
                         f"; exceeds the {args.max_frames}-frame output cap."
                         if detected_loop > args.max_frames
                         else "."
                     )
+                )
+                print(
+                    f"Repeating item period: {detected_item_loop} frame(s); "
+                    f"one-shot blink span: {detected_blink_frames} frame(s)."
                 )
             if ignored_loop_keys:
                 print(
@@ -2386,9 +2794,13 @@ def run(args: argparse.Namespace) -> Path:
                     + "."
                 )
             return output_paths[0]
+        source_paths = sorted({request.source for request in requests})
+        placement_colors_by_source = {
+            source: authored_swf_color_transforms(source) for source in source_paths
+        }
         rules_by_source: dict[Path, dict[str, tuple[str, str]]] = {}
         if not args.no_color_customization:
-            for source in sorted({request.source for request in requests}):
+            for source in source_paths:
                 rules_by_source[source] = parse_color_scripts(
                     source,
                     ffdec=ffdec,
@@ -2417,12 +2829,26 @@ def run(args: argparse.Namespace) -> Path:
             imported: dict[str, ImportedSymbol] = {}
             for request in requests:
                 rules = rules_by_source.get(request.source, {})
+                source_frame_index = frame_index
+                if (
+                    args.complete_loop
+                    and detected_blink_frames is not None
+                    and request.key in ignored_loop_keys
+                ):
+                    source_frame_index = one_shot_source_frame_index(
+                        frame_index,
+                        one_shot_frames=detected_blink_frames,
+                    )
                 imported[request.key] = import_ffdec_symbol(
                     request.key,
-                    raw_exports[request.key][frame_index],
+                    raw_exports[request.key][source_frame_index],
                     zoom=args.zoom,
                     color_rules=rules,
                     root_class=request.class_name,
+                    placement_colors=placement_colors_by_source.get(
+                        request.source, {}
+                    ),
+                    root_character_id=request.character_id,
                 )
             if (
                 svg_override_path is not None
@@ -2561,7 +2987,7 @@ def run(args: argparse.Namespace) -> Path:
             else ""
         )
         + (
-            " (complete detected loop)"
+            " (one blink, complete item loop)"
             if detected_loop is not None and frame_count == detected_loop
             else ""
         )

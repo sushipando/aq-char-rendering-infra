@@ -201,6 +201,18 @@ def test_render_then_finalize_produces_valid_animation() -> None:
         assert cached["cache_hit"] is True
 
 
+def test_blink_source_frames_freeze_after_one_shot() -> None:
+    # The render stage freezes a one-shot blink timeline on its final frame
+    # so item loops (not the eye blink) drive the animation period. This
+    # locks in the 1-based archive name <-> 0-based blink index conversion.
+    blink_frames = 4
+    source = [
+        character_svg.one_shot_source_frame_index(n - 1, one_shot_frames=blink_frames) + 1
+        for n in range(1, 9)
+    ]
+    assert source == [1, 2, 3, 4, 4, 4, 4, 4]
+
+
 def test_render_batch_rejects_out_of_range_batches() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
