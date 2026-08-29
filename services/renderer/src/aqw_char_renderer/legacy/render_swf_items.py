@@ -1060,7 +1060,15 @@ def _render_svg_with_resvg(
     if width <= 0 or height <= 0:
         return None
     size_flag = "--width" if width >= height else "--height"
-    command = [resvg, size_flag, str(maximum), str(svg_path), str(output_path)]
+    command = [
+        resvg,
+        "--shape-rendering",
+        "crispEdges",
+        size_flag,
+        str(maximum),
+        str(svg_path),
+        str(output_path),
+    ]
     try:
         subprocess.run(command, check=True, capture_output=True, timeout=120)
         with Image.open(output_path) as rendered:
