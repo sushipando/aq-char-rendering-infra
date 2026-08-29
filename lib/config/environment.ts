@@ -94,16 +94,13 @@ const DEV_TUNING: InfrastructureTuning = {
     completeLoop: true,
     maxFrames: 360,
     subframeStart: 1,
-    frameBatchSize: 30,
-    // Account is hard-capped at 10 regional concurrent executions, all
-    // unreserved, and each 3008 MiB render worker gets only ~1.7 vCPU.
-    // Measured on 360-frame renders: mapConcurrency 4 -> 155s Map wall
-    // (2.3s/frame), 6 -> 362s (~6s/frame), 8 -> 356s. Above 4 the workers
-    // contend for CPU on the capped pool and each frame runs ~3x slower, so
-    // both wall time and billed compute get worse. 4 is the empirical
-    // optimum until the quota case (178797464300402) lifts the cap; only
-    // then raise this.
-    mapConcurrency: 4,
+    frameBatchSize: 4,
+    // Dev concurrency was raised 10 -> 1000 (case 178797464300402), so small
+    // batches in a single wave are now the fast path: a 360-frame job is 90
+    // batches of 4, all concurrent. Memory stays capped at 3008 MiB (~1.7
+    // vCPU) so per-frame speed is unchanged, but wall time drops ~6x. (This
+    // was previously 30/4 because 10 slots made >4 contend.)
+    mapConcurrency: 90,
     webpQuality: 85,
     webpMethod: 4,
     allowOfficialAssetFallback: true,
@@ -139,11 +136,11 @@ const ROOT_TUNING: InfrastructureTuning = {
   ...DEV_TUNING,
   functions: {
     ...DEV_TUNING.functions,
-    // More memory = more vCPU (Lambda scales CPU by memory). The serial
-    // prepare FFDec export is CPU-bound, so give it ~3 vCPU; render workers
-    // get ~3 vCPU each to speed up the per-frame rasterize. Root has no
-    // 3008 MiB cap.
-    prepare: { memoryMiB: 5308, ephemeralStorageMiB: 4096, timeoutSeconds: 900 },
+    // More memory = more vCPU (Lambda scales CPU by memory). Render workers
+    // get ~3 vCPU to speed up the per-frame rasterize. Prepare stays at 3008
+    // MiB because its FFDec export is dominated by a single source, so extra
+    // vCPU gave no measurable speedup (13.4s vs 13.1s) and just costs more.
+    prepare: { memoryMiB: 3008, ephemeralStorageMiB: 4096, timeoutSeconds: 900 },
     render: { memoryMiB: 5308, ephemeralStorageMiB: 4096, timeoutSeconds: 900, reservedConcurrency: 100 },
   },
   render: {

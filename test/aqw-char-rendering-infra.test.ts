@@ -12,8 +12,8 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     maxSize: 2048,
     completeLoop: true,
     maxFrames: 360,
-    frameBatchSize: 30,
-    mapConcurrency: 4,
+    frameBatchSize: 4,
+    mapConcurrency: 90,
     webpQuality: 85,
     allowOfficialAssetFallback: true,
   });
