@@ -76,6 +76,10 @@ class RuntimeConfig:
     default_webp_method: int = 4
     allow_official_asset_fallback: bool = True
     official_asset_timeout_seconds: int = 15
+    # When false, prepare/finalize skip the content-addressed render cache
+    # check so every job re-renders. Dev disables this to exercise the real
+    # pipeline; prod enables it for cost/latency deduplication.
+    render_cache_enabled: bool = True
     ffdec_path: Path = Path("/opt/ffdec/ffdec-cli.jar")
     rsvg_convert: str = "/usr/bin/rsvg-convert"
     cwebp: str = "/usr/bin/cwebp"
@@ -130,6 +134,7 @@ class RuntimeConfig:
             official_asset_timeout_seconds=_integer(
                 values, "CHAR_RENDER_OFFICIAL_ASSET_TIMEOUT_SECONDS", 15, 1, 60
             ),
+            render_cache_enabled=_boolean(values, "CHAR_RENDER_CACHE_ENABLED", True),
             ffdec_path=Path(values.get("CHAR_RENDER_FFDEC_PATH", "/opt/ffdec/ffdec-cli.jar")),
             rsvg_convert=values.get("CHAR_RENDER_RSVG_CONVERT", "/usr/bin/rsvg-convert"),
             cwebp=values.get("CHAR_RENDER_CWEBP", "/usr/bin/cwebp"),

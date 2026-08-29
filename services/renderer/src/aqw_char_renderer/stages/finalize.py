@@ -97,7 +97,11 @@ def finalize_job(
     frames = _ordered_frames(job_id, frame_count, render_results, store=store, config=config)
     canvas = (int(frames[0]["canvas_width"]), int(frames[0]["canvas_height"]))
     final_key = str(prepared["final_key"])
-    cached = store.exists(config.work_bucket, final_key)
+    cached = (
+        store.exists(config.work_bucket, final_key)
+        if config.render_cache_enabled
+        else None
+    )
     if cached is not None:
         return {
             "url": f"{config.public_base_url}/{final_key}",

@@ -314,7 +314,11 @@ def prepare_job(
             request.render.max_size,
             digest,
         )
-        cached = store.exists(config.work_bucket, final_key)
+        cached = (
+            store.exists(config.work_bucket, final_key)
+            if config.render_cache_enabled
+            else None
+        )
         if cached is not None:
             metadata = dict(cached.get("Metadata") or {})
             return {

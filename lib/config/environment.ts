@@ -22,6 +22,7 @@ export interface RenderTuning {
   readonly allowOfficialAssetFallback: boolean;
   readonly officialAssetTimeoutSeconds: number;
   readonly maxActivePerUser: number;
+  readonly renderCacheEnabled: boolean;
 }
 
 export interface RetentionTuning {
@@ -94,12 +95,22 @@ const DEV_TUNING: InfrastructureTuning = {
     maxFrames: 360,
     subframeStart: 1,
     frameBatchSize: 30,
+    // Measured: mapConcurrency 8 was SLOWER (356s Map wall) than 4 (155s)
+    // because this account is hard-capped at 10 regional concurrent
+    // executions. 8 renderers + prepare + finalizer + launcher exceeds the
+    // cap, forcing serialized contention. 4 leaves headroom for the serial
+    // stages and overlapping jobs. Raise only after a concurrency limit
+    // increase (Service Quotas: Lambda Concurrent Executions).
     mapConcurrency: 4,
     webpQuality: 85,
     webpMethod: 4,
     allowOfficialAssetFallback: true,
     officialAssetTimeoutSeconds: 15,
     maxActivePerUser: 2,
+    // Dev disables the content-addressed render cache so smoke tests and
+    // benchmarks always exercise the real pipeline. Enable in prod for
+    // cost/latency deduplication of identical requests.
+    renderCacheEnabled: false,
   },
   retention: {
     workDays: 2,
