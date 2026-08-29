@@ -719,19 +719,26 @@ def export_requested_symbol_frames(
     destination: Path,
     subframe_start: int = 1,
     frame_count: int = 1,
+    workers: int = 1,
 ) -> dict[str, list[Path]]:
-    """Export one or more nested timeline states for every requested symbol."""
+    """Export one or more nested timeline states for every requested symbol.
+
+    With workers > 1, the per-source FFDec exports run concurrently. Each
+    source already uses an isolated FFDec home, so this is thread-safe.
+    Helpful when the caller has spare vCPU; on the ~1.7 vCPU dev cap it adds
+    little, but on 3+ vCPU it cuts the serial export roughly by source count.
+    """
     if subframe_start < 1 or frame_count < 1:
         raise CharacterSvgError("Subframe start and frame count must be positive")
     grouped: dict[Path, list[SymbolRequest]] = defaultdict(list)
     for request in requests:
         grouped[request.source].append(request)
-    exported: dict[str, list[Path]] = {}
     subframe_end = subframe_start + frame_count - 1
 
-    for index, (source, group) in enumerate(grouped.items()):
-        # Each source gets its own FFDec home so a stray pre-existing home
-        # directory never leaks mutable JVM state between exports.
+    def export_source(item: tuple[int, tuple[Path, list[SymbolRequest]]]) -> dict[str, list[Path]]:
+        index, (source, group) = item
+        # Each source gets its own FFDec home so concurrent exports never
+        # share mutable JVM state.
         ffdec_home = destination / f".ffdec-home-{index:02d}"
         output = destination / f"asset_{index:02d}"
         selected_ids = ",".join(str(request.character_id) for request in group)
@@ -764,6 +771,7 @@ def export_requested_symbol_frames(
             raise CharacterSvgError(
                 f"FFDec SVG export failed for {source}: {detail[-2000:]}"
             )
+        source_exported: dict[str, list[Path]] = {}
         for request in group:
             generic_directory = output / f"DefineSprite_{request.character_id}"
             directories = sorted(
@@ -790,7 +798,18 @@ def export_requested_symbol_frames(
                         f"({request.class_name}) from {source.name}"
                     )
                 frames.append(frame)
-            exported[request.key] = frames
+            source_exported[request.key] = frames
+        return source_exported
+
+    exported: dict[str, list[Path]] = {}
+    items = list(enumerate(grouped.items()))
+    if workers > 1 and len(items) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+            for partial in pool.map(export_source, items):
+                exported.update(partial)
+    else:
+        for item in items:
+            exported.update(export_source(item))
     return exported
 
 

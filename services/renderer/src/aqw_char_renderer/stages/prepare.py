@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import tarfile
 import tempfile
@@ -416,6 +417,9 @@ def prepare_job(
             else 1
         )
         phase = time.perf_counter()
+        # Parallelize the per-source FFDec exports across available vCPUs.
+        # Lambda scales CPU with memory, so os.cpu_count() reflects it.
+        export_workers = max(1, min(len({s.source for s in requests}), (os.cpu_count() or 1)))
         raw_exports = character_svg.export_requested_symbol_frames(
             requests,
             ffdec=config.ffdec_path,
@@ -423,6 +427,7 @@ def prepare_job(
             destination=root / "exports",
             subframe_start=request.render.subframe_start,
             frame_count=export_frame_count,
+            workers=export_workers,
         )
         mark("ffdec_export_ms", phase)
         detected_loop: int | None = None
