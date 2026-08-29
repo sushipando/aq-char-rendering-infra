@@ -160,48 +160,10 @@ def render_batch(
         root = Path(temporary)
         part_roots: dict[str, Path] = {}
         archive_bytes = 0
-        for key, part in prepared["parts"].items():
-            # Prefer the batch-scoped archive so a 2000-frame job's workers
-            # download only their slice, not the entire per-symbol corpus.
-            scoped = (part.get("batch_archives") or {}).get(str(batch_index))
-            archive_key = scoped or part["archive_key"]
-            download_started = time.perf_counter()
-            archive_path = store.download(
-                config.work_bucket,
-                archive_key,
-                root / "archives" / f"{key}.tar.gz",
-            )
-            timings["archive_download_ms"] += (time.perf_counter() - download_started) * 1000
-            archive_bytes += archive_path.stat().st_size
-            target = root / "parts" / key
-            extract_started = time.perf_counter()
-            _extract_archive(archive_path, target)
-            timings["archive_extract_ms"] += (time.perf_counter() - extract_started) * 1000
-            # The overlap frame (frame_start - 1) belongs to the previous
-            # batch, so fetch that slice too and merge the extracted tree.
-            if frame_start > 1:
-                prev_scoped = (part.get("batch_archives") or {}).get(str(batch_index - 1))
-                prev_key = prev_scoped or archive_key
-                if prev_key != archive_key:
-                    prev_started = time.perf_counter()
-                    prev_path = store.download(
-                        config.work_bucket,
-                        prev_key,
-                        root / "archives" / f"{key}.prev.tar.gz",
-                    )
-                    timings["archive_download_ms"] += (
-                        time.perf_counter() - prev_started
-                    ) * 1000
-                    archive_bytes += prev_path.stat().st_size
-                    prev_extract_started = time.perf_counter()
-                    _extract_archive(prev_path, target)
-                    timings["archive_extract_ms"] += (
-                        time.perf_counter() - prev_extract_started
-                    ) * 1000
-            part_roots[key] = target
-
         # Blink timelines play once and then hold their final frame, so item
-        # loops (not the eye blink) drive the animation period.
+        # loops (not the eye blink) drive the animation period. A frozen blink
+        # frame can be owned by a far-away chunk, so every part's downloads
+        # must also cover the freeze frame when it is an ignored loop key.
         detected_blink_frames = prepared.get("detected_blink_frames")
         ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
 
@@ -219,6 +181,57 @@ def render_batch(
                 )
                 return zero_based + 1
             return frame_number
+
+        for key, part in prepared["parts"].items():
+            needed_frames = set()
+            for output_frame in range(frame_start - 1, frame_end + 1):
+                if output_frame >= 1:
+                    needed_frames.add(source_frame_for(key, output_frame))
+            # Chunks are (symbol x batch) at batch_size; resolve the ordinals
+            # that contain the needed source frames plus the overlap frame.
+            needed_ordinals = {
+                (source_frame - 1) // config.batch_size
+                for source_frame in needed_frames
+                if source_frame >= 1
+            }
+            part_roots[key] = root / "parts" / key
+            batch_archives = part.get("batch_archives") or {}
+            if not batch_archives:
+                download_started = time.perf_counter()
+                archive_path = store.download(
+                    config.work_bucket,
+                    part["archive_key"],
+                    root / "archives" / f"{key}.full.tar.gz",
+                )
+                timings["archive_download_ms"] += (
+                    time.perf_counter() - download_started
+                ) * 1000
+                archive_bytes += archive_path.stat().st_size
+                extract_started = time.perf_counter()
+                _extract_archive(archive_path, part_roots[key])
+                timings["archive_extract_ms"] += (
+                    time.perf_counter() - extract_started
+                ) * 1000
+                continue
+            for ordinal in sorted(needed_ordinals):
+                scoped = batch_archives.get(str(ordinal))
+                archive_key = scoped or part["archive_key"]
+                suffix = str(ordinal) if scoped else "full"
+                download_started = time.perf_counter()
+                archive_path = store.download(
+                    config.work_bucket,
+                    archive_key,
+                    root / "archives" / f"{key}.{suffix}.tar.gz",
+                )
+                timings["archive_download_ms"] += (
+                    time.perf_counter() - download_started
+                ) * 1000
+                archive_bytes += archive_path.stat().st_size
+                extract_started = time.perf_counter()
+                _extract_archive(archive_path, part_roots[key])
+                timings["archive_extract_ms"] += (
+                    time.perf_counter() - extract_started
+                ) * 1000
 
         def compose_frame(frame_number: int) -> Path:
             imported: dict[str, character_svg.ImportedSymbol] = {}
