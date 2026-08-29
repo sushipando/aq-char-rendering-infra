@@ -118,6 +118,7 @@ def render_batch(
         "archive_download_ms": 0.0,
         "archive_extract_ms": 0.0,
         "compose_ms": 0.0,
+        "probe_ms": 0.0,
         "rasterize_ms": 0.0,
         "encode_ms": 0.0,
         "upload_ms": 0.0,
@@ -158,129 +159,136 @@ def render_batch(
 
     with tempfile.TemporaryDirectory(prefix=f"aqw-render-{job_id}-{batch_index}-") as temporary:
         root = Path(temporary)
+        # Only the probe phase composes frames, so only it needs the part
+        # archives. Raster workers reuse the composed SVGs uploaded by probe.
         part_roots: dict[str, Path] = {}
         archive_bytes = 0
-        # Blink timelines play once and then hold their final frame, so item
-        # loops (not the eye blink) drive the animation period. A frozen blink
-        # frame can be owned by a far-away chunk, so every part's downloads
-        # must also cover the freeze frame when it is an ignored loop key.
-        detected_blink_frames = prepared.get("detected_blink_frames")
-        ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
+        if mode == "probe":
+            # Blink timelines play once and then hold their final frame, so
+            # item loops (not the eye blink) drive the animation period. A
+            # frozen blink frame can be owned by a far-away chunk, so every
+            # part's downloads must also cover the freeze frame when it is an
+            # ignored loop key.
+            detected_blink_frames = prepared.get("detected_blink_frames")
+            ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
 
-        def source_frame_for(key: str, frame_number: int) -> int:
-            if (
-                detected_blink_frames
-                and key in ignored_loop_keys
-                and detected_blink_frames > 0
-            ):
-                # one_shot_source_frame_index is 0-based; convert between the
-                # 1-based archive file names and the 0-based blink timeline.
-                zero_based = character_svg.one_shot_source_frame_index(
-                    frame_number - 1,
-                    one_shot_frames=detected_blink_frames,
-                )
-                return zero_based + 1
-            return frame_number
-
-        for key, part in prepared["parts"].items():
-            needed_frames = set()
-            for output_frame in range(frame_start - 1, frame_end + 1):
-                if output_frame >= 1:
-                    needed_frames.add(source_frame_for(key, output_frame))
-            # Chunks are (symbol x batch) at batch_size; resolve the ordinals
-            # that contain the needed source frames plus the overlap frame.
-            needed_ordinals = {
-                (source_frame - 1) // config.batch_size
-                for source_frame in needed_frames
-                if source_frame >= 1
-            }
-            part_roots[key] = root / "parts" / key
-            batch_archives = part.get("batch_archives") or {}
-            if not batch_archives:
-                download_started = time.perf_counter()
-                archive_path = store.download(
-                    config.work_bucket,
-                    part["archive_key"],
-                    root / "archives" / f"{key}.full.tar.gz",
-                )
-                timings["archive_download_ms"] += (
-                    time.perf_counter() - download_started
-                ) * 1000
-                archive_bytes += archive_path.stat().st_size
-                extract_started = time.perf_counter()
-                _extract_archive(archive_path, part_roots[key])
-                timings["archive_extract_ms"] += (
-                    time.perf_counter() - extract_started
-                ) * 1000
-                continue
-            for ordinal in sorted(needed_ordinals):
-                scoped = batch_archives.get(str(ordinal))
-                archive_key = scoped or part["archive_key"]
-                suffix = str(ordinal) if scoped else "full"
-                download_started = time.perf_counter()
-                archive_path = store.download(
-                    config.work_bucket,
-                    archive_key,
-                    root / "archives" / f"{key}.{suffix}.tar.gz",
-                )
-                timings["archive_download_ms"] += (
-                    time.perf_counter() - download_started
-                ) * 1000
-                archive_bytes += archive_path.stat().st_size
-                extract_started = time.perf_counter()
-                _extract_archive(archive_path, part_roots[key])
-                timings["archive_extract_ms"] += (
-                    time.perf_counter() - extract_started
-                ) * 1000
-
-        def compose_frame(frame_number: int) -> Path:
-            imported: dict[str, character_svg.ImportedSymbol] = {}
-            for key, part in prepared["parts"].items():
-                source_frame = source_frame_for(key, frame_number)
-                raw_path = part_roots[key] / f"{source_frame:06d}.svg"
-                if not raw_path.is_file():
-                    raise character_svg.CharacterSvgError(
-                        f"Part archive for {key} is missing frame {source_frame}"
+            def source_frame_for(key: str, frame_number: int) -> int:
+                if (
+                    detected_blink_frames
+                    and key in ignored_loop_keys
+                    and detected_blink_frames > 0
+                ):
+                    # one_shot_source_frame_index is 0-based; convert between
+                    # the 1-based archive file names and the 0-based blink.
+                    zero_based = character_svg.one_shot_source_frame_index(
+                        frame_number - 1,
+                        one_shot_frames=detected_blink_frames,
                     )
-                placement_colors = {
-                    tuple(int(component) for component in pair.split(",")):
-                    character_svg.AuthoredColorTransform(**values)
-                    for pair, values in part.get("placement_colors", {}).items()
+                    return zero_based + 1
+                return frame_number
+
+            for key, part in prepared["parts"].items():
+                needed_frames = set()
+                for output_frame in range(frame_start, frame_end + 1):
+                    needed_frames.add(source_frame_for(key, output_frame))
+                # Chunks are (symbol x batch) at batch_size; resolve the
+                # ordinals that contain the needed source frames plus the
+                # overlap frame.
+                needed_ordinals = {
+                    (source_frame - 1) // config.batch_size
+                    for source_frame in needed_frames
+                    if source_frame >= 1
                 }
-                imported[key] = character_svg.import_ffdec_symbol(
-                    key,
-                    raw_path,
-                    zoom=zoom,
-                    color_rules={
-                        name: tuple(rule) for name, rule in part["color_rules"].items()
-                    },
-                    root_class=part["root_class"],
-                    placement_colors=placement_colors,
-                    root_character_id=part.get("character_id"),
+                part_roots[key] = root / "parts" / key
+                batch_archives = part.get("batch_archives") or {}
+                if not batch_archives:
+                    download_started = time.perf_counter()
+                    archive_path = store.download(
+                        config.work_bucket,
+                        part["archive_key"],
+                        root / "archives" / f"{key}.full.tar.gz",
+                    )
+                    timings["archive_download_ms"] += (
+                        time.perf_counter() - download_started
+                    ) * 1000
+                    archive_bytes += archive_path.stat().st_size
+                    extract_started = time.perf_counter()
+                    _extract_archive(archive_path, part_roots[key])
+                    timings["archive_extract_ms"] += (
+                        time.perf_counter() - extract_started
+                    ) * 1000
+                    continue
+                for ordinal in sorted(needed_ordinals):
+                    scoped = batch_archives.get(str(ordinal))
+                    archive_key = scoped or part["archive_key"]
+                    suffix = str(ordinal) if scoped else "full"
+                    download_started = time.perf_counter()
+                    archive_path = store.download(
+                        config.work_bucket,
+                        archive_key,
+                        root / "archives" / f"{key}.{suffix}.tar.gz",
+                    )
+                    timings["archive_download_ms"] += (
+                        time.perf_counter() - download_started
+                    ) * 1000
+                    archive_bytes += archive_path.stat().st_size
+                    extract_started = time.perf_counter()
+                    _extract_archive(archive_path, part_roots[key])
+                    timings["archive_extract_ms"] += (
+                        time.perf_counter() - extract_started
+                    ) * 1000
+
+            def compose_frame(frame_number: int) -> Path:
+                imported: dict[str, character_svg.ImportedSymbol] = {}
+                for key, part in prepared["parts"].items():
+                    source_frame = source_frame_for(key, frame_number)
+                    raw_path = part_roots[key] / f"{source_frame:06d}.svg"
+                    if not raw_path.is_file():
+                        raise character_svg.CharacterSvgError(
+                            f"Part archive for {key} is missing frame {source_frame}"
+                        )
+                    placement_colors = {
+                        tuple(int(component) for component in pair.split(",")):
+                        character_svg.AuthoredColorTransform(**values)
+                        for pair, values in part.get("placement_colors", {}).items()
+                    }
+                    imported[key] = character_svg.import_ffdec_symbol(
+                        key,
+                        raw_path,
+                        zoom=zoom,
+                        color_rules={
+                            name: tuple(rule) for name, rule in part["color_rules"].items()
+                        },
+                        root_class=part["root_class"],
+                        placement_colors=placement_colors,
+                        root_character_id=part.get("character_id"),
+                    )
+                output = root / "svg" / f"{frame_number:06d}.svg"
+                warnings = character_svg.compose_svg(
+                    imported,
+                    layers,
+                    fields=prepared["fields"],
+                    all_color_rules=[tuple(value) for value in prepared["all_color_rules"]],
+                    output=output,
+                    max_size=max_size,
+                    padding=0,
+                    facing=settings["facing"],
+                    rsvg_convert=None,
                 )
-            output = root / "svg" / f"{frame_number:06d}.svg"
-            warnings = character_svg.compose_svg(
-                imported,
-                layers,
-                fields=prepared["fields"],
-                all_color_rules=[tuple(value) for value in prepared["all_color_rules"]],
-                output=output,
-                max_size=max_size,
-                padding=0,
-                facing=settings["facing"],
-                rsvg_convert=None,
-            )
-            for warning in warnings:
-                if warning not in all_warnings:
-                    all_warnings.append(warning)
-            return output
+                for warning in warnings:
+                    if warning not in all_warnings:
+                        all_warnings.append(warning)
+                return output
 
         # Compose and rasterize one extra leading frame so the first encoded
-        # frame of the batch can delta against its predecessor. The overlap
-        # frame is never reported for bounds (it belongs to the previous
-        # batch), but it IS uploaded so the raster phase can delta against it.
+        # Raster needs the predecessor frame to seed the delta; probe does
+        # not (the previous batch already composed + uploaded it, so this is
+        # just a barrier before raster). Starting probe at frame_start removes
+        # ~frame_count/batch_size duplicate compositions, probes, and SVG PUTs.
         pngs: dict[int, Path] = {}
-        first_needed = frame_start - 1 if frame_start > 1 else frame_start
+        first_needed = (
+            frame_start if mode == "probe" else frame_start - 1 if frame_start > 1 else frame_start
+        )
         svg_cache: dict[int, Path] = {}
         frame_bounds: dict[int, tuple[float, float, float, float]] = {}
         for frame_number in range(first_needed, frame_end + 1):
@@ -289,9 +297,13 @@ def render_batch(
                 svg = compose_frame(frame_number)
                 timings["compose_ms"] += (time.perf_counter() - compose_started) * 1000
                 # Probe the composed SVG to get the tight visible bounds.
+                probe_started = time.perf_counter()
                 tight = item_renderer.detect_svg_visible_viewbox(
                     svg, config.rsvg_convert, probe_size=max(1024, max_size * 2)
                 )
+                timings["probe_ms"] = timings.get("probe_ms", 0.0) + (
+                    time.perf_counter() - probe_started
+                ) * 1000
                 # Fall back to the prepare-time vector canvas if the probe
                 # fails for this frame; FitCanvas unions across frames anyway.
                 if frame_number >= frame_start:
