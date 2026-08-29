@@ -125,49 +125,12 @@ const DEV_TUNING: InfrastructureTuning = {
   jobQueueVisibilitySeconds: 180,
 };
 
-// Root/management account (619440099418) has 400 concurrent executions, so
-// it is used as a throwaway high-parallelism benchmark environment. A
-// 360-frame job at batch size 30 yields 12 batches, so mapConcurrency 12
-// runs the entire Map in one wave. Smaller batches create more batches and
-// thus more concurrent render Lambdas when desired. NOT for production use:
-// this is the organization management account and should only host
-// short-lived benchmark stacks that are torn down afterward.
-const ROOT_TUNING: InfrastructureTuning = {
-  ...DEV_TUNING,
-  functions: {
-    ...DEV_TUNING.functions,
-    // More memory = more vCPU (Lambda scales CPU by memory). Render workers
-    // get ~3 vCPU to speed up the per-frame rasterize. Prepare stays at 3008
-    // MiB because its FFDec export is dominated by a single source, so extra
-    // vCPU gave no measurable speedup (13.4s vs 13.1s) and just costs more.
-    prepare: { memoryMiB: 3008, ephemeralStorageMiB: 4096, timeoutSeconds: 900 },
-    render: { memoryMiB: 5308, ephemeralStorageMiB: 4096, timeoutSeconds: 900, reservedConcurrency: 100 },
-  },
-  render: {
-    ...DEV_TUNING.render,
-    // Small batches + high concurrency is the correct way to exploit the
-    // 400-slot ceiling: a 360-frame job becomes 90 batches of 4, each ~16s,
-    // all in one wave, so the Map wall approaches the single-batch time
-    // instead of a fixed 120s+ chunk. (On the 10-slot dev account this just
-    // contends; it only works because root has headroom.)
-    frameBatchSize: 4,
-    mapConcurrency: 90,
-    renderCacheEnabled: false,
-  },
-};
-
 const ENVIRONMENTS: Readonly<Record<string, EnvironmentConfig>> = {
   dev: {
     account: '538522204887',
     region: 'us-west-2',
     stage: 'dev',
     tuning: DEV_TUNING,
-  },
-  root: {
-    account: '619440099418',
-    region: 'us-west-2',
-    stage: 'root',
-    tuning: ROOT_TUNING,
   },
 };
 
