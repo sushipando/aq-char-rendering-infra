@@ -352,9 +352,47 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       backoffRate: 2,
       maxAttempts: 5,
     };
-    const prepare = new tasks.LambdaInvoke(this, 'PrepareAppearance', {
+    // Prepare is split across three phases so the per-source FFDec export
+    // (the dominant cost, especially at maxFrames up to 2000) runs in
+    // parallel, one Lambda per source SWF.
+    const prepareResolve = new tasks.LambdaInvoke(this, 'PrepareResolve', {
       lambdaFunction: functions.prepare,
       payload: sfn.TaskInput.fromObject({ request: sfn.JsonPath.objectAt('$.request') }),
+      payloadResponseOnly: true,
+      resultPath: '$.prepare',
+    }).addRetry(lambdaRetry);
+
+    const exportMap = new sfn.Map(this, 'ExportSourceFrames', {
+      itemsPath: '$.prepare.sources',
+      maxConcurrency: tuning.prepareExportConcurrency,
+      resultPath: '$.export_results',
+      itemSelector: {
+        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+        input_key: sfn.JsonPath.stringAt('$.prepare.input_key'),
+        source: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
+      },
+    });
+    exportMap.itemProcessor(
+      new tasks.LambdaInvoke(this, 'ExportSource', {
+        lambdaFunction: functions.prepare,
+        payload: sfn.TaskInput.fromObject({
+          phase: 'export',
+          job_id: sfn.JsonPath.stringAt('$.job_id'),
+          input_key: sfn.JsonPath.stringAt('$.input_key'),
+          source: sfn.JsonPath.objectAt('$.source'),
+        }),
+        payloadResponseOnly: true,
+      }).addRetry(lambdaRetry),
+    );
+
+    const prepareFinish = new tasks.LambdaInvoke(this, 'PrepareFinish', {
+      lambdaFunction: functions.prepare,
+      payload: sfn.TaskInput.fromObject({
+        phase: 'finish',
+        request: sfn.JsonPath.objectAt('$.request'),
+        input_key: sfn.JsonPath.stringAt('$.prepare.input_key'),
+        export_results: sfn.JsonPath.listAt('$.export_results'),
+      }),
       payloadResponseOnly: true,
       resultPath: '$.prepare',
     }).addRetry(lambdaRetry);
@@ -443,11 +481,11 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       payloadResponseOnly: true,
     }).addRetry(lambdaRetry);
 
-    const renderMiss = probeMap.next(fitCanvas).next(renderMap).next(finalize);
+    const renderMiss = exportMap.next(prepareFinish).next(probeMap).next(fitCanvas).next(renderMap).next(finalize);
     const cacheChoice = new sfn.Choice(this, 'CachedResultExists')
       .when(sfn.Condition.booleanEquals('$.prepare.cache_hit', true), completeCached)
       .otherwise(renderMiss);
-    const branch = prepare.next(cacheChoice);
+    const branch = prepareResolve.next(cacheChoice);
     const protectedWorkflow = new sfn.Parallel(this, 'ProtectedRenderWorkflow');
     protectedWorkflow.branch(branch);
 

@@ -117,7 +117,7 @@ class RuntimeConfig:
                 values, "CHAR_RENDER_DEFAULT_COMPLETE_LOOP", True
             ),
             default_max_frames=_integer(
-                values, "CHAR_RENDER_DEFAULT_MAX_FRAMES", 360, 1, 360
+                values, "CHAR_RENDER_DEFAULT_MAX_FRAMES", 360, 1, 2000
             ),
             default_subframe_start=_integer(
                 values, "CHAR_RENDER_DEFAULT_SUBFRAME_START", 1, 1, 10_000

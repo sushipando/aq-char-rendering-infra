@@ -199,7 +199,7 @@ class RenderSettings:
             facing=facing,
             override=ItemOverride.from_dict(payload.get("override")),
             complete_loop=_boolean(payload.get("complete_loop", True), "render.complete_loop"),
-            max_frames=_integer(payload.get("max_frames", 360), "render.max_frames", 1, 360),
+            max_frames=_integer(payload.get("max_frames", 360), "render.max_frames", 1, 2000),
             subframe_start=_integer(
                 payload.get("subframe_start", 1), "render.subframe_start", 1, 10_000
             ),

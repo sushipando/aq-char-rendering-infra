@@ -1,10 +1,21 @@
-"""Resolve one appearance, export FFDec parts, detect its loop, and write a manifest."""
+"""Prepare phases: resolve appearance, export FFDec parts per source, finish manifest.
+
+Split across three Lambda phases so the expensive per-source FFDec export runs
+in parallel (one Lambda per source SWF) instead of serially inside a single
+prepare invocation:
+
+- prepare_resolve: resolve appearance, build symbol requests, hash, cache
+  check, and publish prepare-input.json.
+- prepare_export_source: one source SWF, export its symbol timelines to
+  per-symbol tar.gz archives, upload color rules + authored placement colors.
+- prepare_finish: reconstruct raw exports from the archives, detect loop,
+  compute the shared viewbox, and write the render manifest.
+"""
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import tarfile
 import tempfile
@@ -45,6 +56,108 @@ class StageStore(Protocol):
     ) -> bool: ...
     def read_json(self, bucket: str, key: str) -> Any: ...
     def write_json(self, bucket: str, key: str, value: Any) -> None: ...
+
+
+def _override(
+    request: JobRequest,
+    fields: dict[str, str],
+    catalog: SourceAssetCatalog,
+    store: StageStore,
+    config: RuntimeConfig,
+    asset_root: Path,
+    database: Path,
+) -> tuple[dict[str, Path], dict[Path, SourceObject]]:
+    selected = request.render.override
+    if selected is None:
+        return {}, {}
+    record = tryon.load_item(database, selected.item_id)
+    database_slot = str(record.get("slot") or "")
+    slot = tryon.effective_slot(database_slot)
+    if slot not in character_svg.SUPPORTED_OVERRIDE_SLOTS:
+        raise character_svg.CharacterSvgError(
+            f"Item {selected.item_id} has unsupported on-character slot {database_slot!r}"
+        )
+    if selected.slot is not None and selected.slot != slot:
+        raise character_svg.CharacterSvgError(
+            f"Override slot {selected.slot!r} conflicts with item slot {slot!r}"
+        )
+    raw_file = str(record.get("file") or "")
+    if not raw_file:
+        raise character_svg.CharacterSvgError(f"Item {selected.item_id} has no SWF path")
+    remote_path = (
+        f"classes/{fields.get('strGender', 'M').upper()}/{raw_file}"
+        if slot == "armor" and "/" not in raw_file
+        else tryon.normalize_asset_path(raw_file)
+    )
+    source, source_record = catalog.resolve_and_download(
+        remote_path,
+        store=store,
+        bucket=config.source_bucket,
+        root=asset_root,
+        allow_official_fallback=config.allow_official_asset_fallback,
+        timeout=config.official_asset_timeout_seconds,
+    )
+    link = tryon.infer_export_link(source, slot=slot, gender=fields.get("strGender", "M"))
+    weapon_type = tryon.infer_weapon_type(source, database_slot) if slot == "weapon" else None
+    synthetic = character_svg._apply_override(
+        fields,
+        slot=slot,
+        source=source,
+        link=link,
+        name=str(record.get("name") or f"Item {selected.item_id}"),
+        weapon_type=weapon_type,
+        custom=not request.render.base_items,
+    )
+    return {synthetic.casefold(): source}, {source: source_record}
+
+
+def _source_color_rules(
+    source: Path,
+    record: SourceObject,
+    *,
+    store: StageStore,
+    config: RuntimeConfig,
+    scripts_root: Path,
+) -> dict[str, tuple[str, str]]:
+    """Color rules for one source SWF, cached by content hash.
+
+    Rules are a pure function of the SWF bytes, so computing them once per
+    source SHA-256 and reusing across jobs removes an FFDec ActionScript
+    export (~2s each) from every repeat render.
+    """
+    cache_key = f"color-rules/{record.sha256}.json"
+    cached: dict[str, tuple[str, str]] | None = None
+    try:
+        payload = store.read_json(config.work_bucket, cache_key)
+        cached = {name: tuple(rule) for name, rule in payload.items()}
+    except ClientError as error:
+        # NoSuchKey is a normal cache miss; anything else means we cannot
+        # trust the cache and must recompute.
+        if error.response.get("Error", {}).get("Code") not in {"NoSuchKey", "NoSuchBucket", "404"}:
+            log_event(
+                "color_rules_cache_read_failed",
+                key=cache_key,
+                error=str(error),
+            )
+    except (StorageError, KeyError, json.JSONDecodeError, OSError) as error:
+        log_event("color_rules_cache_corrupt", key=cache_key, error=str(error))
+    if cached is not None:
+        return cached
+    computed = character_svg.parse_color_scripts(
+        source,
+        ffdec=config.ffdec_path,
+        destination=scripts_root,
+    )
+    try:
+        store.write_json(
+            config.work_bucket,
+            cache_key,
+            {k: list(v) for k, v in computed.items()},
+        )
+    except (StorageError, ClientError, OSError) as error:
+        # A failed cache write must never fail the render.
+        log_event("color_rules_cache_write_failed", key=cache_key, error=str(error))
+    return computed
 
 
 _SVG_ROOT_TAG_RE = re.compile(rb"<svg\b[^>]*>", re.DOTALL)
@@ -149,122 +262,30 @@ def shared_viewbox(
     )
 
 
-def _override(
-    request: JobRequest,
-    fields: dict[str, str],
-    catalog: SourceAssetCatalog,
-    store: StageStore,
-    config: RuntimeConfig,
-    asset_root: Path,
-    database: Path,
-) -> tuple[dict[str, Path], dict[Path, SourceObject]]:
-    selected = request.render.override
-    if selected is None:
-        return {}, {}
-    record = tryon.load_item(database, selected.item_id)
-    database_slot = str(record.get("slot") or "")
-    slot = tryon.effective_slot(database_slot)
-    if slot not in character_svg.SUPPORTED_OVERRIDE_SLOTS:
-        raise character_svg.CharacterSvgError(
-            f"Item {selected.item_id} has unsupported on-character slot {database_slot!r}"
-        )
-    if selected.slot is not None and selected.slot != slot:
-        raise character_svg.CharacterSvgError(
-            f"Override slot {selected.slot!r} conflicts with item slot {slot!r}"
-        )
-    raw_file = str(record.get("file") or "")
-    if not raw_file:
-        raise character_svg.CharacterSvgError(f"Item {selected.item_id} has no SWF path")
-    remote_path = (
-        f"classes/{fields.get('strGender', 'M').upper()}/{raw_file}"
-        if slot == "armor" and "/" not in raw_file
-        else tryon.normalize_asset_path(raw_file)
-    )
-    source, source_record = catalog.resolve_and_download(
-        remote_path,
-        store=store,
-        bucket=config.source_bucket,
-        root=asset_root,
-        allow_official_fallback=config.allow_official_asset_fallback,
-        timeout=config.official_asset_timeout_seconds,
-    )
-    link = tryon.infer_export_link(source, slot=slot, gender=fields.get("strGender", "M"))
-    weapon_type = tryon.infer_weapon_type(source, database_slot) if slot == "weapon" else None
-    synthetic = character_svg._apply_override(
-        fields,
-        slot=slot,
-        source=source,
-        link=link,
-        name=str(record.get("name") or f"Item {selected.item_id}"),
-        weapon_type=weapon_type,
-        custom=not request.render.base_items,
-    )
-    return {synthetic.casefold(): source}, {source: source_record}
+def _extract_archive(archive_path: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(target, filter="data")
 
 
-def _source_color_rules(
-    source: Path,
-    record: SourceObject,
-    *,
-    store: StageStore,
-    config: RuntimeConfig,
-    scripts_root: Path,
-) -> dict[str, tuple[str, str]]:
-    """Color rules for one source SWF, cached by content hash.
-
-    Rules are a pure function of the SWF bytes, so computing them once per
-    source SHA-256 and reusing across jobs removes a serial FFDec ActionScript
-    export (~2s each) from every repeat render.
-    """
-    cache_key = f"color-rules/{record.sha256}.json"
-    cached: dict[str, tuple[str, str]] | None = None
-    try:
-        payload = store.read_json(config.work_bucket, cache_key)
-        cached = {name: tuple(rule) for name, rule in payload.items()}
-    except ClientError as error:
-        # NoSuchKey is a normal cache miss; anything else means we cannot
-        # trust the cache and must recompute.
-        if error.response.get("Error", {}).get("Code") not in {"NoSuchKey", "NoSuchBucket", "404"}:
-            log_event(
-                "color_rules_cache_read_failed",
-                key=cache_key,
-                error=str(error),
-            )
-    except (StorageError, KeyError, json.JSONDecodeError, OSError) as error:
-        log_event("color_rules_cache_corrupt", key=cache_key, error=str(error))
-    if cached is not None:
-        return cached
-    computed = character_svg.parse_color_scripts(
-        source,
-        ffdec=config.ffdec_path,
-        destination=scripts_root,
-    )
-    try:
-        store.write_json(
-            config.work_bucket,
-            cache_key,
-            {k: list(v) for k, v in computed.items()},
-        )
-    except (StorageError, ClientError, OSError) as error:
-        # A failed cache write must never fail the render.
-        log_event("color_rules_cache_write_failed", key=cache_key, error=str(error))
-    return computed
-
-
-def prepare_job(
+def prepare_resolve(
     request: JobRequest,
     *,
     store: StageStore,
     config: RuntimeConfig,
     flashvars: Mapping[str, str] | None = None,
-    work_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Execute the expensive serial preparation stage for one job."""
-    job_started = time.perf_counter()
+    """Phase 1: resolve appearance, build symbol requests, cache check.
+
+    Publishes prepare-input.json with everything the export and finish phases
+    need, then returns the source list to fan out the FFDec export Map. On a
+    cache hit returns the cached result immediately.
+    """
+    started = time.perf_counter()
     timings: dict[str, float] = {}
 
-    def mark(name: str, started: float) -> None:
-        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - started) * 1000
+    def mark(name: str, phase: float) -> None:
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - phase) * 1000
 
     phase = time.perf_counter()
     manifest_payload = store.read_json(config.source_bucket, config.asset_manifest_key)
@@ -275,14 +296,8 @@ def prepare_job(
             "Configured asset dataset does not match its source manifest"
         )
 
-    owned_temporary: tempfile.TemporaryDirectory[str] | None = None
-    if work_root is None:
-        owned_temporary = tempfile.TemporaryDirectory(prefix=f"aqw-prepare-{request.job_id}-")
-        root = Path(owned_temporary.name)
-    else:
-        root = work_root
-        root.mkdir(parents=True, exist_ok=True)
-    try:
+    with tempfile.TemporaryDirectory(prefix=f"aqw-resolve-{request.job_id}-") as temporary:
+        root = Path(temporary)
         phase = time.perf_counter()
         fields = (
             {str(key): str(value) for key, value in flashvars.items()}
@@ -393,6 +408,13 @@ def prepare_job(
         )
         if cached is not None:
             metadata = dict(cached.get("Metadata") or {})
+            log_event(
+                "prepare_resolve_profile",
+                job_id=request.job_id,
+                cache_hit=True,
+                total_ms=round((time.perf_counter() - started) * 1000, 1),
+                **{key: round(value, 1) for key, value in sorted(timings.items())},
+            )
             return {
                 "schema_version": 1,
                 "job_id": request.job_id,
@@ -416,32 +438,323 @@ def prepare_job(
             if request.render.complete_loop
             else 1
         )
-        phase = time.perf_counter()
-        # Parallelize the per-source FFDec exports across available vCPUs.
-        # Lambda scales CPU with memory, so os.cpu_count() reflects it.
-        export_workers = max(1, min(len({s.source for s in requests}), (os.cpu_count() or 1)))
-        raw_exports = character_svg.export_requested_symbol_frames(
+        # Group the requests by their source so each export Lambda handles one
+        # SWF and its full timeline (FFDec -sublength is prefix-only, so a
+        # single source cannot be split across frame ranges).
+        requests_by_source: dict[Path, list[character_svg.SymbolRequest]] = {}
+        for symbol in requests:
+            requests_by_source.setdefault(symbol.source, []).append(symbol)
+        input_key = f"jobs/{request.job_id}/prepare/input.json"
+        store.write_json(
+            config.work_bucket,
+            input_key,
+            {
+                "schema_version": 1,
+                "job_id": request.job_id,
+                "render_hash": digest,
+                "final_key": final_key,
+                "export_frame_count": export_frame_count,
+                "fields": dict(sorted(fields.items())),
+                "aliases": dict(sorted(aliases.items())),
+                "weapon_type": weapon_type,
+                "settings": request.render.to_dict(),
+                "warnings": warnings,
+                "character_renderer": {
+                    "key": catalog.character_renderer.key,
+                    "sha256": catalog.character_renderer.sha256,
+                },
+                "sources": [
+                    {
+                        "idx": index,
+                        "key": source_records[source].key,
+                        "sha256": source_records[source].sha256,
+                        "remote_path": source_records[source].remote_path,
+                        "requests": [
+                            {
+                                "key": symbol.key,
+                                "class_name": symbol.class_name,
+                                "character_id": symbol.character_id,
+                                "frame": symbol.frame,
+                            }
+                            for symbol in sorted(
+                                group,
+                                key=lambda item: item.key,
+                            )
+                        ],
+                    }
+                    for index, (source, group) in enumerate(
+                        sorted(requests_by_source.items(), key=lambda item: str(item[0]))
+                    )
+                ],
+            },
+        )
+        log_event(
+            "prepare_resolve_profile",
+            job_id=request.job_id,
+            cache_hit=False,
+            source_count=len(requests_by_source),
+            symbol_count=len(requests),
+            export_frame_count=export_frame_count,
+            total_ms=round((time.perf_counter() - started) * 1000, 1),
+            **{key: round(value, 1) for key, value in sorted(timings.items())},
+        )
+        return {
+            "schema_version": 1,
+            "job_id": request.job_id,
+            "cache_hit": False,
+            "input_key": input_key,
+            "render_hash": digest,
+            "final_key": final_key,
+            "sources": [
+                {
+                    "idx": index,
+                    "key": source_records[source].key,
+                    "sha256": source_records[source].sha256,
+                    "requests": [
+                        {
+                            "key": symbol.key,
+                            "class_name": symbol.class_name,
+                            "character_id": symbol.character_id,
+                            "frame": symbol.frame,
+                        }
+                        for symbol in sorted(group, key=lambda item: item.key)
+                    ],
+                }
+                for index, (source, group) in enumerate(
+                    sorted(requests_by_source.items(), key=lambda item: str(item[0]))
+                )
+            ],
+        }
+
+
+def prepare_export_source(
+    *,
+    job_id: str,
+    input_key: str,
+    source: Mapping[str, Any],
+    store: StageStore,
+    config: RuntimeConfig,
+) -> dict[str, Any]:
+    """Phase 2: export one source SWF's symbol timelines in parallel.
+
+    Downloads prepare-input.json + its source SWF, runs FFDec once for that
+    source, uploads one per-symbol tar.gz archive, and reports the parts plus
+    color rules and authored placement colors computed from the local file.
+    """
+    started = time.perf_counter()
+    prepared = store.read_json(config.work_bucket, input_key)
+    if prepared.get("job_id") != job_id:
+        raise character_svg.CharacterSvgError("Prepare input belongs to another job")
+    source_idx = int(source["idx"])
+    settings = prepared["settings"]
+    zoom = float(settings["zoom"])
+    export_frame_count = int(prepared["export_frame_count"])
+    subframe_start = int(settings["subframe_start"])
+
+    with tempfile.TemporaryDirectory(prefix=f"aqw-export-{job_id}-{source_idx}-") as temporary:
+        root = Path(temporary)
+        swf = store.download(
+            config.source_bucket,
+            str(source["key"]),
+            root / "source.swf",
+            expected_sha256=str(source["sha256"]),
+        )
+        requests = [
+            character_svg.SymbolRequest(
+                key=str(request["key"]),
+                source=swf,
+                class_name=str(request["class_name"]),
+                character_id=int(request["character_id"]),
+                frame=int(request["frame"]),
+            )
+            for request in source["requests"]
+        ]
+        exported = character_svg.export_requested_symbol_frames(
             requests,
             ffdec=config.ffdec_path,
-            zoom=request.render.zoom,
+            zoom=zoom,
             destination=root / "exports",
-            subframe_start=request.render.subframe_start,
+            subframe_start=subframe_start,
             frame_count=export_frame_count,
-            workers=export_workers,
         )
-        mark("ffdec_export_ms", phase)
+        record = SourceObject(
+            remote_path=str(source.get("remote_path") or ""),
+            key=str(source["key"]),
+            sha256=str(source["sha256"]),
+            size=0,
+        )
+        rules = _source_color_rules(
+            swf,
+            record,
+            store=store,
+            config=config,
+            scripts_root=root / "scripts",
+        )
+        placement_colors = character_svg.authored_swf_color_transforms(swf)
+
+        archive_directory = root / "archives"
+        archive_directory.mkdir(parents=True, exist_ok=True)
+        parts: list[dict[str, Any]] = []
+        archive_bytes = 0
+        for symbol in sorted(requests, key=lambda item: item.key):
+            frames = exported[symbol.key]
+            archive_path = archive_directory / f"{symbol.key}.tar.gz"
+            with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+                for index, path in enumerate(frames, start=1):
+                    archive.add(path, arcname=f"{index:06d}.svg")
+            archive_bytes += archive_path.stat().st_size
+            archive_key = f"jobs/{job_id}/prepare/parts/{symbol.key}.tar.gz"
+            store.upload_file(
+                archive_path,
+                config.work_bucket,
+                archive_key,
+                content_type="application/gzip",
+            )
+            parts.append(
+                {
+                    "key": symbol.key,
+                    "root_class": symbol.class_name,
+                    "character_id": symbol.character_id,
+                    "archive_key": archive_key,
+                    "frame_count": len(frames),
+                }
+            )
+    log_event(
+        "prepare_export_complete",
+        job_id=job_id,
+        source_idx=source_idx,
+        parts=len(parts),
+        archive_bytes=archive_bytes,
+        duration_ms=round((time.perf_counter() - started) * 1000),
+    )
+    return {
+        "job_id": job_id,
+        "source_idx": source_idx,
+        "parts": parts,
+        "color_rules": {key: list(value) for key, value in rules.items()},
+        "placement_colors": {
+            f"{parent_id},{child_id}": {
+                field: getattr(transform, field)
+                for field in (
+                    "red_mult",
+                    "green_mult",
+                    "blue_mult",
+                    "alpha_mult",
+                    "red_add",
+                    "green_add",
+                    "blue_add",
+                    "alpha_add",
+                )
+            }
+            for (parent_id, child_id), transform in sorted(placement_colors.items())
+        },
+    }
+
+
+def prepare_finish(
+    *,
+    request: JobRequest,
+    input_key: str,
+    export_results: list[dict[str, Any]],
+    store: StageStore,
+    config: RuntimeConfig,
+) -> dict[str, Any]:
+    """Phase 3: rebuild exports, detect loop, compute viewbox, write manifest."""
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def mark(name: str, phase: float) -> None:
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - phase) * 1000
+
+    phase = time.perf_counter()
+    prepared = store.read_json(config.work_bucket, input_key)
+    if prepared.get("job_id") != request.job_id:
+        raise character_svg.CharacterSvgError("Prepare input belongs to another job")
+    mark("input_read_ms", phase)
+
+    # Rebuild per-symbol raw exports from the archives the export Lambdas
+    # uploaded, keyed for the loop detector and viewbox math.
+    with tempfile.TemporaryDirectory(prefix=f"aqw-finish-{request.job_id}-") as temporary:
+        root = Path(temporary)
+        export_key_to_result = {int(result["source_idx"]): result for result in export_results}
+        raw_exports: dict[str, list[Path]] = {}
+        part_manifest: dict[str, Any] = {}
+        all_color_rules: set[tuple[str, str]] = set()
+        for result in sorted(export_key_to_result.values(), key=lambda value: int(value["source_idx"])):
+            rules = {
+                name: tuple(rule) for name, rule in result["color_rules"].items()
+            }
+            placement = {
+                tuple(int(component) for component in pair.split(",")):
+                character_svg.AuthoredColorTransform(**values)
+                for pair, values in result["placement_colors"].items()
+            }
+            for part in result["parts"]:
+                phase = time.perf_counter()
+                archive_path = store.download(
+                    config.work_bucket,
+                    part["archive_key"],
+                    root / "archives" / f"{part['key']}.tar.gz",
+                )
+                target = root / "parts" / part["key"]
+                _extract_archive(archive_path, target)
+                mark("archive_download_ms", phase)
+                phase = time.perf_counter()
+                frames = sorted(
+                    target.glob("*.svg"),
+                    key=lambda path: int(path.stem) if path.stem.isdigit() else 0,
+                )
+                raw_exports[part["key"]] = frames
+                part_manifest[part["key"]] = {
+                    "root_class": part["root_class"],
+                    "character_id": part["character_id"],
+                    "archive_key": part["archive_key"],
+                    "frame_count": part["frame_count"],
+                    "color_rules": {
+                        key: list(value)
+                        for key, value in sorted(rules.items())
+                    },
+                    "placement_colors": {
+                        f"{parent_id},{child_id}": {
+                            field: getattr(transform, field)
+                            for field in (
+                                "red_mult",
+                                "green_mult",
+                                "blue_mult",
+                                "alpha_mult",
+                                "red_add",
+                                "green_add",
+                                "blue_add",
+                                "alpha_add",
+                            )
+                        }
+                        for (parent_id, child_id), transform in sorted(placement.items())
+                    },
+                }
+                all_color_rules.update(
+                    tuple(rule) for rule in rules.values()
+                )
+                mark("archive_extract_ms", phase)
+
+        phase = time.perf_counter()
+        detection_exports = {
+            key: frames[: int(prepared["settings"]["max_frames"])]
+            for key, frames in raw_exports.items()
+        }
         detected_loop: int | None = None
         detected_item_loop: int | None = None
         detected_blink_frames: int | None = None
         ignored_loop_keys: tuple[str, ...] = ()
+        warnings = list(prepared.get("warnings") or [])
         if request.render.complete_loop:
-            phase = time.perf_counter()
-            loop_exports, ignored_loop_keys = character_svg.loop_driver_exports(raw_exports)
+            loop_exports, ignored_loop_keys = character_svg.loop_driver_exports(
+                detection_exports
+            )
             detected_item_loop = character_svg.detect_complete_loop_frame_count(
                 loop_exports, max_frames=request.render.max_frames
             )
             detected_blink_frames = character_svg.detect_blink_frame_count(
-                raw_exports,
+                detection_exports,
                 max_frames=request.render.max_frames,
             )
             if detected_item_loop is not None and detected_blink_frames is not None:
@@ -460,163 +773,69 @@ def prepare_job(
                 warnings.append(
                     "The natural eye-blink timeline did not repeat within the frame cap"
                 )
-            mark("loop_detection_ms", phase)
         else:
             frame_count = 1
+        mark("loop_detection_ms", phase)
 
         phase = time.perf_counter()
-        # Serial execution is correct and cheap here: nearly every source hits
-        # the color-rules cache, so no real FFDec work remains to parallelize.
-        unique_sources = sorted({symbol.source for symbol in requests})
-        rules_by_source = {
-            source: _source_color_rules(
-                source,
-                source_records[source],
-                store=store,
-                config=config,
-                scripts_root=root / "scripts" / source.name,
-            )
-            for source in unique_sources
-        }
-        mark("color_scripts_ms", phase)
-
-        phase = time.perf_counter()
-        layers = character_svg.build_layers(aliases, weapon_type=weapon_type)
+        layers = character_svg.build_layers(prepared["aliases"], weapon_type=prepared["weapon_type"])
         viewbox = shared_viewbox(
             layers,
             raw_exports,
             frame_count=frame_count,
             facing=request.render.facing,
-            zoom=request.render.zoom,
-            max_size=request.render.max_size,
-            padding=request.render.padding,
+            zoom=float(prepared["settings"]["zoom"]),
+            max_size=int(prepared["settings"]["max_size"]),
+            padding=int(prepared["settings"]["padding"]),
         )
         mark("viewbox_ms", phase)
 
-        # Upload one compressed archive per symbol part instead of one object
-        # per frame: downstream workers fetch a handful of archives rather
-        # than thousands of individual SVGs.
-        archive_directory = root / "archives"
-        archive_directory.mkdir(parents=True, exist_ok=True)
-        # FFDec SVG exports omit authored PlaceObject color transforms, which
-        # are what restore the exact character skin/eye/hair colors. Parse the
-        # SWF once per source and pass the mapping to the workers.
         phase = time.perf_counter()
-        placement_colors_by_source = {
-            source: character_svg.authored_swf_color_transforms(source)
-            for source in sorted({symbol.source for symbol in requests})
-        }
-        mark("placement_colors_ms", phase)
-        part_manifest: dict[str, Any] = {}
-        archive_total_bytes = 0
-        for symbol in requests:
-            phase = time.perf_counter()
-            frames = raw_exports[symbol.key][:frame_count]
-            archive_path = archive_directory / f"{symbol.key}.tar.gz"
-            # Level 1 gzip is several times faster than the default (6) and
-            # these archives are transient (downloaded once per worker), so
-            # compression time matters more than ratio here.
-            with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
-                for index, path in enumerate(frames, start=1):
-                    archive.add(path, arcname=f"{index:06d}.svg")
-            archive_total_bytes += archive_path.stat().st_size
-            mark("archive_create_ms", phase)
-            archive_key = f"jobs/{request.job_id}/prepare/parts/{symbol.key}.tar.gz"
-            phase = time.perf_counter()
-            store.upload_file(
-                archive_path,
-                config.work_bucket,
-                archive_key,
-                content_type="application/gzip",
-            )
-            mark("archive_upload_ms", phase)
-            # Convert the (parent_id, child_id) integer keys to strings for
-            # JSON manifest transport.
-            placement = placement_colors_by_source.get(symbol.source, {})
-            part_manifest[symbol.key] = {
-                "root_class": symbol.class_name,
-                "character_id": symbol.character_id,
-                "archive_key": archive_key,
-                "frame_count": len(frames),
-                "color_rules": {
-                    key: list(value)
-                    for key, value in sorted(rules_by_source.get(symbol.source, {}).items())
-                },
-                "placement_colors": {
-                    f"{parent_id},{child_id}": {
-                        field: getattr(transform, field)
-                        for field in (
-                            "red_mult",
-                            "green_mult",
-                            "blue_mult",
-                            "alpha_mult",
-                            "red_add",
-                            "green_add",
-                            "blue_add",
-                            "alpha_add",
-                        )
-                    }
-                    for (parent_id, child_id), transform in sorted(placement.items())
-                },
-            }
-
+        character_renderer = store.download(
+            config.source_bucket,
+            prepared["character_renderer"]["key"],
+            root / "characterB.swf",
+            expected_sha256=prepared["character_renderer"]["sha256"],
+        )
         frame_rate = character_svg.swf_frame_rate(character_renderer)
         batches = [batch.to_dict() for batch in partition_frames(frame_count, config.batch_size)]
         manifest_key = f"jobs/{request.job_id}/prepare/manifest.json"
         manifest = {
             "schema_version": 1,
             "job_id": request.job_id,
-            "render_hash": digest,
-            "final_key": final_key,
+            "render_hash": prepared["render_hash"],
+            "final_key": prepared["final_key"],
             "frame_count": frame_count,
             "frame_rate": frame_rate,
             "viewbox": list(viewbox),
             "frame_durations": character_svg.frame_durations_for_rate(frame_count, frame_rate),
-            "fields": dict(sorted(fields.items())),
-            "aliases": dict(sorted(aliases.items())),
-            "weapon_type": weapon_type,
+            "fields": dict(sorted(prepared["fields"].items())),
+            "aliases": dict(sorted(prepared["aliases"].items())),
+            "weapon_type": prepared["weapon_type"],
             "parts": part_manifest,
-            "all_color_rules": sorted(
-                {
-                    tuple(rule)
-                    for part in part_manifest.values()
-                    for rule in part["color_rules"].values()
-                }
-            ),
+            "all_color_rules": sorted(all_color_rules),
             "settings": request.render.to_dict(),
             "batches": batches,
             "warnings": warnings,
             "detected_loop": detected_loop,
             "detected_blink_frames": detected_blink_frames,
             "ignored_loop_keys": list(ignored_loop_keys),
-            "sources": [
-                {
-                    "remote_path": record.remote_path,
-                    "key": record.key,
-                    "sha256": record.sha256,
-                    "size": record.size,
-                }
-                for record in sorted(source_records.values(), key=lambda value: value.key)
-            ],
+            "sources": [],
         }
-        phase = time.perf_counter()
         store.write_json(config.work_bucket, manifest_key, manifest)
         mark("manifest_write_ms", phase)
 
-        total_ms = (time.perf_counter() - job_started) * 1000
-        accounted = sum(timings.values())
-        # Report the uncapped loop geometry so operators can see how much the
-        # frame cap truncated a render. detected_item_loop is the raw repeating
-        # item period; detected_blink_frames is the one-shot blink span; the
-        # aligned loop is either the natural full loop or None when the items
-        # never repeat within the scan window.
         if request.render.complete_loop:
-            natural_loop = character_svg.aligned_animation_frame_count(
-                detected_item_loop, detected_blink_frames
-            ) if detected_item_loop is not None and detected_blink_frames is not None else None
+            natural_loop = (
+                character_svg.aligned_animation_frame_count(
+                    detected_item_loop, detected_blink_frames
+                )
+                if detected_item_loop is not None and detected_blink_frames is not None
+                else None
+            )
             loop_capped = frame_count < natural_loop if natural_loop is not None else True
             symbol_loops = character_svg.symbol_loop_info(
-                raw_exports,
+                detection_exports,
                 max_frames=request.render.max_frames,
                 validation_frames=character_svg.LOOP_VALIDATION_FRAMES,
             )
@@ -624,19 +843,19 @@ def prepare_job(
             natural_loop = None
             loop_capped = False
             symbol_loops = {}
+        total_ms = (time.perf_counter() - started) * 1000
+        accounted = sum(timings.values())
         log_event(
             "prepare_profile",
             job_id=request.job_id,
             frame_count=frame_count,
-            export_frame_count=export_frame_count,
+            export_frame_count=int(prepared["export_frame_count"]),
             detected_item_loop=detected_item_loop,
             detected_blink_frames=detected_blink_frames,
             natural_loop=natural_loop,
             loop_capped=loop_capped,
             symbol_loops=symbol_loops,
-            symbol_count=len(requests),
-            source_count=len(source_records),
-            archive_bytes=archive_total_bytes,
+            symbol_count=len(part_manifest),
             total_ms=round(total_ms, 1),
             unaccounted_ms=round(total_ms - accounted, 1),
             **{key: round(value, 1) for key, value in sorted(timings.items())},
@@ -645,12 +864,9 @@ def prepare_job(
             "schema_version": 1,
             "job_id": request.job_id,
             "cache_hit": False,
-            "render_hash": digest,
-            "final_key": final_key,
+            "render_hash": prepared["render_hash"],
+            "final_key": prepared["final_key"],
             "manifest_key": manifest_key,
             "batches": batches,
             "frame_count": frame_count,
         }
-    finally:
-        if owned_temporary is not None:
-            owned_temporary.cleanup()

@@ -151,7 +151,7 @@ def main() -> int:
     args = parser().parse_args()
     if (
         args.max_active < 1
-        or not 1 <= args.max_frames <= 360
+        or not 1 <= args.max_frames <= 2000
         or args.timeout_seconds < 1
         or args.poll_seconds <= 0
     ):

@@ -53,6 +53,7 @@ export interface InfrastructureTuning {
   readonly budget: BudgetTuning;
   readonly workflowTimeoutMinutes: number;
   readonly jobQueueVisibilitySeconds: number;
+  readonly prepareExportConcurrency: number;
 }
 
 export interface EnvironmentConfig {
@@ -102,7 +103,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // batches of 4, all concurrent. Memory stays capped at 3008 MiB (~1.7
     // vCPU) so per-frame speed is unchanged, but wall time drops ~6x. (This
     // was previously 30/4 because 10 slots made >4 contend.)
-    mapConcurrency: 90,
+    mapConcurrency: 300,
     webpQuality: 85,
     webpMethod: 4,
     allowOfficialAssetFallback: true,
@@ -124,6 +125,10 @@ const DEV_TUNING: InfrastructureTuning = {
     shutdownPercent: 100,
   },
   workflowTimeoutMinutes: 60,
+  // Prepare is split so each source SWF exports in its own Lambda; a
+  // character has ~5 sources, so a small concurrency is plenty, and Step
+  // Functions throttles excess invocations safely.
+  prepareExportConcurrency: 8,
   jobQueueVisibilitySeconds: 180,
 };
 
