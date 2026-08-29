@@ -479,6 +479,69 @@ def prepare_resolve(
             if request.render.complete_loop
             else 1
         )
+        # Step 4: consult the offline per-SWF animation manifest so the frame
+        # count, item loop, and blink span are known before any vector-state
+        # export. When metadata is present (dataset was pre-analyzed), the
+        # export Map only needs to produce the exact frame range and finish
+        # skips signature scanning entirely.
+        manifest_meta: dict[str, Any] | None = None
+        try:
+            if request.render.complete_loop:
+                meta_by_source: dict[Path, Any] = {}
+                missing = False
+                for source in {symbol.source for symbol in requests}:
+                    record = source_records[source]
+                    try:
+                        manifest_meta = store.read_json(
+                            config.source_bucket,
+                            f"animation-metadata/1/26.2.1/{record.sha256}.json",
+                        )
+                    except Exception:  # noqa: BLE001 - missing metadata is a miss
+                        missing = True
+                        break
+                    meta_by_source[source] = manifest_meta
+                if not missing:
+                    # Recover each requested symbol's period from the metadata
+                    # keyed by class name, then compute the combined loop.
+                    periods: list[int] = []
+                    blink_period: int | None = None
+                    for symbol in requests:
+                        source_meta = meta_by_source.get(symbol.source)
+                        symbol_meta = (source_meta or {}).get("symbols", {}).get(
+                            symbol.class_name.casefold()
+                        )
+                        if not symbol_meta or symbol_meta.get("period") is None:
+                            missing = True
+                            break
+                        if symbol.key == "armor_head":
+                            blink_period = int(symbol_meta["period"])
+                        else:
+                            periods.append(int(symbol_meta["period"]))
+                    if not missing:
+                        import math
+
+                        detected_item_loop = math.lcm(*periods) if periods else 1
+                        detected_blink_frames = blink_period
+                        if detected_item_loop is not None and detected_blink_frames is not None:
+                            detected_loop = character_svg.aligned_animation_frame_count(
+                                detected_item_loop, detected_blink_frames
+                            )
+                            frame_count = min(detected_loop, request.render.max_frames)
+                        else:
+                            frame_count = request.render.max_frames
+                        manifest_meta = {
+                            "detected_item_loop": detected_item_loop,
+                            "detected_blink_frames": detected_blink_frames,
+                            "frame_count": frame_count,
+                            "source_count": len(meta_by_source),
+                        }
+        except Exception:  # noqa: BLE001 - any manifest failure degrades to request-time scan
+            manifest_meta = None
+        if manifest_meta is not None and manifest_meta.get("frame_count"):
+            frame_count = int(manifest_meta["frame_count"])
+            export_frame_count = frame_count + min(
+                character_svg.LOOP_VALIDATION_FRAMES, frame_count
+            )
         # Group the requests by their source so each export Lambda handles one
         # SWF and its full timeline (FFDec -sublength is prefix-only, so a
         # single source cannot be split across frame ranges).
@@ -495,6 +558,11 @@ def prepare_resolve(
                 "render_hash": digest,
                 "final_key": final_key,
                 "export_frame_count": export_frame_count,
+                "precomputed_loop": (
+                    manifest_meta
+                    if manifest_meta is not None and manifest_meta.get("frame_count")
+                    else None
+                ),
                 "fields": dict(sorted(fields.items())),
                 "aliases": dict(sorted(aliases.items())),
                 "weapon_type": weapon_type,
@@ -835,16 +903,26 @@ def prepare_finish(
                 mark("meta_parse_ms", phase)
 
         phase = time.perf_counter()
-        # Use the full exported signature list (including the +8 validation
-        # tail) so periods at the cap can be proven; slicing back to
-        # max_frames would discard the tail the detector relies on.
         detection_sigs = symbol_signatures
         detected_loop: int | None = None
         detected_item_loop: int | None = None
         detected_blink_frames: int | None = None
         ignored_loop_keys: tuple[str, ...] = ()
         warnings = list(prepared.get("warnings") or [])
-        if request.render.complete_loop:
+        precomputed = prepared.get("precomputed_loop") or {}
+        if precomputed.get("frame_count"):
+            frame_count = int(precomputed["frame_count"])
+            detected_item_loop = precomputed.get("detected_item_loop")
+            detected_blink_frames = precomputed.get("detected_blink_frames")
+            detected_loop = (
+                character_svg.aligned_animation_frame_count(
+                    detected_item_loop, detected_blink_frames
+                )
+                if detected_item_loop is not None and detected_blink_frames is not None
+                else None
+            )
+            ignored_loop_keys = ("armor_head",)
+        elif request.render.complete_loop:
             loop_sigs, ignored_loop_keys = character_svg.loop_driver_from_signatures(
                 detection_sigs
             )

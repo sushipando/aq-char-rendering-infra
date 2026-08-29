@@ -25,6 +25,7 @@ line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint.per-file-ignores]
+"../../scripts/build_animation_manifest.py" = ["EXE001", "S112"]
 "src/aqw_char_renderer/character_svg.py" = ["EXE001", "I001", "PLW1510", "RUF007", "UP035"]
 "src/aqw_char_renderer/legacy/*.py" = ["ALL"]
 "tests/test_character_svg.py" = ["I001"]
