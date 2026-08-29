@@ -28,13 +28,6 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             store=store,
             config=config,
         )
-        log_event(
-            "prepare_export_complete",
-            job_id=result["job_id"],
-            source_idx=result["source_idx"],
-            parts=len(result["parts"]),
-            duration_ms=round((perf_counter() - started) * 1000),
-        )
         return result
     request = JobRequest.from_dict(event["request"])
     jobs = JobStore(config.job_table)
