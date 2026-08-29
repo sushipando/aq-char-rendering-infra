@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Distributed AQW character rendering runtime"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "boto3>=1.40,<2",
+    "numpy>=2.2,<3",
+    "pillow>=11,<13",
+]
 
 [dependency-groups]
 dev = [
@@ -19,6 +23,11 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+
+[tool.ruff.lint.per-file-ignores]
+"src/aqw_char_renderer/character_svg.py" = ["EXE001", "I001", "PLW1510", "RUF007", "UP035"]
+"src/aqw_char_renderer/legacy/*.py" = ["ALL"]
+"tests/test_character_svg.py" = ["I001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

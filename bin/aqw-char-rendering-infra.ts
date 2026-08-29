@@ -15,6 +15,7 @@ new AqwCharRenderingInfraStack(app, `AqwCharRendering-${environment.stage}`, {
   description: 'Distributed AQW character rendering infrastructure',
   stackName: `aqw-char-rendering-${environment.stage}`,
   stageName: environment.stage,
+  tuning: environment.tuning,
   terminationProtection: environment.stage === 'prod',
   tags: {
     Environment: environment.stage,

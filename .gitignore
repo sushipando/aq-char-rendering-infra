@@ -6,6 +6,8 @@ node_modules
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+cdk.out.*
+cdk-outputs.*.json
 
 # Python / uv
 .venv
@@ -22,3 +24,4 @@ __pycache__/
 !.env.example
 render_outputs/
 jobs/
+tmp/

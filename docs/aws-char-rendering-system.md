@@ -1,15 +1,14 @@
 # Distributed `/char` Rendering System
 
-Status: implementation handoff; the AWS system and Discord `/char` command do
-not exist yet.
+Status: implemented and validated locally; CDK synthesizes successfully, but
+the AWS stack has not been bootstrapped or deployed.
 
 Last updated: 2026-08-28.
 
-This document specifies the system another agent should implement to render an
-animated AQW character from a username, store the result in S3, and display it
-in Discord without doing rendering work on the small Hetzner search server.
-It intentionally records the decisions, constraints, data contracts, failure
-handling, and fidelity requirements discussed during design.
+This document records the design and operating requirements for rendering an
+animated AQW character from a username, storing the result in S3, and
+displaying it in Discord without doing rendering work on the small Hetzner
+search server.
 
 ## Decisions already made
 
@@ -42,10 +41,9 @@ constants. The values above are initial production defaults.
 
 ## Current source state
 
-The reference renderer currently lives in the sibling `aq-image-search`
-repository at `pipeline/render_swf_character_svg.py`. It must be migrated into
-`services/renderer/` here without changing its output. It already does the
-following locally:
+The reference renderer still lives in the sibling `aq-image-search` repository
+at `pipeline/render_swf_character_svg.py`. A fidelity-preserving copy and its
+tests now live under `services/renderer/` here and provide the following:
 
 - Fetches or loads saved public character FlashVars.
 - Resolves cosmetic/base armor, weapon, helm/hair, cape, and ground SWFs.
@@ -62,8 +60,14 @@ following locally:
 - Computes even-offset delta rectangles between adjacent RGBA frames.
 - Encodes frames concurrently with `cwebp` and combines them with `webpmux`.
 
-The current script is monolithic. It must be refactored into reusable library
-operations and Lambda handlers without changing its rendering output.
+The AWS package separates versioned contracts, storage, orchestration stages,
+and Lambda handlers while retaining the proven composition operations.
+
+Live character pages sometimes reference legitimate staff or legacy SWFs that
+are absent from the bulk item corpus. The implemented resolver permits only
+the fixed official AQW `gamefiles` origin, validates the SWF, and atomically
+caches the first copy in the private versioned source bucket. Its content hash
+is included in the render hash and job manifest.
 
 Source commit `e7aa745` added:
 
@@ -918,9 +922,15 @@ CHAR_RENDER_ENABLED=false
 AWS_REGION=us-west-2
 CHAR_RENDER_JOB_QUEUE_URL=
 CHAR_RENDER_RESULT_QUEUE_URL=
-CHAR_RENDER_MAX_ACTIVE_PER_USER=2
+CHAR_RENDER_JOB_TABLE=
+CHAR_RENDER_ENABLED_PARAMETER=
+CHAR_RENDER_MAX_ACTIVE_PARAMETER=
 CHAR_RENDER_RESULT_POLL_SECONDS=20
 ```
+
+The maximum-active value is emitted by CDK as an SSM parameter from the typed
+environment tuning file. `CHAR_RENDER_MAX_ACTIVE_PER_USER` remains an optional
+bot-side emergency override and should normally be blank.
 
 The Lambda/stack configuration should include:
 
@@ -1074,9 +1084,9 @@ deployment, confirm:
 None of these choices should block the local refactor or a private staging
 stack.
 
-## Implementation order
+## Validation/deployment order
 
-### Phase 1: profile and refactor locally
+### Phase 1: profile and refactor locally (implemented)
 
 1. Preserve the existing monolithic command as a reference.
 2. Record per-stage timings for Soltina at 512, 1024, and 2048.
@@ -1085,7 +1095,7 @@ stack.
    local executor and produces the same final WebP.
 5. Verify output before introducing AWS.
 
-### Phase 2: container compatibility
+### Phase 2: container compatibility (image defined; Linux build pending)
 
 1. Build the pinned Linux renderer container.
 2. Run the complete saved Soltina fixture without network access except local
@@ -1093,7 +1103,7 @@ stack.
 3. Confirm headless FFDec, librsvg, Pillow, cwebp, and webpmux behavior.
 4. Compare decoded output and timing with macOS reference output.
 
-### Phase 3: AWS staging workflow
+### Phase 3: AWS staging workflow (CDK implemented; deployment pending)
 
 1. Deploy private staging buckets, queues, DynamoDB, Lambdas, and Step
    Functions without CloudFront or Discord.
@@ -1101,7 +1111,7 @@ stack.
 3. Test retries, one failed batch, timeout, abort, idempotent release, and DLQs.
 4. Tune batch size, Lambda memory, local worker count, and Map concurrency.
 
-### Phase 4: delivery and Discord
+### Phase 4: delivery and Discord (code implemented; live integration pending)
 
 1. Add CloudFront OAC and lifecycle rules.
 2. Test a real animated WebP URL in Discord desktop and mobile.

@@ -1,0 +1,248 @@
+"""Submit one real render through the deployed SQS workflow and verify its CDN result."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import boto3
+from aqw_char_renderer import character_svg
+from aqw_char_renderer.contracts import (
+    DiscordTarget,
+    JobRequest,
+    RenderSettings,
+    utc_now,
+)
+from aqw_char_renderer.jobs import TERMINAL_STATUSES, JobStore
+from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
+from aqw_char_renderer.source_assets import SourceAssetCatalog, SourceAssetError
+from aqw_char_renderer.storage import S3ObjectStore
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Queue a deployed AQW character render and validate its CloudFront WebP."
+    )
+    result.add_argument("--outputs", type=Path, default=Path("cdk-outputs.dev.json"))
+    result.add_argument("--username", default="artix")
+    result.add_argument("--user-id", default="900000000000000001")
+    result.add_argument("--channel-id", default="900000000000000002")
+    result.add_argument("--guild-id", default="900000000000000003")
+    result.add_argument("--max-active", type=int, default=2)
+    result.add_argument("--dataset-version", default="dev-v1")
+    result.add_argument("--max-frames", type=int, default=8)
+    result.add_argument("--timeout-seconds", type=int, default=1_200)
+    result.add_argument("--poll-seconds", type=float, default=5)
+    return result
+
+
+def load_outputs(path: Path) -> dict[str, str]:
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict) or len(document) != 1:
+        raise TypeError(f"Expected exactly one stack in {path}")
+    outputs = next(iter(document.values()))
+    if not isinstance(outputs, dict):
+        raise TypeError(f"Malformed CDK outputs in {path}")
+    required = {
+        "CloudFrontBaseUrl",
+        "JobQueueUrl",
+        "JobTableName",
+        "RenderEnabledParameterName",
+        "ResultQueueUrl",
+        "SourceAssetBucketName",
+    }
+    missing = sorted(required.difference(outputs))
+    if missing:
+        raise RuntimeError(f"Missing CDK output(s): {', '.join(missing)}")
+    return {str(key): str(value) for key, value in outputs.items()}
+
+
+def seed_missing_assets(
+    outputs: dict[str, str],
+    appearance: dict[str, str],
+    *,
+    dataset_version: str,
+) -> list[str]:
+    store = S3ObjectStore()
+    bucket = outputs["SourceAssetBucketName"]
+    catalog = SourceAssetCatalog(
+        store.read_json(bucket, f"datasets/{dataset_version}/manifest.json")
+    )
+    if catalog.dataset_version != dataset_version:
+        raise RuntimeError("Smoke dataset version does not match its manifest")
+    missing: list[str] = []
+    for asset in character_svg.appearance_assets(appearance).values():
+        try:
+            catalog.get(asset.remote_path)
+        except SourceAssetError:
+            missing.append(asset.remote_path)
+    if not missing:
+        return []
+    with tempfile.TemporaryDirectory(prefix="aqw-char-smoke-assets-") as temporary:
+        root = Path(temporary)
+        for remote_path in missing:
+            catalog.resolve_and_download(
+                remote_path,
+                store=store,
+                bucket=bucket,
+                root=root,
+                allow_official_fallback=True,
+                timeout=15,
+            )
+            print(json.dumps({"event": "seeded_asset", "path": remote_path}))
+    return missing
+
+
+def receive_result(
+    sqs: Any,
+    queue_url: str,
+    job_id: str,
+    deadline: float,
+) -> tuple[dict[str, Any], str]:
+    while time.monotonic() < deadline:
+        response = sqs.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=10,
+            VisibilityTimeout=30,
+        )
+        for message in response.get("Messages", []):
+            try:
+                payload = json.loads(message["Body"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("job_id") == job_id:
+                return payload, str(message["ReceiptHandle"])
+            sqs.change_message_visibility(
+                QueueUrl=queue_url,
+                ReceiptHandle=message["ReceiptHandle"],
+                VisibilityTimeout=0,
+            )
+    raise TimeoutError(f"Timed out waiting for result message for {job_id}")
+
+
+def verify_webp(url: str, expected_base_url: str) -> dict[str, Any]:
+    expected_prefix = expected_base_url.rstrip("/") + "/renders/"
+    if not url.startswith(expected_prefix):
+        raise RuntimeError(f"Result URL is outside the expected CDN prefix: {url}")
+    request = urllib.request.Request(url, headers={"User-Agent": "aqw-char-smoke/1"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        prefix = response.read(16)
+        content_type = response.headers.get_content_type()
+        content_length = response.headers.get("Content-Length")
+        status = response.status
+    if not (prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP"):
+        raise RuntimeError("CloudFront response is not a WebP file")
+    return {
+        "url": url,
+        "http_status": status,
+        "content_type": content_type,
+        "content_length": int(content_length) if content_length else None,
+    }
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if (
+        args.max_active < 1
+        or not 1 <= args.max_frames <= 360
+        or args.timeout_seconds < 1
+        or args.poll_seconds <= 0
+    ):
+        raise SystemExit("Limits and timeouts must be positive")
+    outputs = load_outputs(args.outputs.resolve())
+    ssm = boto3.client("ssm")
+    enabled = ssm.get_parameter(Name=outputs["RenderEnabledParameterName"])["Parameter"][
+        "Value"
+    ]
+    if enabled.casefold() != "true":
+        raise RuntimeError("The deployed render safety switch is disabled")
+
+    appearance = tryon.fetch_character_flashvars(args.username, timeout=15)
+    seed_missing_assets(
+        outputs,
+        appearance,
+        dataset_version=args.dataset_version,
+    )
+    job_id = str(uuid4())
+    request = JobRequest(
+        job_id=job_id,
+        created_at=utc_now(),
+        discord=DiscordTarget(
+            user_id=args.user_id,
+            channel_id=args.channel_id,
+            guild_id=args.guild_id,
+        ),
+        render=RenderSettings(username=args.username, max_frames=args.max_frames),
+        appearance=appearance,
+    )
+    jobs = JobStore(outputs["JobTableName"])
+    jobs.acquire(request, args.max_active)
+    # Match the public bot contract while keeping deployment smoke tests short.
+    queue_payload = request.to_dict()
+    queue_payload["render"] = {
+        "username": request.render.username,
+        "max_frames": request.render.max_frames,
+    }
+    sqs = boto3.client("sqs")
+    try:
+        sqs.send_message(
+            QueueUrl=outputs["JobQueueUrl"],
+            MessageBody=json.dumps(queue_payload, separators=(",", ":"), sort_keys=True),
+        )
+    except Exception as error:
+        jobs.release(
+            job_id,
+            "FAILED",
+            attributes={"error_code": f"SMOKE_QUEUE_SEND_FAILED:{type(error).__name__}"},
+        )
+        raise
+    print(json.dumps({"event": "queued", "job_id": job_id, "username": args.username}))
+
+    deadline = time.monotonic() + args.timeout_seconds
+    previous_status: str | None = None
+    while time.monotonic() < deadline:
+        record = jobs.get(job_id)
+        status = str((record or {}).get("status", "MISSING"))
+        if status != previous_status:
+            print(json.dumps({"event": "status", "job_id": job_id, "status": status}))
+            previous_status = status
+        if status in TERMINAL_STATUSES:
+            break
+        time.sleep(args.poll_seconds)
+    else:
+        raise TimeoutError(f"Timed out waiting for terminal job state for {job_id}")
+
+    payload, receipt_handle = receive_result(
+        sqs, outputs["ResultQueueUrl"], job_id, deadline
+    )
+    try:
+        if payload.get("status") != "SUCCEEDED":
+            raise RuntimeError(f"Render failed: {json.dumps(payload, sort_keys=True)}")
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("url"), str):
+            raise TypeError(f"Malformed success result: {json.dumps(payload, sort_keys=True)}")
+        verified = verify_webp(result["url"], outputs["CloudFrontBaseUrl"])
+        summary = {
+            "event": "verified",
+            "job_id": job_id,
+            "username": request.render.username,
+            **result,
+            **verified,
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    finally:
+        sqs.delete_message(
+            QueueUrl=outputs["ResultQueueUrl"], ReceiptHandle=receipt_handle
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
