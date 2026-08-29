@@ -95,12 +95,14 @@ const DEV_TUNING: InfrastructureTuning = {
     maxFrames: 360,
     subframeStart: 1,
     frameBatchSize: 30,
-    // Measured: mapConcurrency 8 was SLOWER (356s Map wall) than 4 (155s)
-    // because this account is hard-capped at 10 regional concurrent
-    // executions. 8 renderers + prepare + finalizer + launcher exceeds the
-    // cap, forcing serialized contention. 4 leaves headroom for the serial
-    // stages and overlapping jobs. Raise only after a concurrency limit
-    // increase (Service Quotas: Lambda Concurrent Executions).
+    // Account is hard-capped at 10 regional concurrent executions, all
+    // unreserved, and each 3008 MiB render worker gets only ~1.7 vCPU.
+    // Measured on 360-frame renders: mapConcurrency 4 -> 155s Map wall
+    // (2.3s/frame), 6 -> 362s (~6s/frame), 8 -> 356s. Above 4 the workers
+    // contend for CPU on the capped pool and each frame runs ~3x slower, so
+    // both wall time and billed compute get worse. 4 is the empirical
+    // optimum until the quota case (178797464300402) lifts the cap; only
+    // then raise this.
     mapConcurrency: 4,
     webpQuality: 85,
     webpMethod: 4,
@@ -126,12 +128,41 @@ const DEV_TUNING: InfrastructureTuning = {
   jobQueueVisibilitySeconds: 180,
 };
 
+// Root/management account (619440099418) has 400 concurrent executions, so
+// it is used as a throwaway high-parallelism benchmark environment. A
+// 360-frame job at batch size 30 yields 12 batches, so mapConcurrency 12
+// runs the entire Map in one wave. Smaller batches create more batches and
+// thus more concurrent render Lambdas when desired. NOT for production use:
+// this is the organization management account and should only host
+// short-lived benchmark stacks that are torn down afterward.
+const ROOT_TUNING: InfrastructureTuning = {
+  ...DEV_TUNING,
+  functions: {
+    ...DEV_TUNING.functions,
+    // 400 slots are available, so reserve a generous render pool and let the
+    // serial stages share the rest.
+    render: { memoryMiB: 3008, ephemeralStorageMiB: 4096, timeoutSeconds: 900, reservedConcurrency: 100 },
+  },
+  render: {
+    ...DEV_TUNING.render,
+    frameBatchSize: 30,
+    mapConcurrency: 12,
+    renderCacheEnabled: false,
+  },
+};
+
 const ENVIRONMENTS: Readonly<Record<string, EnvironmentConfig>> = {
   dev: {
     account: '538522204887',
     region: 'us-west-2',
     stage: 'dev',
     tuning: DEV_TUNING,
+  },
+  root: {
+    account: '619440099418',
+    region: 'us-west-2',
+    stage: 'root',
+    tuning: ROOT_TUNING,
   },
 };
 

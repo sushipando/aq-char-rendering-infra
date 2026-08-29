@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 import tarfile
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Protocol
@@ -20,6 +21,7 @@ from PIL import Image
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.hashing import file_sha256
+from aqw_char_renderer.structured_logging import log_event
 
 
 class StageStore(Protocol):
@@ -99,7 +101,19 @@ def render_batch(
     store: StageStore,
     config: RuntimeConfig,
 ) -> dict[str, Any]:
+    batch_started = time.perf_counter()
+    timings: dict[str, float] = {
+        "manifest_ms": 0.0,
+        "archive_download_ms": 0.0,
+        "archive_extract_ms": 0.0,
+        "compose_ms": 0.0,
+        "rasterize_ms": 0.0,
+        "encode_ms": 0.0,
+        "upload_ms": 0.0,
+    }
+    manifest_started = time.perf_counter()
     prepared = store.read_json(config.work_bucket, manifest_key)
+    timings["manifest_ms"] = (time.perf_counter() - manifest_started) * 1000
     if prepared.get("job_id") != job_id:
         raise character_svg.CharacterSvgError("Prepare manifest belongs to another job")
     batch_index = int(batch["index"])
@@ -124,14 +138,20 @@ def render_batch(
     with tempfile.TemporaryDirectory(prefix=f"aqw-render-{job_id}-{batch_index}-") as temporary:
         root = Path(temporary)
         part_roots: dict[str, Path] = {}
+        archive_bytes = 0
         for key, part in prepared["parts"].items():
+            download_started = time.perf_counter()
             archive_path = store.download(
                 config.work_bucket,
                 part["archive_key"],
                 root / "archives" / f"{key}.tar.gz",
             )
+            timings["archive_download_ms"] += (time.perf_counter() - download_started) * 1000
+            archive_bytes += archive_path.stat().st_size
             target = root / "parts" / key
+            extract_started = time.perf_counter()
             _extract_archive(archive_path, target)
+            timings["archive_extract_ms"] += (time.perf_counter() - extract_started) * 1000
             part_roots[key] = target
 
         def compose_frame(frame_number: int) -> Path:
@@ -173,8 +193,11 @@ def render_batch(
         pngs: dict[int, Path] = {}
         first_needed = frame_start - 1 if frame_start > 1 else frame_start
         for frame_number in range(first_needed, frame_end + 1):
+            compose_started = time.perf_counter()
             svg = compose_frame(frame_number)
+            timings["compose_ms"] += (time.perf_counter() - compose_started) * 1000
             png = root / "png" / f"{frame_number:06d}.png"
+            rasterize_started = time.perf_counter()
             _rasterize(
                 svg,
                 png,
@@ -182,12 +205,14 @@ def render_batch(
                 max_size=max_size,
                 rsvg_convert=config.rsvg_convert,
             )
+            timings["rasterize_ms"] += (time.perf_counter() - rasterize_started) * 1000
             pngs[frame_number] = png
 
         canvas_size: tuple[int, int] | None = None
         for frame_number in range(frame_start, frame_end + 1):
             encoded = root / "webp" / f"{frame_number:06d}.webp"
             encoded.parent.mkdir(parents=True, exist_ok=True)
+            encode_started = time.perf_counter()
             x, y, width, height, frame_canvas = _encode_frame(
                 pngs[frame_number],
                 pngs.get(frame_number - 1),
@@ -196,12 +221,15 @@ def render_batch(
                 method=int(settings["webp_method"]),
                 cwebp=config.cwebp,
             )
+            timings["encode_ms"] += (time.perf_counter() - encode_started) * 1000
             if canvas_size is None:
                 canvas_size = frame_canvas
             elif frame_canvas != canvas_size:
                 raise character_svg.CharacterSvgError("Raster frames do not share one canvas")
             output_key = f"jobs/{job_id}/webp-frames/{frame_number:06d}.webp"
+            upload_started = time.perf_counter()
             store.upload_file(encoded, config.work_bucket, output_key, content_type="image/webp")
+            timings["upload_ms"] += (time.perf_counter() - upload_started) * 1000
             records.append(
                 {
                     "frame": frame_number,
@@ -219,6 +247,7 @@ def render_batch(
             )
 
     batch_manifest_key = f"jobs/{job_id}/render/batch-{batch_index:04d}.json"
+    manifest_write_started = time.perf_counter()
     store.write_json(
         config.work_bucket,
         batch_manifest_key,
@@ -229,6 +258,26 @@ def render_batch(
             "frames": records,
             "warnings": all_warnings,
         },
+    )
+    timings["manifest_write_ms"] = (time.perf_counter() - manifest_write_started) * 1000
+
+    total_ms = (time.perf_counter() - batch_started) * 1000
+    frames_rendered = frame_end - first_needed + 1
+    accounted = sum(timings.values())
+    log_event(
+        "render_batch_profile",
+        job_id=job_id,
+        batch=batch_index,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        frames_rendered=frames_rendered,
+        overlap_frame=frame_start > 1,
+        part_count=len(prepared["parts"]),
+        archive_bytes=archive_bytes,
+        total_ms=round(total_ms, 1),
+        unaccounted_ms=round(total_ms - accounted, 1),
+        ms_per_frame=round(total_ms / frames_rendered, 1),
+        **{key: round(value, 1) for key, value in timings.items()},
     )
     return {
         "job_id": job_id,
