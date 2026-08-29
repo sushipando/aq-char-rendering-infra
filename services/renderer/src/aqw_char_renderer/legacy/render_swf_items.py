@@ -1062,8 +1062,6 @@ def _render_svg_with_resvg(
     size_flag = "--width" if width >= height else "--height"
     command = [
         resvg,
-        "--shape-rendering",
-        "crispEdges",
         size_flag,
         str(maximum),
         str(svg_path),
