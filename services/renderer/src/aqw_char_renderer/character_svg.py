@@ -1085,6 +1085,64 @@ def frame_state_pattern(paths: Sequence[Path]) -> tuple[int, ...]:
     return tuple(pattern)
 
 
+def signature_state_pattern(signatures: Sequence[str]) -> tuple[int, ...]:
+    """State pattern from precomputed sha256 signatures (no file reads)."""
+    states: dict[str, int] = {}
+    pattern: list[int] = []
+    for signature in signatures:
+        pattern.append(states.setdefault(signature, len(states)))
+    return tuple(pattern)
+
+
+def loop_driver_from_signatures(
+    signatures: Mapping[str, Sequence[str]],
+) -> tuple[dict[str, Sequence[str]], tuple[str, ...]]:
+    """Exclude the blink like loop_driver_exports, from signatures only."""
+    drivers = dict(signatures)
+    head_sigs = drivers.pop("armor_head", None)
+    if head_sigs is None:
+        return drivers, ()
+    ignored = ["armor_head"]
+    head_pattern = signature_state_pattern(head_sigs)
+    for key in ("helm", "hair", "backhair"):
+        sigs = drivers.get(key)
+        if sigs is not None and signature_state_pattern(sigs) == head_pattern:
+            drivers.pop(key)
+            ignored.append(key)
+    return drivers, tuple(ignored)
+
+
+def detect_loop_from_signatures(
+    signatures: Mapping[str, Sequence[str]],
+    *,
+    max_frames: int,
+    validation_frames: int = LOOP_VALIDATION_FRAMES,
+) -> int | None:
+    """Combined loop period from precomputed signatures (no file reads)."""
+    if max_frames < 1 or validation_frames < 1:
+        raise CharacterSvgError("Loop frame limits must be positive")
+    periods: list[int] = []
+    for sigs in signatures.values():
+        pattern = signature_state_pattern(sigs)
+        search_limit = min(max_frames, len(pattern) - 1)
+        symbol_period = next(
+            (
+                period
+                for period in range(1, search_limit + 1)
+                if len(pattern) - period >= min(validation_frames, period)
+                and all(
+                    pattern[index] == pattern[index % period]
+                    for index in range(period, len(pattern))
+                )
+            ),
+            None,
+        )
+        if symbol_period is None:
+            return None
+        periods.append(symbol_period)
+    return math.lcm(*periods) if periods else 1
+
+
 def loop_driver_exports(
     exports: Mapping[str, Sequence[Path]],
 ) -> tuple[dict[str, Sequence[Path]], tuple[str, ...]]:

@@ -32,7 +32,7 @@ from aqw_char_renderer.batching import partition_frames
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.contracts import JobRequest
 from aqw_char_renderer.geometry import shared_canvas, union_bounds
-from aqw_char_renderer.hashing import canonical_sha256, render_key
+from aqw_char_renderer.hashing import canonical_sha256, file_sha256, render_key
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
 from aqw_char_renderer.legacy import render_swf_items as item_renderer
 from aqw_char_renderer.source_assets import SourceAssetCatalog, SourceObject
@@ -257,6 +257,47 @@ def shared_viewbox(
     margin = max(tight[2], tight[3]) * 0.1 + 2
     return shared_canvas(
         [(tight[0] - margin, tight[1] - margin, tight[2] + margin * 2, tight[3] + margin * 2)],
+        max_size=max_size,
+        padding=padding,
+    )
+
+
+def shared_viewbox_from_bounds(
+    layers: Sequence[character_svg.Layer],
+    symbol_bounds: Mapping[str, Sequence[tuple[float, float, float, float] | None]],
+    *,
+    frame_count: int,
+    facing: str,
+    zoom: float,
+    max_size: int,
+    padding: int,
+) -> tuple[float, float, float, float]:
+    """shared_viewbox from precomputed per-frame header bounds (no SVG reads)."""
+    direction = 1.0 if facing == "right" else -1.0
+    outer = (
+        direction * character_svg.CHARACTER_DISPLAY_SCALE,
+        0.0,
+        0.0,
+        character_svg.CHARACTER_DISPLAY_SCALE,
+        0.0,
+        0.0,
+    )
+    transformed: list[tuple[float, float, float, float]] = []
+    for layer in layers:
+        matrix = item_renderer.compose_transforms(outer, layer.transform)
+        for bounds in symbol_bounds.get(layer.symbol_key, [])[:frame_count]:
+            if bounds is None:
+                continue
+            transformed.append(character_svg._transformed_bounds(bounds, matrix))
+    try:
+        ans = union_bounds(transformed)
+    except ValueError as error:
+        raise character_svg.CharacterSvgError(
+            "Character composition produced no visible layers"
+        ) from error
+    margin = max(ans[2], ans[3]) * 0.1 + 2
+    return shared_canvas(
+        [(ans[0] - margin, ans[1] - margin, ans[2] + margin * 2, ans[3] + margin * 2)],
         max_size=max_size,
         padding=padding,
     )
@@ -613,6 +654,19 @@ def prepare_export_source(
                 with tarfile.open(bundle_paths[ordinal], "w:gz", compresslevel=1) as archive:
                     for index, path in enumerate(chunk, start=start + 1):
                         archive.add(path, arcname=f"{symbol.key}/{index:06d}.svg")
+            # Compute loop-detection signatures and vector-header bounds while
+            # the SVG frames are still local, so the finish phase does not need
+            # to re-download and re-parse them (step 3 of the speed review).
+            meta_key = f"jobs/{job_id}/prepare/meta/{symbol.key}.json"
+            store.write_json(
+                config.work_bucket,
+                meta_key,
+                {
+                    "frame_signatures": [file_sha256(path) for path in frames],
+                    "frame_bounds": [export_frame_bounds(path, zoom) for path in frames],
+                    "frame_count": len(frames),
+                },
+            )
             # Keep a full per-symbol archive so the finish phase can rebuild
             # every frame for loop detection and the shared viewbox.
             full_path = archive_directory / f"{symbol.key}.full.tar.gz"
@@ -705,12 +759,13 @@ def prepare_finish(
         raise character_svg.CharacterSvgError("Prepare input belongs to another job")
     mark("input_read_ms", phase)
 
-    # Rebuild per-symbol raw exports from the archives the export Lambdas
-    # uploaded, keyed for the loop detector and viewbox math.
+    # Load per-symbol metadata (signatures + bounds) computed and uploaded by
+    # the export Lambdas, so finish never re-downloads or re-parses the SVGs.
     with tempfile.TemporaryDirectory(prefix=f"aqw-finish-{request.job_id}-") as temporary:
         root = Path(temporary)
         export_key_to_result = {int(result["source_idx"]): result for result in export_results}
-        raw_exports: dict[str, list[Path]] = {}
+        symbol_signatures: dict[str, list[str]] = {}
+        symbol_bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
         part_manifest: dict[str, Any] = {}
         all_color_rules: set[tuple[str, str]] = set()
         for result in sorted(export_key_to_result.values(), key=lambda value: int(value["source_idx"])):
@@ -724,20 +779,16 @@ def prepare_finish(
             }
             for part in result["parts"]:
                 phase = time.perf_counter()
-                archive_path = store.download(
+                meta = store.read_json(
                     config.work_bucket,
-                    part["archive_key"],
-                    root / "archives" / f"{part['key']}.tar.gz",
+                    f"jobs/{request.job_id}/prepare/meta/{part['key']}.json",
                 )
-                target = root / "parts" / part["key"]
-                _extract_archive(archive_path, target)
-                mark("archive_download_ms", phase)
-                phase = time.perf_counter()
-                frames = sorted(
-                    target.glob("*.svg"),
-                    key=lambda path: int(path.stem) if path.stem.isdigit() else 0,
-                )
-                raw_exports[part["key"]] = frames
+                mark("meta_read_ms", phase)
+                symbol_signatures[part["key"]] = list(meta["frame_signatures"])
+                symbol_bounds[part["key"]] = [
+                    None if value is None else tuple(float(v) for v in value)
+                    for value in meta["frame_bounds"]
+                ]
                 part_manifest[part["key"]] = {
                     "source_idx": int(result["source_idx"]),
                     "root_class": part["root_class"],
@@ -781,28 +832,32 @@ def prepare_finish(
                 all_color_rules.update(
                     tuple(rule) for rule in rules.values()
                 )
-                mark("archive_extract_ms", phase)
+                mark("meta_parse_ms", phase)
 
         phase = time.perf_counter()
-        detection_exports = {
-            key: frames[: int(prepared["settings"]["max_frames"])]
-            for key, frames in raw_exports.items()
-        }
+        # Use the full exported signature list (including the +8 validation
+        # tail) so periods at the cap can be proven; slicing back to
+        # max_frames would discard the tail the detector relies on.
+        detection_sigs = symbol_signatures
         detected_loop: int | None = None
         detected_item_loop: int | None = None
         detected_blink_frames: int | None = None
         ignored_loop_keys: tuple[str, ...] = ()
         warnings = list(prepared.get("warnings") or [])
         if request.render.complete_loop:
-            loop_exports, ignored_loop_keys = character_svg.loop_driver_exports(
-                detection_exports
+            loop_sigs, ignored_loop_keys = character_svg.loop_driver_from_signatures(
+                detection_sigs
             )
-            detected_item_loop = character_svg.detect_complete_loop_frame_count(
-                loop_exports, max_frames=request.render.max_frames
+            detected_item_loop = character_svg.detect_loop_from_signatures(
+                loop_sigs, max_frames=request.render.max_frames
             )
-            detected_blink_frames = character_svg.detect_blink_frame_count(
-                detection_exports,
-                max_frames=request.render.max_frames,
+            detected_blink_frames = (
+                character_svg.detect_loop_from_signatures(
+                    {"armor_head": detection_sigs["armor_head"]},
+                    max_frames=request.render.max_frames,
+                )
+                if "armor_head" in detection_sigs
+                else None
             )
             if detected_item_loop is not None and detected_blink_frames is not None:
                 detected_loop = character_svg.aligned_animation_frame_count(
@@ -826,9 +881,9 @@ def prepare_finish(
 
         phase = time.perf_counter()
         layers = character_svg.build_layers(prepared["aliases"], weapon_type=prepared["weapon_type"])
-        viewbox = shared_viewbox(
+        viewbox = shared_viewbox_from_bounds(
             layers,
-            raw_exports,
+            symbol_bounds,
             frame_count=frame_count,
             facing=request.render.facing,
             zoom=float(prepared["settings"]["zoom"]),
@@ -896,11 +951,17 @@ def prepare_finish(
                 else None
             )
             loop_capped = frame_count < natural_loop if natural_loop is not None else True
-            symbol_loops = character_svg.symbol_loop_info(
-                detection_exports,
-                max_frames=request.render.max_frames,
-                validation_frames=character_svg.LOOP_VALIDATION_FRAMES,
-            )
+            symbol_loops = {
+                key: {
+                    "period": character_svg.detect_loop_from_signatures(
+                        {key: sigs},
+                        max_frames=request.render.max_frames,
+                        validation_frames=character_svg.LOOP_VALIDATION_FRAMES,
+                    ),
+                    "unique_states": len(set(sigs[: request.render.max_frames])),
+                }
+                for key, sigs in sorted(detection_sigs.items())
+            }
         else:
             natural_loop = None
             loop_capped = False
