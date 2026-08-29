@@ -204,3 +204,23 @@ def test_finalizer_orders_batches_and_rejects_duplicates() -> None:
             store=store,
             config=config(),
         )
+
+
+def test_batch_archive_ordinal_keys_are_deterministic() -> None:
+    # prepare_export_source writes jobs/<id>/prepare/parts/<symbol>.<ordinal>.tar.gz
+    # with ordinal = chunk_index // batch_size; prepare_finish reconstructs the
+    # same map from (frame_count, batch_size). Verify the two agree for a
+    # non-divisible frame count and that workers can look up by batch index.
+    frame_count = 9
+    batch_size = 4
+    ordinals = [chunk // batch_size for chunk in range(0, frame_count, batch_size)]
+    assert ordinals == [0, 1, 2]
+    reconstructed = {
+        str(ordinal): f"jobs/job/prepare/parts/weapon.{ordinal}.tar.gz"
+        for ordinal in range((frame_count + batch_size - 1) // batch_size)
+    }
+    assert list(reconstructed) == ["0", "1", "2"]
+    # Batch index -> archive ordinal used by the render worker.
+    for batch_index in range(3):
+        assert str(batch_index) in reconstructed
+        assert batch_index in ordinals

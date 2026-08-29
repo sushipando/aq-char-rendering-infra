@@ -596,18 +596,40 @@ def prepare_export_source(
         archive_directory.mkdir(parents=True, exist_ok=True)
         parts: list[dict[str, Any]] = []
         archive_bytes = 0
+        batch_size = config.batch_size
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
-            archive_path = archive_directory / f"{symbol.key}.tar.gz"
-            with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+            # Each batch worker only consumes its own frame range plus the
+            # overlap frame, so split each symbol into per-batch archives:
+            # a probe/raster worker then downloads a few hundred KB instead
+            # of the whole 100+ MiB corpus.
+            chunked: dict[int, str] = {}
+            for batch_index in range(0, len(frames), batch_size):
+                chunk = frames[batch_index:batch_index + batch_size]
+                archive_path = archive_directory / f"{symbol.key}.{len(chunked)}.tar.gz"
+                with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+                    for index, path in enumerate(chunk, start=batch_index + 1):
+                        archive.add(path, arcname=f"{index:06d}.svg")
+                archive_bytes += archive_path.stat().st_size
+                archive_key = f"jobs/{job_id}/prepare/parts/{symbol.key}.{len(chunked)}.tar.gz"
+                store.upload_file(
+                    archive_path,
+                    config.work_bucket,
+                    archive_key,
+                    content_type="application/gzip",
+                )
+                chunked[batch_index // batch_size] = archive_key
+            # Keep a full per-symbol archive so the finish phase can rebuild
+            # every frame for loop detection and the shared viewbox.
+            full_path = archive_directory / f"{symbol.key}.full.tar.gz"
+            with tarfile.open(full_path, "w:gz", compresslevel=1) as archive:
                 for index, path in enumerate(frames, start=1):
                     archive.add(path, arcname=f"{index:06d}.svg")
-            archive_bytes += archive_path.stat().st_size
-            archive_key = f"jobs/{job_id}/prepare/parts/{symbol.key}.tar.gz"
+            full_key = f"jobs/{job_id}/prepare/parts/{symbol.key}.full.tar.gz"
             store.upload_file(
-                archive_path,
+                full_path,
                 config.work_bucket,
-                archive_key,
+                full_key,
                 content_type="application/gzip",
             )
             parts.append(
@@ -615,7 +637,7 @@ def prepare_export_source(
                     "key": symbol.key,
                     "root_class": symbol.class_name,
                     "character_id": symbol.character_id,
-                    "archive_key": archive_key,
+                    "archive_key": full_key,
                     "frame_count": len(frames),
                 }
             )
@@ -709,6 +731,19 @@ def prepare_finish(
                     "root_class": part["root_class"],
                     "character_id": part["character_id"],
                     "archive_key": part["archive_key"],
+                    # Rebuild the per-batch archive keys deterministically so
+                    # the ~7000-entry map never travels through Step Functions
+                    # state; workers resolve their slice by ordinal.
+                    "batch_archives": {
+                        str(ordinal): (
+                            f"jobs/{request.job_id}/prepare/parts/"
+                            f"{part['key']}.{ordinal}.tar.gz"
+                        )
+                        for ordinal in range(
+                            (part["frame_count"] + config.batch_size - 1)
+                            // config.batch_size
+                        )
+                    },
                     "frame_count": part["frame_count"],
                     "color_rules": {
                         key: list(value)

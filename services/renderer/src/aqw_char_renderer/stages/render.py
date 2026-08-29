@@ -161,10 +161,14 @@ def render_batch(
         part_roots: dict[str, Path] = {}
         archive_bytes = 0
         for key, part in prepared["parts"].items():
+            # Prefer the batch-scoped archive so a 2000-frame job's workers
+            # download only their slice, not the entire per-symbol corpus.
+            scoped = (part.get("batch_archives") or {}).get(str(batch_index))
+            archive_key = scoped or part["archive_key"]
             download_started = time.perf_counter()
             archive_path = store.download(
                 config.work_bucket,
-                part["archive_key"],
+                archive_key,
                 root / "archives" / f"{key}.tar.gz",
             )
             timings["archive_download_ms"] += (time.perf_counter() - download_started) * 1000
@@ -173,6 +177,27 @@ def render_batch(
             extract_started = time.perf_counter()
             _extract_archive(archive_path, target)
             timings["archive_extract_ms"] += (time.perf_counter() - extract_started) * 1000
+            # The overlap frame (frame_start - 1) belongs to the previous
+            # batch, so fetch that slice too and merge the extracted tree.
+            if frame_start > 1:
+                prev_scoped = (part.get("batch_archives") or {}).get(str(batch_index - 1))
+                prev_key = prev_scoped or archive_key
+                if prev_key != archive_key:
+                    prev_started = time.perf_counter()
+                    prev_path = store.download(
+                        config.work_bucket,
+                        prev_key,
+                        root / "archives" / f"{key}.prev.tar.gz",
+                    )
+                    timings["archive_download_ms"] += (
+                        time.perf_counter() - prev_started
+                    ) * 1000
+                    archive_bytes += prev_path.stat().st_size
+                    prev_extract_started = time.perf_counter()
+                    _extract_archive(prev_path, target)
+                    timings["archive_extract_ms"] += (
+                        time.perf_counter() - prev_extract_started
+                    ) * 1000
             part_roots[key] = target
 
         # Blink timelines play once and then hold their final frame, so item
