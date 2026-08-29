@@ -138,13 +138,9 @@ def render_batch(
         )
     layers = character_svg.build_layers(prepared["aliases"], weapon_type=prepared["weapon_type"])
     if mode == "raster" and store_viewbox_key:
-        fitted = store.read_json(
-            config.work_bucket, store_viewbox_key
-        )
+        fitted = store.read_json(config.work_bucket, store_viewbox_key)
         if fitted.get("job_id") != job_id:
-            raise character_svg.CharacterSvgError(
-                "Fitted canvas belongs to another job"
-            )
+            raise character_svg.CharacterSvgError("Fitted canvas belongs to another job")
         viewbox = tuple(float(value) for value in fitted["viewbox"])
     else:
         viewbox = tuple(float(value) for value in prepared["viewbox"])
@@ -173,11 +169,7 @@ def render_batch(
             ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
 
             def source_frame_for(key: str, frame_number: int) -> int:
-                if (
-                    detected_blink_frames
-                    and key in ignored_loop_keys
-                    and detected_blink_frames > 0
-                ):
+                if detected_blink_frames and key in ignored_loop_keys and detected_blink_frames > 0:
                     # one_shot_source_frame_index is 0-based; convert between
                     # the 1-based archive file names and the 0-based blink.
                     zero_based = character_svg.one_shot_source_frame_index(
@@ -198,13 +190,9 @@ def render_batch(
                 for output_frame in range(frame_start, frame_end + 1):
                     source_frame = source_frame_for(key, output_frame)
                     if source_frame >= 1:
-                        needed_pairs.add(
-                            (source_idx, (source_frame - 1) // config.batch_size)
-                        )
+                        needed_pairs.add((source_idx, (source_frame - 1) // config.batch_size))
             for source_idx, ordinal in sorted(needed_pairs):
-                source_bundles = (prepared.get("source_bundles") or {}).get(
-                    str(source_idx), {}
-                )
+                source_bundles = (prepared.get("source_bundles") or {}).get(str(source_idx), {})
                 scoped = source_bundles.get(str(ordinal))
                 if not scoped:
                     continue
@@ -214,15 +202,11 @@ def render_batch(
                     scoped,
                     root / "archives" / f"source-{source_idx}-{ordinal}.tar.gz",
                 )
-                timings["archive_download_ms"] += (
-                    time.perf_counter() - download_started
-                ) * 1000
+                timings["archive_download_ms"] += (time.perf_counter() - download_started) * 1000
                 archive_bytes += archive_path.stat().st_size
                 extract_started = time.perf_counter()
                 _extract_archive(archive_path, root / "parts" / f"src{source_idx}")
-                timings["archive_extract_ms"] += (
-                    time.perf_counter() - extract_started
-                ) * 1000
+                timings["archive_extract_ms"] += (time.perf_counter() - extract_started) * 1000
             for key, part in prepared["parts"].items():
                 source_idx = int(part.get("source_idx", 0))
                 part_roots[key] = root / "parts" / f"src{source_idx}" / key
@@ -231,20 +215,21 @@ def render_batch(
             for key, part in prepared["parts"].items():
                 if part_roots[key].is_dir() and any(part_roots[key].glob("*.svg")):
                     continue
+                legacy_archive_key = part.get("archive_key")
+                if not legacy_archive_key:
+                    raise character_svg.CharacterSvgError(
+                        f"Source bundle is missing the requested frames for {key}"
+                    )
                 download_started = time.perf_counter()
                 archive_path = store.download(
                     config.work_bucket,
-                    part["archive_key"],
+                    legacy_archive_key,
                     root / "archives" / f"{key}.full.tar.gz",
                 )
-                timings["archive_download_ms"] += (
-                    time.perf_counter() - download_started
-                ) * 1000
+                timings["archive_download_ms"] += (time.perf_counter() - download_started) * 1000
                 extract_started = time.perf_counter()
                 _extract_archive(archive_path, part_roots[key])
-                timings["archive_extract_ms"] += (
-                    time.perf_counter() - extract_started
-                ) * 1000
+                timings["archive_extract_ms"] += (time.perf_counter() - extract_started) * 1000
 
             def compose_frame(frame_number: int) -> Path:
                 imported: dict[str, character_svg.ImportedSymbol] = {}
@@ -256,8 +241,9 @@ def render_batch(
                             f"Part archive for {key} is missing frame {source_frame}"
                         )
                     placement_colors = {
-                        tuple(int(component) for component in pair.split(",")):
-                        character_svg.AuthoredColorTransform(**values)
+                        tuple(
+                            int(component) for component in pair.split(",")
+                        ): character_svg.AuthoredColorTransform(**values)
                         for pair, values in part.get("placement_colors", {}).items()
                     }
                     imported[key] = character_svg.import_ffdec_symbol(
@@ -309,20 +295,16 @@ def render_batch(
                 tight = item_renderer.detect_svg_visible_viewbox(
                     svg, config.rsvg_convert, probe_size=max(1024, max_size * 2)
                 )
-                timings["probe_ms"] = timings.get("probe_ms", 0.0) + (
-                    time.perf_counter() - probe_started
-                ) * 1000
+                timings["probe_ms"] = (
+                    timings.get("probe_ms", 0.0) + (time.perf_counter() - probe_started) * 1000
+                )
                 # Fall back to the prepare-time vector canvas if the probe
                 # fails for this frame; FitCanvas unions across frames anyway.
                 if frame_number >= frame_start:
-                    frame_bounds[frame_number] = (
-                        tight if tight is not None else viewbox
-                    )
+                    frame_bounds[frame_number] = tight if tight is not None else viewbox
                 # Upload the composed SVG so the raster phase reuses it.
                 svg_key = f"jobs/{job_id}/svg/{frame_number:06d}.svg"
-                store.upload_file(
-                    svg, config.work_bucket, svg_key, content_type="image/svg+xml"
-                )
+                store.upload_file(svg, config.work_bucket, svg_key, content_type="image/svg+xml")
                 svg_cache[frame_number] = svg
             else:
                 svg_key = f"jobs/{job_id}/svg/{frame_number:06d}.svg"
@@ -345,15 +327,12 @@ def render_batch(
                     "job_id": job_id,
                     "batch": batch_index,
                     "frames": [
-                        {"frame": n, "bounds": list(frame_bounds[n])}
-                        for n in sorted(frame_bounds)
+                        {"frame": n, "bounds": list(frame_bounds[n])} for n in sorted(frame_bounds)
                     ],
                     "warnings": all_warnings,
                 },
             )
-            timings["manifest_write_ms"] = (
-                time.perf_counter() - manifest_write_started
-            ) * 1000
+            timings["manifest_write_ms"] = (time.perf_counter() - manifest_write_started) * 1000
         else:
             # Rasterize each frame at the fitted (tight) canvas.
             for frame_number in range(first_needed, frame_end + 1):
@@ -366,9 +345,7 @@ def render_batch(
                     max_size=max_size,
                     rsvg_convert=config.rsvg_convert,
                 )
-                timings["rasterize_ms"] += (
-                    time.perf_counter() - rasterize_started
-                ) * 1000
+                timings["rasterize_ms"] += (time.perf_counter() - rasterize_started) * 1000
                 pngs[frame_number] = png
 
             canvas_size: tuple[int, int] | None = None
@@ -388,9 +365,7 @@ def render_batch(
                 if canvas_size is None:
                     canvas_size = frame_canvas
                 elif frame_canvas != canvas_size:
-                    raise character_svg.CharacterSvgError(
-                        "Raster frames do not share one canvas"
-                    )
+                    raise character_svg.CharacterSvgError("Raster frames do not share one canvas")
                 output_key = f"jobs/{job_id}/webp-frames/{frame_number:06d}.webp"
                 upload_started = time.perf_counter()
                 store.upload_file(
@@ -441,9 +416,7 @@ def render_batch(
                     "warnings": all_warnings,
                 },
             )
-            timings["manifest_write_ms"] = (
-                time.perf_counter() - manifest_write_started
-            ) * 1000
+            timings["manifest_write_ms"] = (time.perf_counter() - manifest_write_started) * 1000
 
     total_ms = (time.perf_counter() - batch_started) * 1000
     frames_rendered = frame_end - first_needed + 1

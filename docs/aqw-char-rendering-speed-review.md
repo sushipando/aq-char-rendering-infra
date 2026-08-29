@@ -16,6 +16,65 @@ The reviewed workflow is:
 6. `RenderFrameBatches` Map
 7. `FinalizeAnimation`
 
+## 2026-08-29 implementation follow-up
+
+The active `parallel-prepare-2000frames` branch was reviewed after steps 1–4
+were implemented. A 360-frame Alina render in `us-west-2` took about 165.3
+seconds end to end:
+
+| State | Wall time |
+| --- | ---: |
+| `PrepareResolve` | 1.57 s |
+| `ExportSourceFrames` | 20.11 s |
+| `PrepareFinish` | 0.81 s |
+| `ProbeFrameBounds` | 97.48 s |
+| `FitSharedCanvas` | 2.98 s |
+| `RenderFrameBatches` | 33.28 s |
+| `FinalizeAnimation` | 9.03 s |
+
+The implementation captured the main ideas, but the audit found several
+important gaps:
+
+- raster workers skip source archives and probe workers skip overlap;
+- finalization downloads one WebP bundle per batch;
+- signatures and vector-header bounds are computed in ExportSource;
+- the source-bundle writer reopened the same archive once per symbol, so each
+  archive retained only the last symbol and workers fell back to duplicate
+  full-symbol archives;
+- `PrepareFinish` still reconstructed a large unused per-symbol archive map;
+- `item_db.json` was still downloaded for renders without an override;
+- the offline manifest builder is an FFDec export-and-hash fallback, not the
+  recommended reachable-timeline structural analyzer, and its validation-tail
+  limit and unique-state lookup were incorrect;
+- only assets with uploaded manifest objects benefit from precomputed periods.
+
+The follow-up working tree fixes the source-bundle overwrite, removes the full
+duplicate symbol archives, makes the database download conditional, corrects
+finish timing, fixes the manifest builder's tail/state bookkeeping, and adds an
+exact content-addressed unique-vector-state cache. The cache key includes SWF
+content, FFDec version, zoom, selected symbols/root frames, subframe start, and
+frame count, preventing a short or incompatible first export from poisoning
+later requests. Cache archives store each unique SVG state once plus a compact
+frame schedule, signatures, and bounds. A regression test verifies both cold
+and warm paths and confirms that every symbol is present in every source
+bundle that should contain it.
+
+This step-5 cache can eliminate most of the 20-second ExportSource wave for a
+repeat appearance, but it cannot address the dominant cost above. The 4096-px
+probe wave consumed about 59% of Alina's total wall time, so validated
+precomputed bounds and removal of `ProbeFrameBounds`/`FitSharedCanvas` remain
+the highest-leverage next change.
+
+Alina also illustrates why structural and meaningful visual periods should be
+recorded separately. Her armor contains reachable 227- and 375-frame nested
+shine timelines, whose structural LCM is 85,125 frames. The hand pose itself
+does not move: frame 1 versus the most visibly different sampled hand frame
+changes only about 38 pixel-equivalents on a 190×245 raster (about 0.081%), in
+a tiny fingertip glint. If sparse glints are excluded as duration drivers, the
+meaningful default animation is the 87-frame one-shot blink. A perceptual
+threshold needs fixture validation before replacing exact state hashes across
+the corpus.
+
 ## Short answer about knowing the loop length first
 
 Yes: for the immutable AQW asset corpus, the normal path should know the loop

@@ -6,10 +6,10 @@ prepare invocation:
 
 - prepare_resolve: resolve appearance, build symbol requests, hash, cache
   check, and publish prepare-input.json.
-- prepare_export_source: one source SWF, export its symbol timelines to
-  per-symbol tar.gz archives, upload color rules + authored placement colors.
-- prepare_finish: reconstruct raw exports from the archives, detect loop,
-  compute the shared viewbox, and write the render manifest.
+- prepare_export_source: one source SWF, reuse or export its symbol timelines,
+  publish per-source frame bundles, metadata, color rules, and placements.
+- prepare_finish: read the compact metadata, detect the loop, compute the
+  shared viewbox, and write the render manifest.
 """
 
 from __future__ import annotations
@@ -39,6 +39,9 @@ from aqw_char_renderer.source_assets import SourceAssetCatalog, SourceObject
 from aqw_char_renderer.storage import StorageError
 from aqw_char_renderer.structured_logging import log_event
 
+FFDEC_VERSION = "26.2.1"
+VECTOR_CACHE_SCHEMA = 2
+
 
 class StageStore(Protocol):
     def exists(self, bucket: str, key: str) -> Mapping[str, Any] | None: ...
@@ -51,9 +54,7 @@ class StageStore(Protocol):
         expected_sha256: str | None = None,
     ) -> Path: ...
     def upload_file(self, source: Path, bucket: str, key: str, **kwargs: Any) -> None: ...
-    def upload_file_if_absent(
-        self, source: Path, bucket: str, key: str, **kwargs: Any
-    ) -> bool: ...
+    def upload_file_if_absent(self, source: Path, bucket: str, key: str, **kwargs: Any) -> bool: ...
     def read_json(self, bucket: str, key: str) -> Any: ...
     def write_json(self, bucket: str, key: str, value: Any) -> None: ...
 
@@ -165,7 +166,7 @@ _MATRIX_ATTR_RE = re.compile(rb'transform="(matrix\([^)]*\))"')
 
 
 def _svg_dimension(root_tag: bytes, name: str) -> float | None:
-    match = re.search(rb'\b' + name.encode("ascii") + rb'="([^"]*)"', root_tag)
+    match = re.search(rb"\b" + name.encode("ascii") + rb'="([^"]*)"', root_tag)
     if match is None:
         return None
     value = match.group(1).decode("utf-8", "replace").strip()
@@ -199,7 +200,7 @@ def export_frame_bounds(path: Path, zoom: float) -> tuple[float, float, float, f
     defs_start = data.find(b"<defs")
     defs_end = data.find(b"</defs>")
     if 0 <= defs_start < defs_end:
-        body = data[:defs_start] + data[defs_end + len(b"</defs>"):]
+        body = data[:defs_start] + data[defs_end + len(b"</defs>") :]
     transform_match = _MATRIX_ATTR_RE.search(body)
     matrix = character_svg.parse_matrix(
         transform_match.group(1).decode("utf-8", "replace") if transform_match else None
@@ -309,6 +310,245 @@ def _extract_archive(archive_path: Path, target: Path) -> None:
         archive.extractall(target, filter="data")
 
 
+def _vector_symbol_identity(request: character_svg.SymbolRequest) -> str:
+    """Stable cache identity for one selected SWF symbol/root frame."""
+    return canonical_sha256(
+        {
+            "character_id": request.character_id,
+            "class_name": request.class_name,
+            "root_frame": request.frame,
+        }
+    )[:24]
+
+
+def _vector_cache_key(
+    record: SourceObject,
+    requests: Sequence[character_svg.SymbolRequest],
+    *,
+    zoom: float,
+    subframe_start: int,
+    frame_count: int,
+) -> str:
+    """Content/settings-addressed key for an exact reusable vector export."""
+    request_digest = canonical_sha256(
+        [
+            {
+                "character_id": request.character_id,
+                "class_name": request.class_name,
+                "root_frame": request.frame,
+            }
+            for request in sorted(
+                requests,
+                key=lambda value: (
+                    value.character_id,
+                    value.frame,
+                    value.class_name,
+                ),
+            )
+        ]
+    )
+    zoom_label = f"{zoom:.12g}"
+    return (
+        f"vector-states/{VECTOR_CACHE_SCHEMA}/{FFDEC_VERSION}/z{zoom_label}/"
+        f"start-{subframe_start}/frames-{frame_count}/{record.sha256}/"
+        f"{request_digest}.tar.gz"
+    )
+
+
+def _validated_cached_bounds(
+    value: Any,
+) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 4:
+        raise character_svg.CharacterSvgError("Vector cache has invalid frame bounds")
+    parsed = tuple(float(component) for component in value)
+    if not all(math.isfinite(component) for component in parsed):
+        raise character_svg.CharacterSvgError("Vector cache has non-finite frame bounds")
+    if parsed[2] < 0 or parsed[3] < 0:
+        raise character_svg.CharacterSvgError("Vector cache has negative frame bounds")
+    return parsed
+
+
+def _load_vector_cache(
+    archive_path: Path,
+    root: Path,
+    record: SourceObject,
+    requests: Sequence[character_svg.SymbolRequest],
+    *,
+    zoom: float,
+    subframe_start: int,
+    frame_count: int,
+) -> tuple[
+    dict[str, list[Path]],
+    dict[str, list[str]],
+    dict[str, list[tuple[float, float, float, float] | None]],
+]:
+    """Load and fully validate one immutable unique-vector-state archive."""
+    _extract_archive(archive_path, root)
+    try:
+        payload = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise character_svg.CharacterSvgError(
+            f"Vector cache has no valid manifest: {error}"
+        ) from error
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != VECTOR_CACHE_SCHEMA:
+        raise character_svg.CharacterSvgError("Vector cache schema is unsupported")
+    expected = {
+        "ffdec_version": FFDEC_VERSION,
+        "swf_sha256": record.sha256,
+        "zoom": zoom,
+        "subframe_start": subframe_start,
+        "frame_count": frame_count,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise character_svg.CharacterSvgError(
+                f"Vector cache {field} does not match this export"
+            )
+    raw_symbols = payload.get("symbols")
+    if not isinstance(raw_symbols, Mapping):
+        raise character_svg.CharacterSvgError("Vector cache has no symbols mapping")
+
+    exported: dict[str, list[Path]] = {}
+    signatures: dict[str, list[str]] = {}
+    bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
+    resolved_root = root.resolve()
+    for request in requests:
+        identity = _vector_symbol_identity(request)
+        raw_symbol = raw_symbols.get(identity)
+        if not isinstance(raw_symbol, Mapping):
+            raise character_svg.CharacterSvgError(
+                f"Vector cache is missing symbol {request.class_name}"
+            )
+        if (
+            raw_symbol.get("class_name") != request.class_name
+            or raw_symbol.get("character_id") != request.character_id
+            or raw_symbol.get("root_frame") != request.frame
+        ):
+            raise character_svg.CharacterSvgError(
+                f"Vector cache symbol metadata does not match {request.class_name}"
+            )
+        raw_states = raw_symbol.get("states")
+        schedule = raw_symbol.get("schedule")
+        if not isinstance(raw_states, list) or not raw_states:
+            raise character_svg.CharacterSvgError("Vector cache symbol has no states")
+        if not isinstance(schedule, list) or len(schedule) != frame_count:
+            raise character_svg.CharacterSvgError(
+                "Vector cache schedule length does not match this export"
+            )
+        state_paths: list[Path] = []
+        state_signatures: list[str] = []
+        state_bounds: list[tuple[float, float, float, float] | None] = []
+        for state_id, raw_state in enumerate(raw_states):
+            if not isinstance(raw_state, Mapping):
+                raise character_svg.CharacterSvgError("Vector cache state is invalid")
+            expected_name = f"states/{identity}/{state_id}.svg"
+            if raw_state.get("path") != expected_name:
+                raise character_svg.CharacterSvgError("Vector cache state path is invalid")
+            path = (root / expected_name).resolve()
+            if not path.is_relative_to(resolved_root) or not path.is_file():
+                raise character_svg.CharacterSvgError("Vector cache state file is missing")
+            signature = str(raw_state.get("sha256") or "")
+            if len(signature) != 64 or file_sha256(path) != signature:
+                raise character_svg.CharacterSvgError("Vector cache state checksum is invalid")
+            state_paths.append(path)
+            state_signatures.append(signature)
+            state_bounds.append(_validated_cached_bounds(raw_state.get("bounds")))
+        if not all(
+            isinstance(state_id, int)
+            and not isinstance(state_id, bool)
+            and 0 <= state_id < len(state_paths)
+            for state_id in schedule
+        ):
+            raise character_svg.CharacterSvgError("Vector cache schedule is invalid")
+        exported[request.key] = [state_paths[state_id] for state_id in schedule]
+        signatures[request.key] = [state_signatures[state_id] for state_id in schedule]
+        bounds[request.key] = [state_bounds[state_id] for state_id in schedule]
+    return exported, signatures, bounds
+
+
+def _build_vector_cache(
+    root: Path,
+    record: SourceObject,
+    requests: Sequence[character_svg.SymbolRequest],
+    exported: Mapping[str, Sequence[Path]],
+    *,
+    zoom: float,
+    subframe_start: int,
+    frame_count: int,
+) -> tuple[
+    Path,
+    dict[str, list[str]],
+    dict[str, list[tuple[float, float, float, float] | None]],
+]:
+    """Deduplicate raw exports and package their schedule plus reusable metadata."""
+    root.mkdir(parents=True, exist_ok=True)
+    symbols: dict[str, Any] = {}
+    state_files: list[tuple[Path, str]] = []
+    signatures: dict[str, list[str]] = {}
+    bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
+    for request in requests:
+        paths = list(exported.get(request.key) or ())
+        if len(paths) != frame_count:
+            raise character_svg.CharacterSvgError(
+                f"FFDec exported {len(paths)} frames for {request.key}; expected {frame_count}"
+            )
+        identity = _vector_symbol_identity(request)
+        signature_to_state: dict[str, int] = {}
+        states: list[dict[str, Any]] = []
+        schedule: list[int] = []
+        state_bounds: list[tuple[float, float, float, float] | None] = []
+        for path in paths:
+            signature = file_sha256(path)
+            state_id = signature_to_state.get(signature)
+            if state_id is None:
+                state_id = len(states)
+                signature_to_state[signature] = state_id
+                visible_bounds = export_frame_bounds(path, zoom)
+                cached_path = f"states/{identity}/{state_id}.svg"
+                states.append(
+                    {
+                        "path": cached_path,
+                        "sha256": signature,
+                        "bounds": (list(visible_bounds) if visible_bounds is not None else None),
+                    }
+                )
+                state_bounds.append(visible_bounds)
+                state_files.append((path, cached_path))
+            schedule.append(state_id)
+        symbols[identity] = {
+            "class_name": request.class_name,
+            "character_id": request.character_id,
+            "root_frame": request.frame,
+            "schedule": schedule,
+            "states": states,
+        }
+        signatures[request.key] = [states[state_id]["sha256"] for state_id in schedule]
+        bounds[request.key] = [state_bounds[state_id] for state_id in schedule]
+
+    manifest = {
+        "schema_version": VECTOR_CACHE_SCHEMA,
+        "ffdec_version": FFDEC_VERSION,
+        "swf_sha256": record.sha256,
+        "zoom": zoom,
+        "subframe_start": subframe_start,
+        "frame_count": frame_count,
+        "symbols": symbols,
+    }
+    manifest_path = root / "vector-cache-manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    archive_path = root / "vector-cache.tar.gz"
+    with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+        archive.add(manifest_path, arcname="manifest.json")
+        for source, cached_path in state_files:
+            archive.add(source, arcname=cached_path)
+    return archive_path, signatures, bounds
+
+
 def prepare_resolve(
     request: JobRequest,
     *,
@@ -350,17 +590,22 @@ def prepare_resolve(
         mark("flashvars_ms", phase)
 
         asset_root = root / "assets"
-        phase = time.perf_counter()
-        database = store.download(
-            config.source_bucket,
-            catalog.item_database.key,
-            root / "item_db.json",
-            expected_sha256=catalog.item_database.sha256,
-        )
-        mark("item_db_download_ms", phase)
-        explicit, source_records = _override(
-            request, fields, catalog, store, config, asset_root, database
-        )
+        explicit: dict[str, Path] = {}
+        source_records: dict[Path, SourceObject] = {}
+        if request.render.override is not None:
+            phase = time.perf_counter()
+            database = store.download(
+                config.source_bucket,
+                catalog.item_database.key,
+                root / "item_db.json",
+                expected_sha256=catalog.item_database.sha256,
+            )
+            mark("item_db_download_ms", phase)
+            explicit, source_records = _override(
+                request, fields, catalog, store, config, asset_root, database
+            )
+        else:
+            timings["item_db_download_ms"] = 0.0
         assets = character_svg.appearance_assets(
             fields, use_cosmetics=not request.render.base_items
         )
@@ -429,7 +674,7 @@ def prepare_resolve(
                 "schema_version": 1,
                 "renderer_version": config.renderer_version,
                 "character_renderer_sha256": catalog.character_renderer.sha256,
-                "ffdec_version": "26.2.1",
+                "ffdec_version": FFDEC_VERSION,
                 "libwebp_version": "1.5.0",
                 "asset_dataset_version": config.asset_dataset_version,
                 "appearance": appearance_for_hash,
@@ -443,9 +688,7 @@ def prepare_resolve(
             digest,
         )
         cached = (
-            store.exists(config.work_bucket, final_key)
-            if config.render_cache_enabled
-            else None
+            store.exists(config.work_bucket, final_key) if config.render_cache_enabled else None
         )
         if cached is not None:
             metadata = dict(cached.get("Metadata") or {})
@@ -494,7 +737,7 @@ def prepare_resolve(
                     try:
                         manifest_meta = store.read_json(
                             config.source_bucket,
-                            f"animation-metadata/1/26.2.1/{record.sha256}.json",
+                            f"animation-metadata/1/{FFDEC_VERSION}/{record.sha256}.json",
                         )
                     except Exception:  # noqa: BLE001 - missing metadata is a miss
                         missing = True
@@ -507,8 +750,8 @@ def prepare_resolve(
                     blink_period: int | None = None
                     for symbol in requests:
                         source_meta = meta_by_source.get(symbol.source)
-                        symbol_meta = (source_meta or {}).get("symbols", {}).get(
-                            symbol.class_name.casefold()
+                        symbol_meta = (
+                            (source_meta or {}).get("symbols", {}).get(symbol.class_name.casefold())
                         )
                         if not symbol_meta or symbol_meta.get("period") is None:
                             missing = True
@@ -518,8 +761,6 @@ def prepare_resolve(
                         else:
                             periods.append(int(symbol_meta["period"]))
                     if not missing:
-                        import math
-
                         detected_item_loop = math.lcm(*periods) if periods else 1
                         detected_blink_frames = blink_period
                         if detected_item_loop is not None and detected_blink_frames is not None:
@@ -646,12 +887,19 @@ def prepare_export_source(
 ) -> dict[str, Any]:
     """Phase 2: export one source SWF's symbol timelines in parallel.
 
-    Downloads prepare-input.json + its source SWF, runs FFDec once for that
-    source, uploads one per-symbol tar.gz archive, and reports the parts plus
-    color rules and authored placement colors computed from the local file.
+    Reuses an exact content-addressed vector-state cache when available,
+    otherwise runs FFDec once and publishes that cache. Uploads per-source
+    frame bundles plus compact signature/bounds metadata for finish/render.
     """
     started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def mark(name: str, phase: float) -> None:
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - phase) * 1000
+
+    phase = time.perf_counter()
     prepared = store.read_json(config.work_bucket, input_key)
+    mark("input_read_ms", phase)
     if prepared.get("job_id") != job_id:
         raise character_svg.CharacterSvgError("Prepare input belongs to another job")
     source_idx = int(source["idx"])
@@ -662,11 +910,19 @@ def prepare_export_source(
 
     with tempfile.TemporaryDirectory(prefix=f"aqw-export-{job_id}-{source_idx}-") as temporary:
         root = Path(temporary)
+        phase = time.perf_counter()
         swf = store.download(
             config.source_bucket,
             str(source["key"]),
             root / "source.swf",
             expected_sha256=str(source["sha256"]),
+        )
+        mark("source_download_ms", phase)
+        record = SourceObject(
+            remote_path=str(source.get("remote_path") or ""),
+            key=str(source["key"]),
+            sha256=str(source["sha256"]),
+            size=0,
         )
         requests = [
             character_svg.SymbolRequest(
@@ -678,20 +934,97 @@ def prepare_export_source(
             )
             for request in source["requests"]
         ]
-        exported = character_svg.export_requested_symbol_frames(
+        cache_key = _vector_cache_key(
+            record,
             requests,
-            ffdec=config.ffdec_path,
             zoom=zoom,
-            destination=root / "exports",
             subframe_start=subframe_start,
             frame_count=export_frame_count,
         )
-        record = SourceObject(
-            remote_path=str(source.get("remote_path") or ""),
-            key=str(source["key"]),
-            sha256=str(source["sha256"]),
-            size=0,
-        )
+        cache_hit = False
+        exported: dict[str, list[Path]] = {}
+        vector_signatures: dict[str, list[str]] = {}
+        vector_bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
+        phase = time.perf_counter()
+        cache_exists = store.exists(config.source_bucket, cache_key) is not None
+        mark("vector_cache_head_ms", phase)
+        if cache_exists:
+            phase = time.perf_counter()
+            try:
+                cache_archive = store.download(
+                    config.source_bucket,
+                    cache_key,
+                    root / "vector-cache" / "states.tar.gz",
+                )
+                exported, vector_signatures, vector_bounds = _load_vector_cache(
+                    cache_archive,
+                    root / "cached-states",
+                    record,
+                    requests,
+                    zoom=zoom,
+                    subframe_start=subframe_start,
+                    frame_count=export_frame_count,
+                )
+                cache_hit = True
+            except Exception as error:  # noqa: BLE001 - corrupt cache must not fail a render
+                log_event(
+                    "vector_cache_read_failed",
+                    job_id=job_id,
+                    source_idx=source_idx,
+                    cache_key=cache_key,
+                    error=f"{type(error).__name__}: {error}",
+                )
+                exported = {}
+                vector_signatures = {}
+                vector_bounds = {}
+            mark("vector_cache_read_ms", phase)
+
+        cache_created = False
+        if not cache_hit:
+            phase = time.perf_counter()
+            exported = character_svg.export_requested_symbol_frames(
+                requests,
+                ffdec=config.ffdec_path,
+                zoom=zoom,
+                destination=root / "exports",
+                subframe_start=subframe_start,
+                frame_count=export_frame_count,
+            )
+            mark("ffdec_export_ms", phase)
+            phase = time.perf_counter()
+            cache_archive, vector_signatures, vector_bounds = _build_vector_cache(
+                root / "cache-build",
+                record,
+                requests,
+                exported,
+                zoom=zoom,
+                subframe_start=subframe_start,
+                frame_count=export_frame_count,
+            )
+            mark("vector_cache_build_ms", phase)
+            phase = time.perf_counter()
+            try:
+                cache_created = store.upload_file_if_absent(
+                    cache_archive,
+                    config.source_bucket,
+                    cache_key,
+                    content_type="application/gzip",
+                    metadata={
+                        "swf-sha256": record.sha256,
+                        "ffdec-version": FFDEC_VERSION,
+                    },
+                )
+            except Exception as error:  # noqa: BLE001 - cache is optional acceleration
+                log_event(
+                    "vector_cache_write_failed",
+                    job_id=job_id,
+                    source_idx=source_idx,
+                    cache_key=cache_key,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            mark("vector_cache_upload_ms", phase)
+
+        phase = time.perf_counter()
         rules = _source_color_rules(
             swf,
             record,
@@ -700,6 +1033,7 @@ def prepare_export_source(
             scripts_root=root / "scripts",
         )
         placement_colors = character_svg.authored_swf_color_transforms(swf)
+        mark("source_metadata_ms", phase)
 
         archive_directory = root / "archives"
         archive_directory.mkdir(parents=True, exist_ok=True)
@@ -711,46 +1045,45 @@ def prepare_export_source(
         # ~1 GET per symbol. Entries are namespaced <symbol>/<frame>.svg.
         frame_count = int(prepared["export_frame_count"])
         chunk_count = max(1, (frame_count + batch_size - 1) // batch_size)
-        bundle_paths: dict[int, Path] = {}
-        for ordinal in range(chunk_count):
-            bundle_paths[ordinal] = archive_directory / f"source.{ordinal}.tar.gz"
+        bundle_paths = {
+            ordinal: archive_directory / f"source.{ordinal}.tar.gz"
+            for ordinal in range(chunk_count)
+        }
+        phase = time.perf_counter()
+        for ordinal, bundle_path in sorted(bundle_paths.items()):
+            start = ordinal * batch_size
+            stop = start + batch_size
+            with tarfile.open(bundle_path, "w:gz", compresslevel=1) as archive:
+                for symbol in sorted(requests, key=lambda item: item.key):
+                    for index, path in enumerate(exported[symbol.key][start:stop], start=start + 1):
+                        archive.add(path, arcname=f"{symbol.key}/{index:06d}.svg")
+        mark("bundle_build_ms", phase)
+
+        phase = time.perf_counter()
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
-            for ordinal in range(chunk_count):
-                start = ordinal * batch_size
-                chunk = frames[start:start + batch_size]
-                with tarfile.open(bundle_paths[ordinal], "w:gz", compresslevel=1) as archive:
-                    for index, path in enumerate(chunk, start=start + 1):
-                        archive.add(path, arcname=f"{symbol.key}/{index:06d}.svg")
-            # Compute loop-detection signatures and vector-header bounds while
-            # the SVG frames are still local, so the finish phase does not need
-            # to re-download and re-parse them (step 3 of the speed review).
             meta_key = f"jobs/{job_id}/prepare/meta/{symbol.key}.json"
             store.write_json(
                 config.work_bucket,
                 meta_key,
                 {
-                    "frame_signatures": [file_sha256(path) for path in frames],
-                    "frame_bounds": [export_frame_bounds(path, zoom) for path in frames],
+                    "frame_signatures": vector_signatures[symbol.key],
+                    "frame_bounds": vector_bounds[symbol.key],
                     "frame_count": len(frames),
                 },
             )
-            # Keep a full per-symbol archive so the finish phase can rebuild
-            # every frame for loop detection and the shared viewbox.
-            full_path = archive_directory / f"{symbol.key}.full.tar.gz"
-            with tarfile.open(full_path, "w:gz", compresslevel=1) as archive:
-                for index, path in enumerate(frames, start=1):
-                    archive.add(path, arcname=f"{index:06d}.svg")
-            full_key = f"jobs/{job_id}/prepare/parts/{symbol.key}.full.tar.gz"
-            store.upload_file(
-                full_path,
-                config.work_bucket,
-                full_key,
-                content_type="application/gzip",
+            parts.append(
+                {
+                    "key": symbol.key,
+                    "root_class": symbol.class_name,
+                    "character_id": symbol.character_id,
+                    "frame_count": len(frames),
+                }
             )
+        mark("meta_upload_ms", phase)
 
         # Upload the per-source bundles.
-        source_bundles: dict[str, str] = {}
+        phase = time.perf_counter()
         for ordinal, bundle_path in sorted(bundle_paths.items()):
             archive_bytes += bundle_path.stat().st_size
             bundle_key = f"jobs/{job_id}/prepare/source-bundles/{source_idx}.{ordinal}.tar.gz"
@@ -760,31 +1093,26 @@ def prepare_export_source(
                 bundle_key,
                 content_type="application/gzip",
             )
-            source_bundles[str(ordinal)] = bundle_key
-        for symbol in sorted(requests, key=lambda item: item.key):
-            frames = exported[symbol.key]
-            parts.append(
-                {
-                    "key": symbol.key,
-                    "root_class": symbol.class_name,
-                    "character_id": symbol.character_id,
-                    "archive_key": (
-                        f"jobs/{job_id}/prepare/parts/{symbol.key}.full.tar.gz"
-                    ),
-                    "frame_count": len(frames),
-                }
-            )
+        mark("bundle_upload_ms", phase)
+    total_ms = (time.perf_counter() - started) * 1000
+    accounted_ms = sum(timings.values())
     log_event(
         "prepare_export_complete",
         job_id=job_id,
         source_idx=source_idx,
         parts=len(parts),
         archive_bytes=archive_bytes,
-        duration_ms=round((time.perf_counter() - started) * 1000),
+        cache_hit=cache_hit,
+        cache_created=cache_created,
+        cache_key=cache_key,
+        duration_ms=round(total_ms, 1),
+        unaccounted_ms=round(total_ms - accounted_ms, 1),
+        **{key: round(value, 1) for key, value in sorted(timings.items())},
     )
     return {
         "job_id": job_id,
         "source_idx": source_idx,
+        "vector_cache_hit": cache_hit,
         "parts": parts,
         "color_rules": {key: list(value) for key, value in rules.items()},
         "placement_colors": {
@@ -836,13 +1164,14 @@ def prepare_finish(
         symbol_bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
         part_manifest: dict[str, Any] = {}
         all_color_rules: set[tuple[str, str]] = set()
-        for result in sorted(export_key_to_result.values(), key=lambda value: int(value["source_idx"])):
-            rules = {
-                name: tuple(rule) for name, rule in result["color_rules"].items()
-            }
+        for result in sorted(
+            export_key_to_result.values(), key=lambda value: int(value["source_idx"])
+        ):
+            rules = {name: tuple(rule) for name, rule in result["color_rules"].items()}
             placement = {
-                tuple(int(component) for component in pair.split(",")):
-                character_svg.AuthoredColorTransform(**values)
+                tuple(
+                    int(component) for component in pair.split(",")
+                ): character_svg.AuthoredColorTransform(**values)
                 for pair, values in result["placement_colors"].items()
             }
             for part in result["parts"]:
@@ -852,34 +1181,18 @@ def prepare_finish(
                     f"jobs/{request.job_id}/prepare/meta/{part['key']}.json",
                 )
                 mark("meta_read_ms", phase)
+                phase = time.perf_counter()
                 symbol_signatures[part["key"]] = list(meta["frame_signatures"])
                 symbol_bounds[part["key"]] = [
                     None if value is None else tuple(float(v) for v in value)
                     for value in meta["frame_bounds"]
                 ]
-                part_manifest[part["key"]] = {
+                part_record = {
                     "source_idx": int(result["source_idx"]),
                     "root_class": part["root_class"],
                     "character_id": part["character_id"],
-                    "archive_key": part["archive_key"],
-                    # Rebuild the per-batch archive keys deterministically so
-                    # the ~7000-entry map never travels through Step Functions
-                    # state; workers resolve their slice by ordinal.
-                    "batch_archives": {
-                        str(ordinal): (
-                            f"jobs/{request.job_id}/prepare/parts/"
-                            f"{part['key']}.{ordinal}.tar.gz"
-                        )
-                        for ordinal in range(
-                            (part["frame_count"] + config.batch_size - 1)
-                            // config.batch_size
-                        )
-                    },
                     "frame_count": part["frame_count"],
-                    "color_rules": {
-                        key: list(value)
-                        for key, value in sorted(rules.items())
-                    },
+                    "color_rules": {key: list(value) for key, value in sorted(rules.items())},
                     "placement_colors": {
                         f"{parent_id},{child_id}": {
                             field: getattr(transform, field)
@@ -897,9 +1210,12 @@ def prepare_finish(
                         for (parent_id, child_id), transform in sorted(placement.items())
                     },
                 }
-                all_color_rules.update(
-                    tuple(rule) for rule in rules.values()
-                )
+                # Legacy manifests may still need the full per-symbol archive;
+                # new complete source bundles make that duplicate unnecessary.
+                if part.get("archive_key"):
+                    part_record["archive_key"] = part["archive_key"]
+                part_manifest[part["key"]] = part_record
+                all_color_rules.update(tuple(rule) for rule in rules.values())
                 mark("meta_parse_ms", phase)
 
         phase = time.perf_counter()
@@ -923,9 +1239,7 @@ def prepare_finish(
             )
             ignored_loop_keys = ("armor_head",)
         elif request.render.complete_loop:
-            loop_sigs, ignored_loop_keys = character_svg.loop_driver_from_signatures(
-                detection_sigs
-            )
+            loop_sigs, ignored_loop_keys = character_svg.loop_driver_from_signatures(detection_sigs)
             detected_item_loop = character_svg.detect_loop_from_signatures(
                 loop_sigs, max_frames=request.render.max_frames
             )
@@ -958,7 +1272,9 @@ def prepare_finish(
         mark("loop_detection_ms", phase)
 
         phase = time.perf_counter()
-        layers = character_svg.build_layers(prepared["aliases"], weapon_type=prepared["weapon_type"])
+        layers = character_svg.build_layers(
+            prepared["aliases"], weapon_type=prepared["weapon_type"]
+        )
         viewbox = shared_viewbox_from_bounds(
             layers,
             symbol_bounds,

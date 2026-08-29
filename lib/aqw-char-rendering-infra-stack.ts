@@ -537,6 +537,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           sourceBucket.arnForObjects(
             `dynamic-assets/${tuning.render.assetDatasetVersion}/*`,
           ),
+          // Content-addressed vector-state warm cache written by export workers.
+          sourceBucket.arnForObjects('vector-states/*'),
         ],
       }),
     );

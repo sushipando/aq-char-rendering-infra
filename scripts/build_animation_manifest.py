@@ -40,7 +40,9 @@ from aqw_char_renderer import character_svg
 from aqw_char_renderer.hashing import canonical_json, file_sha256
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
 
-SCAN_FRAMES = 2008  # matches the request-time cap plus validation tail
+FFDEC_VERSION = "26.2.1"
+MAX_OUTPUT_FRAMES = 2000
+SCAN_FRAMES = MAX_OUTPUT_FRAMES + character_svg.LOOP_VALIDATION_FRAMES
 
 
 def parser() -> argparse.ArgumentParser:
@@ -142,12 +144,16 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                 continue
             signatures = [file_sha256(path) for path in paths]
             pattern = character_svg.signature_state_pattern(signatures)
-            states: list[str] = []
-            for state_id in dict.fromkeys(pattern):
-                states.append(signatures[state_id])
+            first_signature_by_state: dict[int, str] = {}
+            for frame_index, state_id in enumerate(pattern):
+                first_signature_by_state.setdefault(state_id, signatures[frame_index])
+            states = [
+                first_signature_by_state[state_id]
+                for state_id in range(len(first_signature_by_state))
+            ]
             period = character_svg.detect_loop_from_signatures(
                 {request.key: signatures},
-                max_frames=scan_frames,
+                max_frames=max(1, scan_frames - character_svg.LOOP_VALIDATION_FRAMES),
                 validation_frames=character_svg.LOOP_VALIDATION_FRAMES,
             )
             symbols[request.class_name.casefold()] = {
@@ -184,9 +190,7 @@ def main() -> int:
 
     def run_one(path: Path) -> str:
         digest = file_sha256(path)
-        key = (
-            f"animation-metadata/1/{'26.2.1'}/{digest}.json"
-        )
+        key = f"animation-metadata/1/{FFDEC_VERSION}/{digest}.json"
         try:
             client.head_object(Bucket=args.bucket, Key=key)
         except Exception:  # noqa: BLE001,S110 - missing means compute
@@ -197,7 +201,7 @@ def main() -> int:
         if payload is None:
             return "skipped"
         payload["swf_sha256"] = digest
-        payload["ffdec_version"] = "26.2.1"
+        payload["ffdec_version"] = FFDEC_VERSION
         payload["scan_frames"] = SCAN_FRAMES
         body = canonical_json(payload)
         try:
@@ -217,9 +221,7 @@ def main() -> int:
         for done, future in enumerate(as_completed(futures), start=1):
             results[future.result()] += 1
             if done % 50 == 0 or done == len(futures):
-                print(
-                    f"{done}/{len(futures)} {results}", flush=True
-                )
+                print(f"{done}/{len(futures)} {results}", flush=True)
     print(f"Complete {results}", flush=True)
     return 0
 
