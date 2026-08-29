@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import re
+import tarfile
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
@@ -12,8 +15,10 @@ from aqw_char_renderer import character_svg
 from aqw_char_renderer.batching import partition_frames
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.contracts import JobRequest
+from aqw_char_renderer.geometry import shared_canvas, union_bounds
 from aqw_char_renderer.hashing import canonical_sha256, render_key
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
+from aqw_char_renderer.legacy import render_swf_items as item_renderer
 from aqw_char_renderer.source_assets import SourceAssetCatalog, SourceObject
 
 
@@ -33,6 +38,108 @@ class StageStore(Protocol):
     ) -> bool: ...
     def read_json(self, bucket: str, key: str) -> Any: ...
     def write_json(self, bucket: str, key: str, value: Any) -> None: ...
+
+
+_SVG_ROOT_TAG_RE = re.compile(rb"<svg\b[^>]*>", re.DOTALL)
+_MATRIX_ATTR_RE = re.compile(rb'transform="(matrix\([^)]*\))"')
+
+
+def _svg_dimension(root_tag: bytes, name: str) -> float | None:
+    match = re.search(rb'\b' + name.encode("ascii") + rb'="([^"]*)"', root_tag)
+    if match is None:
+        return None
+    value = match.group(1).decode("utf-8", "replace").strip()
+    numeric = re.fullmatch(r"([-+0-9.eE]+)(?:px)?", value)
+    if numeric is None:
+        return None
+    try:
+        parsed = float(numeric.group(1))
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def export_frame_bounds(path: Path, zoom: float) -> tuple[float, float, float, float] | None:
+    """Bounds of one raw FFDec frame export, parsed from its header only.
+
+    Mirrors import_ffdec_symbol's bounds math without paying for a full XML
+    parse of every frame. Returns None for intentionally empty exports.
+    """
+    data = path.read_bytes()
+    root_match = _SVG_ROOT_TAG_RE.search(data)
+    if root_match is None:
+        raise character_svg.CharacterSvgError(f"FFDec SVG has no root element: {path}")
+    width = _svg_dimension(root_match.group(0), "width")
+    height = _svg_dimension(root_match.group(0), "height")
+    if width is None or height is None:
+        raise character_svg.CharacterSvgError(f"FFDec SVG has no usable dimensions: {path}")
+    if width == 0 or height == 0:
+        return None
+    body = data
+    defs_start = data.find(b"<defs")
+    defs_end = data.find(b"</defs>")
+    if 0 <= defs_start < defs_end:
+        body = data[:defs_start] + data[defs_end + len(b"</defs>"):]
+    transform_match = _MATRIX_ATTR_RE.search(body)
+    matrix = character_svg.parse_matrix(
+        transform_match.group(1).decode("utf-8", "replace") if transform_match else None
+    )
+    if matrix is None:
+        raise character_svg.CharacterSvgError(f"FFDec frame wrapper has no matrix: {path}")
+    a, b, c, d, e, f = matrix
+    if abs(b) > 1e-8 or abs(c) > 1e-8 or abs(a - zoom) > 1e-5 or abs(d - zoom) > 1e-5:
+        raise character_svg.CharacterSvgError(
+            f"Unexpected FFDec crop/zoom matrix {matrix} in {path}"
+        )
+    return (-e / zoom, -f / zoom, width / zoom, height / zoom)
+
+
+def shared_viewbox(
+    layers: Sequence[character_svg.Layer],
+    raw_exports: Mapping[str, Sequence[Path]],
+    *,
+    frame_count: int,
+    facing: str,
+    zoom: float,
+    max_size: int,
+    padding: int,
+) -> tuple[float, float, float, float]:
+    """Union every composed frame's vector bounds into one stable animation canvas.
+
+    This replaces the old compose->bounds reduce: rasterizing every frame
+    against this canvas keeps one pixel scale for the whole animation while
+    webpmux still receives delta-cropped frames with offsets.
+    """
+    direction = 1.0 if facing == "right" else -1.0
+    outer = (
+        direction * character_svg.CHARACTER_DISPLAY_SCALE,
+        0.0,
+        0.0,
+        character_svg.CHARACTER_DISPLAY_SCALE,
+        0.0,
+        0.0,
+    )
+    transformed: list[tuple[float, float, float, float]] = []
+    for layer in layers:
+        matrix = item_renderer.compose_transforms(outer, layer.transform)
+        for frame in raw_exports[layer.symbol_key][:frame_count]:
+            bounds = export_frame_bounds(frame, zoom)
+            if bounds is None:
+                continue
+            transformed.append(character_svg._transformed_bounds(bounds, matrix))
+    try:
+        tight = union_bounds(transformed)
+    except ValueError as error:
+        raise character_svg.CharacterSvgError(
+            "Character composition produced no visible layers"
+        ) from error
+    # Match compose_svg's conservative page margin so filter glow is not clipped.
+    margin = max(tight[2], tight[3]) * 0.1 + 2
+    return shared_canvas(
+        [(tight[0] - margin, tight[1] - margin, tight[2] + margin * 2, tight[3] + margin * 2)],
+        max_size=max_size,
+        padding=padding,
+    )
 
 
 def _override(
@@ -266,16 +373,40 @@ def prepare_job(
                 destination=root / "scripts",
             )
 
+        layers = character_svg.build_layers(aliases, weapon_type=weapon_type)
+        viewbox = shared_viewbox(
+            layers,
+            raw_exports,
+            frame_count=frame_count,
+            facing=request.render.facing,
+            zoom=request.render.zoom,
+            max_size=request.render.max_size,
+            padding=request.render.padding,
+        )
+
+        # Upload one compressed archive per symbol part instead of one object
+        # per frame: downstream workers fetch a handful of archives rather
+        # than thousands of individual SVGs.
+        archive_directory = root / "archives"
+        archive_directory.mkdir(parents=True, exist_ok=True)
         part_manifest: dict[str, Any] = {}
         for symbol in requests:
-            frame_keys: list[str] = []
-            for index, path in enumerate(raw_exports[symbol.key][:frame_count], start=1):
-                key = f"jobs/{request.job_id}/prepare/parts/{symbol.key}/{index:06d}.svg"
-                store.upload_file(path, config.work_bucket, key, content_type="image/svg+xml")
-                frame_keys.append(key)
+            frames = raw_exports[symbol.key][:frame_count]
+            archive_path = archive_directory / f"{symbol.key}.tar.gz"
+            with tarfile.open(archive_path, "w:gz") as archive:
+                for index, path in enumerate(frames, start=1):
+                    archive.add(path, arcname=f"{index:06d}.svg")
+            archive_key = f"jobs/{request.job_id}/prepare/parts/{symbol.key}.tar.gz"
+            store.upload_file(
+                archive_path,
+                config.work_bucket,
+                archive_key,
+                content_type="application/gzip",
+            )
             part_manifest[symbol.key] = {
                 "root_class": symbol.class_name,
-                "frames": frame_keys,
+                "archive_key": archive_key,
+                "frame_count": len(frames),
                 "color_rules": {
                     key: list(value)
                     for key, value in sorted(rules_by_source.get(symbol.source, {}).items())
@@ -292,6 +423,7 @@ def prepare_job(
             "final_key": final_key,
             "frame_count": frame_count,
             "frame_rate": frame_rate,
+            "viewbox": list(viewbox),
             "frame_durations": character_svg.frame_durations_for_rate(frame_count, frame_rate),
             "fields": dict(sorted(fields.items())),
             "aliases": dict(sorted(aliases.items())),
@@ -327,8 +459,7 @@ def prepare_job(
             "render_hash": digest,
             "final_key": final_key,
             "manifest_key": manifest_key,
-            "compose_batches": batches,
-            "raster_batches": batches,
+            "batches": batches,
             "frame_count": frame_count,
         }
     finally:

@@ -34,16 +34,16 @@ class StageStore(Protocol):
 def _ordered_frames(
     job_id: str,
     frame_count: int,
-    raster_results: list[dict[str, Any]],
+    render_results: list[dict[str, Any]],
     *,
     store: StageStore,
     config: RuntimeConfig,
 ) -> list[dict[str, Any]]:
     by_number: dict[int, dict[str, Any]] = {}
-    for result in raster_results:
+    for result in render_results:
         batch = store.read_json(config.work_bucket, result["batch_manifest_key"])
         if batch.get("job_id") != job_id:
-            raise character_svg.CharacterSvgError("Encode manifest belongs to another job")
+            raise character_svg.CharacterSvgError("Render batch manifest belongs to another job")
         for frame in batch["frames"]:
             number = int(frame["frame"])
             if number in by_number:
@@ -86,7 +86,7 @@ def finalize_job(
     *,
     job_id: str,
     manifest_key: str,
-    raster_results: list[dict[str, Any]],
+    render_results: list[dict[str, Any]],
     store: StageStore,
     config: RuntimeConfig,
 ) -> dict[str, Any]:
@@ -94,7 +94,7 @@ def finalize_job(
     if prepared.get("job_id") != job_id:
         raise character_svg.CharacterSvgError("Prepare manifest belongs to another job")
     frame_count = int(prepared["frame_count"])
-    frames = _ordered_frames(job_id, frame_count, raster_results, store=store, config=config)
+    frames = _ordered_frames(job_id, frame_count, render_results, store=store, config=config)
     canvas = (int(frames[0]["canvas_width"]), int(frames[0]["canvas_height"]))
     final_key = str(prepared["final_key"])
     cached = store.exists(config.work_bucket, final_key)

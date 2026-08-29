@@ -1,8 +1,15 @@
-"""Apply the shared canvas, rasterize SVGs, and encode delta WebP frames."""
+"""Compose, rasterize, and delta-encode one batch of frames in a single stage.
+
+This merged stage replaces the old compose -> bounds -> raster chain. Prepare
+computes one shared animation canvas up front, so each worker can compose a
+frame in memory, rasterize it exactly once, and encode the delta WebP without
+any intermediate S3 round-trips.
+"""
 
 from __future__ import annotations
 
 import subprocess
+import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -20,6 +27,12 @@ class StageStore(Protocol):
     def upload_file(self, source: Path, bucket: str, key: str, **kwargs: Any) -> None: ...
     def read_json(self, bucket: str, key: str) -> Any: ...
     def write_json(self, bucket: str, key: str, value: Any) -> None: ...
+
+
+def _extract_archive(archive_path: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(target, filter="data")
 
 
 def _rasterize(
@@ -78,38 +91,89 @@ def _encode_frame(
     return x, y, width, height, canvas
 
 
-def raster_batch(
+def render_batch(
     *,
     job_id: str,
     manifest_key: str,
-    shared_canvas_key: str,
     batch: dict[str, int],
     store: StageStore,
     config: RuntimeConfig,
 ) -> dict[str, Any]:
     prepared = store.read_json(config.work_bucket, manifest_key)
-    shared = store.read_json(config.work_bucket, shared_canvas_key)
-    if prepared.get("job_id") != job_id or shared.get("job_id") != job_id:
-        raise character_svg.CharacterSvgError("Raster input belongs to another job")
+    if prepared.get("job_id") != job_id:
+        raise character_svg.CharacterSvgError("Prepare manifest belongs to another job")
     batch_index = int(batch["index"])
     frame_start = int(batch["frame_start"])
     frame_end = int(batch["frame_end"])
-    viewbox = tuple(float(value) for value in shared["viewbox"])
-    max_size = int(prepared["settings"]["max_size"])
+    frame_count = int(prepared["frame_count"])
+    if frame_start < 1 or frame_end > frame_count or frame_start > frame_end:
+        raise character_svg.CharacterSvgError(
+            f"Invalid render batch {frame_start}-{frame_end} for {frame_count} frames"
+        )
+    layers = character_svg.build_layers(prepared["aliases"], weapon_type=prepared["weapon_type"])
+    viewbox = tuple(float(value) for value in prepared["viewbox"])
+    if len(viewbox) != 4:
+        raise character_svg.CharacterSvgError("Prepare manifest has no usable shared viewbox")
+    settings = prepared["settings"]
+    max_size = int(settings["max_size"])
+    zoom = float(settings["zoom"])
     durations = [int(value) for value in prepared["frame_durations"]]
     records: list[dict[str, Any]] = []
+    all_warnings: list[str] = []
 
-    with tempfile.TemporaryDirectory(prefix=f"aqw-raster-{job_id}-{batch_index}-") as temporary:
+    with tempfile.TemporaryDirectory(prefix=f"aqw-render-{job_id}-{batch_index}-") as temporary:
         root = Path(temporary)
+        part_roots: dict[str, Path] = {}
+        for key, part in prepared["parts"].items():
+            archive_path = store.download(
+                config.work_bucket,
+                part["archive_key"],
+                root / "archives" / f"{key}.tar.gz",
+            )
+            target = root / "parts" / key
+            _extract_archive(archive_path, target)
+            part_roots[key] = target
+
+        def compose_frame(frame_number: int) -> Path:
+            imported: dict[str, character_svg.ImportedSymbol] = {}
+            for key, part in prepared["parts"].items():
+                raw_path = part_roots[key] / f"{frame_number:06d}.svg"
+                if not raw_path.is_file():
+                    raise character_svg.CharacterSvgError(
+                        f"Part archive for {key} is missing frame {frame_number}"
+                    )
+                imported[key] = character_svg.import_ffdec_symbol(
+                    key,
+                    raw_path,
+                    zoom=zoom,
+                    color_rules={
+                        name: tuple(rule) for name, rule in part["color_rules"].items()
+                    },
+                    root_class=part["root_class"],
+                )
+            output = root / "svg" / f"{frame_number:06d}.svg"
+            warnings = character_svg.compose_svg(
+                imported,
+                layers,
+                fields=prepared["fields"],
+                all_color_rules=[tuple(value) for value in prepared["all_color_rules"]],
+                output=output,
+                max_size=max_size,
+                padding=0,
+                facing=settings["facing"],
+                rsvg_convert=None,
+            )
+            for warning in warnings:
+                if warning not in all_warnings:
+                    all_warnings.append(warning)
+            return output
+
+        # Compose and rasterize one extra leading frame so the first encoded
+        # frame of the batch can delta against its predecessor.
         pngs: dict[int, Path] = {}
         first_needed = frame_start - 1 if frame_start > 1 else frame_start
         for frame_number in range(first_needed, frame_end + 1):
-            svg_key = f"jobs/{job_id}/svg/{frame_number:06d}.svg"
-            svg = store.download(
-                config.work_bucket,
-                svg_key,
-                root / "input" / f"{frame_number:06d}.svg",
-            )
+            svg = compose_frame(frame_number)
             png = root / "png" / f"{frame_number:06d}.png"
             _rasterize(
                 svg,
@@ -124,15 +188,14 @@ def raster_batch(
         for frame_number in range(frame_start, frame_end + 1):
             encoded = root / "webp" / f"{frame_number:06d}.webp"
             encoded.parent.mkdir(parents=True, exist_ok=True)
-            crop = _encode_frame(
+            x, y, width, height, frame_canvas = _encode_frame(
                 pngs[frame_number],
                 pngs.get(frame_number - 1),
                 encoded,
-                quality=float(prepared["settings"]["webp_quality"]),
-                method=int(prepared["settings"]["webp_method"]),
+                quality=float(settings["webp_quality"]),
+                method=int(settings["webp_method"]),
                 cwebp=config.cwebp,
             )
-            x, y, width, height, frame_canvas = crop
             if canvas_size is None:
                 canvas_size = frame_canvas
             elif frame_canvas != canvas_size:
@@ -155,7 +218,7 @@ def raster_batch(
                 }
             )
 
-    batch_manifest_key = f"jobs/{job_id}/encode/batch-{batch_index:04d}.json"
+    batch_manifest_key = f"jobs/{job_id}/render/batch-{batch_index:04d}.json"
     store.write_json(
         config.work_bucket,
         batch_manifest_key,
@@ -164,6 +227,7 @@ def raster_batch(
             "job_id": job_id,
             "batch": batch_index,
             "frames": records,
+            "warnings": all_warnings,
         },
     )
     return {

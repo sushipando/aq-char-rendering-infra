@@ -31,10 +31,19 @@ def _publish(config: RuntimeConfig, payload: dict[str, Any]) -> None:
     )
 
 
-def success_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
-    config = RuntimeConfig.from_env()
-    request = JobRequest.from_dict(event["request"])
-    result = event["result"]
+def complete_success(
+    *,
+    config: RuntimeConfig,
+    jobs: JobStore,
+    request: JobRequest,
+    result: dict[str, Any],
+    render_hash: str = "",
+) -> dict[str, Any]:
+    """Idempotently release the user slot and publish the success result.
+
+    Shared by the cached-result Lambda path and the finalize stage, which
+    completes rendered jobs inline to avoid a trailing state transition.
+    """
     status = "CACHE_HIT" if result.get("cache_hit") else "SUCCEEDED"
     payload = {
         "schema_version": 1,
@@ -58,12 +67,11 @@ def success_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             )
         },
     }
-    jobs = JobStore(config.job_table)
     released = jobs.release(
         request.job_id,
         status,
         attributes={
-            "render_hash": result.get("render_hash", event.get("render_hash", "")),
+            "render_hash": result.get("render_hash", render_hash),
             "result_url": result["url"],
             "result_payload": payload,
         },
@@ -76,6 +84,17 @@ def success_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         "job_succeeded", job_id=request.job_id, cache_hit=result.get("cache_hit"), released=released
     )
     return {"job_id": request.job_id, "status": "SUCCEEDED", "released": released}
+
+
+def success_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
+    config = RuntimeConfig.from_env()
+    return complete_success(
+        config=config,
+        jobs=JobStore(config.job_table),
+        request=JobRequest.from_dict(event["request"]),
+        result=event["result"],
+        render_hash=str(event.get("render_hash", "")),
+    )
 
 
 def failure_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:

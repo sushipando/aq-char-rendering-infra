@@ -1,23 +1,30 @@
 from __future__ import annotations
 
+from time import perf_counter
 from typing import Any
 
 from aqw_char_renderer.config import RuntimeConfig
-from aqw_char_renderer.jobs import JobStore
-from aqw_char_renderer.stages.bounds import reduce_bounds
+from aqw_char_renderer.stages.render import render_batch
 from aqw_char_renderer.storage import S3ObjectStore
 from aqw_char_renderer.structured_logging import log_event
 
 
 def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
+    started = perf_counter()
     config = RuntimeConfig.from_env()
-    JobStore(config.job_table).update_status(event["job_id"], "REDUCING_BOUNDS")
-    result = reduce_bounds(
+    result = render_batch(
         job_id=event["job_id"],
         manifest_key=event["manifest_key"],
-        compose_results=event["compose_results"],
+        batch=event["batch"],
         store=S3ObjectStore(),
         config=config,
     )
-    log_event("bounds_reduced", job_id=event["job_id"])
+    log_event(
+        "render_batch_complete",
+        job_id=event["job_id"],
+        batch=result["batch"],
+        frame_start=event["batch"]["frame_start"],
+        frame_end=event["batch"]["frame_end"],
+        duration_ms=round((perf_counter() - started) * 1000),
+    )
     return result

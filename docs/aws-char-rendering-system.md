@@ -158,21 +158,17 @@ Launcher Lambda
 Step Functions Standard Workflow
     |
     +--> Prepare Lambda (reserved concurrency 1)
-    |       resolve appearance, FFDec export, loop detection, cache check
+    |       resolve appearance, FFDec export, loop detection, cache check,
+    |       shared-canvas viewBox from export headers, per-part frame archives
     |
-    +--> Map 1: Compose SVG frame batches
-    |       upload SVGs and per-frame tight bounds
-    |
-    +--> Bounds Reducer Lambda
-    |       calculate one shared viewBox
-    |
-    +--> Map 2: Rasterize and encode frame batches
-    |       shared SVG canvas -> PNG -> Q85 frame WebP
+    +--> Map: Render frame batches
+    |       compose in memory -> rasterize once on the shared canvas
+    |       -> delta Q85 frame WebP
     |
     +--> Finalizer Lambda
-    |       ordered webpmux -> final S3 object
+    |       ordered webpmux -> final S3 object -> inline job completion
     |
-    +--> Complete/cleanup and SQS char-render-results
+    +--> SQS char-render-results
             |
             v
 Hetzner result listener
@@ -212,16 +208,15 @@ Required resources:
 5. `char-render-results` SQS queue and dead-letter queue.
 6. Launcher Lambda subscribed to the job queue with batch size one.
 7. Prepare Lambda.
-8. SVG composition worker Lambda.
-9. Bounds reducer Lambda.
-10. Raster/WebP frame worker Lambda.
-11. Finalizer Lambda.
-12. Cleanup/reconciliation Lambda.
-13. Step Functions Standard state machine.
-14. DynamoDB job/concurrency table.
-15. EventBridge rule for terminal Step Functions statuses.
-16. CloudFront distribution with Origin Access Control for the result prefix.
-17. CloudWatch log groups, metrics, alarms, and a cost budget.
+8. Render worker Lambda (compose + rasterize + encode per batch).
+9. Finalizer Lambda (mux + publish + inline completion).
+10. Complete Lambda (cache-hit and failure terminal paths).
+11. Cleanup/reconciliation Lambda.
+12. Step Functions Standard state machine.
+13. DynamoDB job/concurrency table.
+14. EventBridge rule for terminal Step Functions statuses.
+15. CloudFront distribution with Origin Access Control for the result prefix.
+16. CloudWatch log groups, metrics, alarms, and a cost budget.
 
 Initially, one shared renderer container image is simpler and acceptable
 because cold-start latency is not sensitive. It should contain:
@@ -253,10 +248,9 @@ These are starting values to benchmark, not permanent truths:
 | --- | ---: | ---: | ---: | ---: |
 | Launcher | 512 MB | 512 MB | 30 s | 1 |
 | Prepare | 4-7 GB | 4 GB | 900 s | 1 |
-| Compose worker | 3-4 GB | 2 GB | 900 s | 8 globally |
-| Bounds reducer | 512 MB | 512 MB | 60 s | 1-2 |
-| Raster/encode worker | 3-4 GB | 4 GB | 900 s | 8 globally |
+| Render worker | 3-4 GB | 4 GB | 900 s | 8 globally |
 | Finalizer | 2-4 GB | 4 GB | 300 s | 1-2 |
+| Complete | 512 MB | 512 MB | 60 s | 1-2 |
 | Cleanup | 512 MB | 512 MB | 60 s | 2 |
 
 Start each Map at `MaxConcurrency: 4`, then test `8`. Use 15-30 frames per
@@ -293,11 +287,8 @@ Suggested work/result bucket keys:
 ```text
 jobs/<job-id>/request.json
 jobs/<job-id>/prepare/manifest.json
-jobs/<job-id>/prepare/parts/<asset>/<symbol>/<frame>.svg
-jobs/<job-id>/compose/batch-000.json
-jobs/<job-id>/svg/000001.svg
-jobs/<job-id>/shared-canvas.json
-jobs/<job-id>/encode/batch-000.json
+jobs/<job-id>/prepare/parts/<symbol>.tar.gz
+jobs/<job-id>/render/batch-000.json
 jobs/<job-id>/webp-frames/000001.webp
 renders/<renderer-version>/q85/2048/<hash-prefix>/<render-hash>.webp
 ```
@@ -491,13 +482,9 @@ Use a Standard Workflow. The logical state graph is:
 Prepare
   -> CacheHit?
        yes -> CompleteCacheHitAndRelease -> EmitResult -> MarkResultEnqueued -> Success
-       no  -> ComposeMap
-                  -> ReduceBounds
-                  -> RasterEncodeMap
-                  -> Finalize
-                  -> CompleteSuccessAndRelease
-                  -> EmitResult
-                  -> MarkResultEnqueued
+       no  -> RenderMap (compose + rasterize + encode per batch)
+                  -> Finalize (mux, publish, CompleteSuccessAndRelease inline,
+                     EmitResult, MarkResultEnqueued)
                   -> Success
 
 Any unrecovered rendering error
@@ -518,8 +505,16 @@ terminal and its slot remains released; an alarm plus the reconciler must
 re-enqueue any terminal job lacking `result_enqueued_at`.
 
 Step Functions `Map` waits until all iterations complete successfully before
-entering the next state. That is the synchronization mechanism for the bounds
-reducer and Finalizer; do not implement polling loops between Lambdas.
+entering the next state. That is the synchronization mechanism for the
+Finalizer; do not implement polling loops between Lambdas.
+
+The shared animation canvas is computed in Prepare from the raw FFDec export
+headers (root dimensions plus the outer zoom/crop matrix), so no intermediate
+bounds-reduction state exists. Every render worker rasterizes against that
+canvas, which keeps one pixel scale for the whole animation. The canvas uses
+the conservative vector-bounds union plus the same filter-glow margin the
+composer already applied, rather than an alpha-probe rasterization per frame;
+this removes the old double rasterization of every frame.
 
 Keep state payloads small. Pass job IDs, batch ranges, S3 manifest keys, and
 small status objects through Step Functions. Store SVGs, PNGs, WebPs, and large
@@ -576,115 +571,53 @@ Therefore, v1 may briefly reserve a user slot and run Prepare before discovering
 a cache hit. Release the slot immediately on the cache-hit branch. A future
 short-lived request-to-render alias can optimize this if necessary.
 
-## Map 1: SVG composition and tight bounds
+## Map: render workers (compose + rasterize + encode)
 
 Each iteration receives a frame range and the prepare-manifest S3 key. It must:
 
-1. Download only the prepared SVG parts/rules needed by its batch.
+1. Download the manifest and one compressed part archive per symbol (Prepare
+   uploads `jobs/<job-id>/prepare/parts/<part>.tar.gz` instead of one object
+   per frame).
 2. Import symbols using the same zoom correction as the local renderer.
 3. Build the exact full character layer order and transforms.
-4. Apply color filters and minimum-stroke preparation.
-5. Write one complete character SVG per assigned frame.
-6. Determine each frame's tight visible character-space viewBox.
-7. Upload each SVG and a batch manifest containing frame number, SVG key,
-   bounds, and warnings.
+4. Apply color filters and minimum-stroke preparation, composing each frame
+   in memory.
+5. Apply the shared canvas viewBox from the prepare manifest, recalibrate
+   minimum strokes, and rasterize once with `rsvg-convert` to transparent
+   RGBA PNG.
+6. Compute the delta rectangle against the preceding global frame.
+7. Expand delta x/y offsets to even coordinates as required by animated WebP.
+8. Encode the cropped frame with pinned `cwebp` arguments equivalent to:
 
-Example batch output:
-
-```json
-{
-  "schema_version": 1,
-  "job_id": "8d1c70fd-6c7a-4abc-a539-014575b09078",
-  "batch": 2,
-  "frames": [
-    {
-      "frame": 31,
-      "svg_key": "jobs/8d1c.../svg/000031.svg",
-      "bounds": [-82.5, -140.2, 171.4, 265.8],
-      "warnings": []
-    }
-  ]
-}
+```text
+cwebp -quiet -q 85 -alpha_q 100 -m 4 [crop] input.png -o frame.webp
 ```
 
-For fidelity with the current implementation, `compose_svg()` uses
-`rsvg-convert` as an alpha probe to tighten visible bounds after a conservative
-vector-bounds pass. At `max_size=2048`, the current probe size is
-`max(1024, max_size * 2)`, or 4096 pixels. This means Map 1 contains real raster
-work and may be a major cost. Preserve behavior first, instrument it, and only
-then optimize it with image comparisons.
+9. Upload each encoded frame and a batch manifest containing frame number,
+   frame WebP key, x/y offset, duration, canvas dimensions, and checksum.
 
-## Bounds Reducer Lambda
-
-The Bounds Reducer is a small single Lambda invoked after every Map 1 batch has
-succeeded. It reads the batch manifests and computes the same union as
-`align_frame_svg_viewboxes()`:
+The shared canvas viewBox is the union of every frame's transformed vector
+bounds, computed in Prepare, plus the composer's conservative filter margin
+and configured padding:
 
 ```text
 left   = min(frame.x)
 top    = min(frame.y)
 right  = max(frame.x + frame.width)
 bottom = max(frame.y + frame.height)
+margin = max(width, height) * 0.1 + 2
 
-width  = right - left
-height = bottom - top
-```
-
-Apply padding in character-space units:
-
-```text
 content_pixels = max(1, max_size - 2 * padding)
 units_per_pixel = max(width, height) / content_pixels
 padding_units = padding * units_per_pixel
-
-shared_x = left - padding_units
-shared_y = top - padding_units
-shared_width = width + 2 * padding_units
-shared_height = height + 2 * padding_units
 ```
-
-With the current production default `padding=0`, the shared viewBox is the raw
-union. Write it to:
-
-```text
-jobs/<job-id>/shared-canvas.json
-```
-
-There is no need for the reducer to download or rewrite hundreds of SVG files.
-Map 2 can apply the shared geometry in memory before rasterization.
-
-## Map 2: shared SVG canvas, PNG, and WebP frame encoding
-
-Each iteration receives a frame range, its SVG batch manifest, and the shared
-canvas key. It must:
-
-1. Download each assigned complete SVG.
-2. Replace its frame-local `viewBox`, width, and height with geometry derived
-   from the shared canvas and `max_size`.
-3. Run the same minimum-stroke recalibration that
-   `align_frame_svg_viewboxes()` currently performs after changing scale.
-4. Rasterize with `rsvg-convert` to transparent RGBA PNG.
-5. Compute the delta rectangle against the preceding global frame.
-6. Expand delta x/y offsets to even coordinates as required by animated WebP.
-7. Encode the cropped frame with pinned `cwebp` arguments equivalent to:
-
-```text
-cwebp -quiet -q 85 -alpha_q 100 -m 4 [crop] input.png -o frame.webp
-```
-
-8. Upload each encoded frame and a batch manifest containing frame number,
-   frame WebP key, x/y offset, duration, canvas dimensions, and checksum.
 
 The first frame of a batch still depends on the prior global frame for the
 smallest delta. Avoid dependencies between concurrently running batches by
-having every non-first batch also rasterize the immediately preceding SVG as a
-temporary overlap frame. Do not upload that duplicate as an output frame. This
-duplicates one rasterization per batch while preserving the current delta
-behavior and compression.
-
-The simpler fallback is to encode each batch's first frame as a full-canvas
-replacement. It is correct when muxed with no-blend semantics but may make the
-final animation larger. Benchmark both approaches before choosing the fallback.
+having every non-first batch also compose and rasterize the immediately
+preceding frame as a temporary overlap frame. Do not upload that duplicate as
+an output frame. This duplicates one render per batch while preserving the
+current delta behavior and compression.
 
 Do not pass PNGs or frame WebPs through Step Functions payloads. Keep temporary
 PNGs in Lambda `/tmp`; only upload them for debugging or when a retry design
@@ -692,9 +625,9 @@ requires them. Upload the much smaller encoded frame WebPs for Finalizer input.
 
 ## Finalizer Lambda
 
-Finalizer runs only after every Map 2 batch succeeds. It must:
+Finalizer runs only after every render batch succeeds. It must:
 
-1. Read all encode batch manifests.
+1. Read all render batch manifests.
 2. Verify exactly one record exists for every expected frame number.
 3. Verify canvas dimensions, duration list, hashes, and frame ordering.
 4. Download the already-encoded frame WebPs.
@@ -704,11 +637,15 @@ Finalizer runs only after every Map 2 batch succeeds. It must:
    canvas, durations, loop metadata, transparency, and nonzero file size.
 7. Upload atomically to the content-addressed final result key with the required
    HTTP metadata.
-8. Write final size, total/stage durations, renderer version, and result URL to
-   the job record.
+8. Complete the job inline: write final size, durations, renderer version, and
+   result URL to the job record, release the user slot in the same terminal
+   DynamoDB transition, and publish the result-queue message.
 
 `webpmux` does not recompress pixels. The expensive `cwebp` conversion occurs
-inside Map 2. Finalizer is primarily ordered file I/O plus container assembly.
+inside the render workers. Finalizer is primarily ordered file I/O plus
+container assembly; the inline completion avoids a trailing Lambda state
+transition per render. The separate Complete Lambda remains for the cache-hit
+branch and the terminal failure path.
 
 Do not publish a partially written final key. Write to a job-specific temporary
 key, validate, then copy/promote it to the immutable render key and remove the
@@ -795,9 +732,6 @@ Suggested job statuses:
 ```text
 QUEUED
 PREPARING
-COMPOSING
-REDUCING_BOUNDS
-RASTERIZING
 FINALIZING
 CACHE_HIT
 SUCCEEDED
@@ -975,9 +909,7 @@ frame_count
 input/output bytes
 duration_ms
 ffdec_ms
-compose_ms
-bounds_probe_ms
-raster_ms
+render_ms
 cwebp_ms
 webpmux_ms
 s3_ms
@@ -1126,8 +1058,9 @@ stack.
 - Split the shared container into lean stage-specific images if cold starts or
   image size matter.
 - Reuse warm `/tmp` source assets.
-- Investigate retaining the alpha-probe raster to avoid a second full SVG
-  rasterization. Do not change this until image-regression tests prove fidelity.
+- The shared canvas is derived from vector bounds; if glow/filter clipping is
+  ever observed, evaluate an alpha-trim pass on rendered PNGs rather than
+  restoring the removed per-frame probe rasterization.
 - Add scheduled or manual cleanup/reconciliation tooling.
 - Add safe item overrides to the Discord interface.
 
@@ -1139,7 +1072,7 @@ stack.
 - Canonical render hash stability and sensitivity to every fidelity setting.
 - Deterministic batch partitioning with no missing/duplicate frames.
 - Complete-loop frame duration sum without cumulative rounding drift.
-- Bounds reducer math, padding, and negative coordinates.
+- Shared-canvas union math, padding, and negative coordinates.
 - Applying shared SVG geometry and recalibrating strokes.
 - Delta bounds at batch boundaries and even x/y expansion.
 - Ordered final mux manifest validation.

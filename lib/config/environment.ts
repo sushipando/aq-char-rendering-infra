@@ -40,9 +40,7 @@ export interface InfrastructureTuning {
   readonly functions: Readonly<{
     launcher: FunctionTuning;
     prepare: FunctionTuning;
-    compose: FunctionTuning;
-    bounds: FunctionTuning;
-    raster: FunctionTuning;
+    render: FunctionTuning;
     finalizer: FunctionTuning;
     complete: FunctionTuning;
     cleanup: FunctionTuning;
@@ -76,9 +74,7 @@ const DEV_TUNING: InfrastructureTuning = {
     launcher: mib(512, 512, 30),
     // This new AWS account currently enforces a 3008 MiB Lambda memory cap.
     prepare: mib(3008, 4096, 900),
-    compose: mib(3008, 2048, 900),
-    bounds: mib(512, 512, 60),
-    raster: mib(3008, 4096, 900),
+    render: mib(3008, 4096, 900),
     finalizer: mib(3008, 4096, 300),
     complete: mib(512, 512, 60),
     cleanup: mib(512, 512, 60),
@@ -86,7 +82,9 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
-    rendererVersion: 'v3',
+    // v4: shared canvas now comes from vector bounds computed in Prepare
+    // (the compose-stage alpha probe rasterization was removed).
+    rendererVersion: 'v4',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,

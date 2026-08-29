@@ -68,11 +68,11 @@ new jobs by CDK rather than being duplicated in the bot.
 ```text
 Discord bot -> DynamoDB admission transaction -> job SQS -> launcher
   -> Step Functions Standard
-      -> Prepare (resolve character, FFDec export, loop/cache detection)
-      -> parallel SVG composition batches
-      -> shared-bounds reducer
-      -> parallel PNG/WebP frame batches
-      -> final WebP mux and immutable promotion
+      -> Prepare (resolve character, FFDec export, loop/cache detection,
+         shared-canvas computation, per-part frame archives)
+      -> parallel render batches (compose in memory -> rasterize once
+         against the shared canvas -> delta WebP encode)
+      -> final WebP mux, immutable promotion, and inline job completion
       -> result SQS -> Discord bot
 
 CloudFront -> private S3 /renders/ objects
