@@ -21,7 +21,9 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         job_id=event["job_id"],
         manifest_key=event["manifest_key"],
         render_results=event["render_results"],
-        store=S3ObjectStore(),
+        store=S3ObjectStore(
+            max_pool_connections=config.finalizer_download_concurrency,
+        ),
         config=config,
     )
     # Complete the job inline: a DynamoDB release plus one SQS publish does

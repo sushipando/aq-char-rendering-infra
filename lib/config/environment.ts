@@ -17,6 +17,7 @@ export interface RenderTuning {
   readonly subframeStart: number;
   readonly framesPerRenderLambda: number;
   readonly sourceBundleFrameCount: number;
+  readonly finalizerDownloadConcurrency: number;
   readonly mapConcurrency: number;
   readonly webpQuality: number;
   readonly webpMethod: number;
@@ -87,6 +88,10 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v16: render workers upload individual WebP frames and the finalizer
+    // downloads them concurrently, removing output tar creation/extraction.
+    // v15: finalizer batch-manifest reads and rendered-frame bundle downloads
+    // run concurrently while retaining the existing tar bundle format.
     // v14: render workers encode complete frames and compute exactly the
     // configured number of frames. This removes the previous overlap-frame
     // rasterization that every non-first batch needed for delta cropping.
@@ -108,7 +113,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v14',
+    rendererVersion: 'v16',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
@@ -132,6 +137,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // hundreds of additional small, serial S3 uploads.
     framesPerRenderLambda: 1,
     sourceBundleFrameCount: 4,
+    finalizerDownloadConcurrency: 32,
     // Dev concurrency was raised 10 -> 1000 (case 178797464300402), so small
     // render Lambdas in a single wave are now the fast path: a 120-frame job
     // is 120 independent full-frame tasks. Memory stays capped at 3008 MiB

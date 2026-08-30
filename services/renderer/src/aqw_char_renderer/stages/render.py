@@ -329,20 +329,6 @@ def render_batch(
             )
 
         batch_manifest_key = f"jobs/{job_id}/render/batch-{batch_index:04d}.json"
-        # Bundle the batch's encoded WebPs into one archive so finalize does
-        # one GET per batch instead of N serial frame GETs.
-        bundle_path = root / "webp" / f"{job_id}.{batch_index}.tar.gz"
-        with tarfile.open(bundle_path, "w:gz", compresslevel=1) as archive:
-            for frame in records:
-                frame_path = root / "webp" / f"{frame['frame']:06d}.webp"
-                archive.add(frame_path, arcname=f"{frame['frame']:06d}.webp")
-        bundle_key = f"jobs/{job_id}/webp-batches/{batch_index:04d}.tar.gz"
-        store.upload_file(
-            bundle_path,
-            config.work_bucket,
-            bundle_key,
-            content_type="application/gzip",
-        )
         manifest_write_started = time.perf_counter()
         store.write_json(
             config.work_bucket,
@@ -352,7 +338,6 @@ def render_batch(
                 "job_id": job_id,
                 "batch": batch_index,
                 "frames": records,
-                "webp_bundle_key": bundle_key,
                 "warnings": all_warnings,
             },
         )

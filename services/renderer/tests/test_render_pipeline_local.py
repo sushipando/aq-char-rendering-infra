@@ -9,6 +9,8 @@ from __future__ import annotations
 import shutil
 import tarfile
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -80,10 +82,48 @@ def pipeline_config() -> RuntimeConfig:
         asset_dataset_version="dev-v1",
         asset_manifest_key="datasets/dev-v1/manifest.json",
         character_renderer_key="character-renderer/dev-v1/characterB.swf",
+        finalizer_download_concurrency=3,
         rsvg_convert=str(RSVG_CONVERT),
         cwebp=str(CWEBP),
         webpmux=str(WEBPMUX),
     )
+
+
+class TrackingFilesystemObjectStore(FilesystemObjectStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self._download_lock = threading.Lock()
+        self._active_frame_downloads = 0
+        self.max_concurrent_frame_downloads = 0
+
+    def download(
+        self,
+        bucket: str,
+        key: str,
+        destination: Path,
+        *,
+        expected_sha256: str | None = None,
+    ) -> Path:
+        tracked = "/webp-frames/" in key
+        if tracked:
+            with self._download_lock:
+                self._active_frame_downloads += 1
+                self.max_concurrent_frame_downloads = max(
+                    self.max_concurrent_frame_downloads,
+                    self._active_frame_downloads,
+                )
+            time.sleep(0.02)
+        try:
+            return super().download(
+                bucket,
+                key,
+                destination,
+                expected_sha256=expected_sha256,
+            )
+        finally:
+            if tracked:
+                with self._download_lock:
+                    self._active_frame_downloads -= 1
 
 
 def build_manifest(
@@ -144,7 +184,7 @@ def test_render_then_finalize_produces_valid_animation() -> None:
     job_id = "job-local"
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        store = FilesystemObjectStore(root / "objects")
+        store = TrackingFilesystemObjectStore(root / "objects")
         frame_paths = write_frames(
             root,
             [frame_svg(red=120 + index * 40, x_offset=index) for index in range(frame_count)],
@@ -161,21 +201,29 @@ def test_render_then_finalize_produces_valid_animation() -> None:
 
         # Single render phase: compose from states and rasterize at the
         # precomputed shared canvas (no probe/fit).
-        result = render_batch(
-            job_id=job_id,
-            manifest_key=manifest_key,
-            batch={"index": 0, "frame_start": 1, "frame_end": frame_count},
-            store=store,
-            config=config,
-        )
-        batch_manifest = store.read_json("work", result["batch_manifest_key"])
-        assert [frame["frame"] for frame in batch_manifest["frames"]] == [1, 2, 3]
+        results = [
+            render_batch(
+                job_id=job_id,
+                manifest_key=manifest_key,
+                batch={"index": index, "frame_start": index + 1, "frame_end": index + 1},
+                store=store,
+                config=config,
+            )
+            for index in range(frame_count)
+        ]
+        batch_manifests = [
+            store.read_json("work", result["batch_manifest_key"])
+            for result in results
+        ]
+        assert [batch["frames"][0]["frame"] for batch in batch_manifests] == [1, 2, 3]
+        assert all("webp_bundle_key" not in batch for batch in batch_manifests)
+        frames = [batch["frames"][0] for batch in batch_manifests]
         canvases = {
             (frame["canvas_width"], frame["canvas_height"])
-            for frame in batch_manifest["frames"]
+            for frame in frames
         }
         assert len(canvases) == 1
-        for frame in batch_manifest["frames"]:
+        for frame in frames:
             assert frame["x"] == 0 and frame["y"] == 0
             assert frame["width"] == frame["canvas_width"]
             assert frame["height"] == frame["canvas_height"]
@@ -183,12 +231,13 @@ def test_render_then_finalize_produces_valid_animation() -> None:
         final = finalize_job(
             job_id=job_id,
             manifest_key=manifest_key,
-            render_results=[result],
+            render_results=results,
             store=store,
             config=config,
         )
         assert final["cache_hit"] is False
         assert final["frame_count"] == frame_count
+        assert store.max_concurrent_frame_downloads > 1
         output = root / "objects" / "work" / final["final_key"]
         with Image.open(output) as animation:
             assert animation.format == "WEBP"
@@ -200,7 +249,7 @@ def test_render_then_finalize_produces_valid_animation() -> None:
         cached = finalize_job(
             job_id=job_id,
             manifest_key=manifest_key,
-            render_results=[result],
+            render_results=results,
             store=store,
             config=config,
         )

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from aqw_char_renderer.hashing import file_sha256
@@ -34,8 +35,13 @@ def validate_key(key: str) -> str:
 
 
 class S3ObjectStore:
-    def __init__(self, client: Any | None = None) -> None:
-        self.client = client or boto3.client("s3")
+    def __init__(self, client: Any | None = None, *, max_pool_connections: int = 10) -> None:
+        if max_pool_connections < 1:
+            raise ValueError("max_pool_connections must be positive")
+        self.client = client or boto3.client(
+            "s3",
+            config=BotoConfig(max_pool_connections=max_pool_connections),
+        )
 
     def exists(self, bucket: str, key: str) -> Mapping[str, Any] | None:
         validate_key(key)

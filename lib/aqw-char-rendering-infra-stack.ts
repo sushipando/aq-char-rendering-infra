@@ -275,6 +275,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       CHAR_RENDER_PUBLIC_BASE_URL: publicBaseUrl,
       CHAR_RENDER_FRAMES_PER_LAMBDA: String(tuning.render.framesPerRenderLambda),
       CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT: String(tuning.render.sourceBundleFrameCount),
+      CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY: String(
+        tuning.render.finalizerDownloadConcurrency,
+      ),
       CHAR_RENDER_MAX_ACTIVE_PER_USER: String(tuning.render.maxActivePerUser),
       CHAR_RENDER_DEFAULT_MAX_SIZE: String(tuning.render.maxSize),
       CHAR_RENDER_DEFAULT_ZOOM: String(tuning.render.zoom),

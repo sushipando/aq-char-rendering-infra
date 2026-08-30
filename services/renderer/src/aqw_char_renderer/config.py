@@ -66,6 +66,7 @@ class RuntimeConfig:
     renderer_version: str = "v3"
     frames_per_render_lambda: int = 30
     source_bundle_frame_count: int = 30
+    finalizer_download_concurrency: int = 16
     maximum_active_per_user: int = 2
     default_max_size: int = 2048
     default_zoom: float = 2.0
@@ -119,6 +120,13 @@ class RuntimeConfig:
                 legacy_batch_size,
                 1,
                 60,
+            ),
+            finalizer_download_concurrency=_integer(
+                values,
+                "CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY",
+                16,
+                1,
+                64,
             ),
             maximum_active_per_user=_integer(values, "CHAR_RENDER_MAX_ACTIVE_PER_USER", 2, 1, 25),
             default_max_size=_integer(

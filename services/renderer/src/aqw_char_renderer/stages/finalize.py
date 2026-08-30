@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import subprocess
-import tarfile
 import tempfile
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol
 
 from PIL import Image
@@ -14,12 +15,7 @@ from PIL import Image
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.hashing import file_sha256
-
-
-def _extract_archive(archive_path: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive_path) as archive:
-        archive.extractall(target, filter="data")
+from aqw_char_renderer.structured_logging import log_event
 
 
 class StageStore(Protocol):
@@ -47,12 +43,18 @@ def _ordered_frames(
     config: RuntimeConfig,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     by_number: dict[int, dict[str, Any]] = {}
-    batches: list[dict[str, Any]] = []
-    for result in render_results:
+    workers = min(config.finalizer_download_concurrency, max(1, len(render_results)))
+
+    def read_batch(result: dict[str, Any]) -> dict[str, Any]:
         batch = store.read_json(config.work_bucket, result["batch_manifest_key"])
         if batch.get("job_id") != job_id:
             raise character_svg.CharacterSvgError("Render batch manifest belongs to another job")
-        batches.append(batch)
+        return batch
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="batch-manifest") as executor:
+        batches = list(executor.map(read_batch, render_results))
+
+    for batch in batches:
         for frame in batch["frames"]:
             number = int(frame["frame"])
             if number in by_number:
@@ -99,13 +101,18 @@ def finalize_job(
     store: StageStore,
     config: RuntimeConfig,
 ) -> dict[str, Any]:
+    started = perf_counter()
+    manifest_started = perf_counter()
     prepared = store.read_json(config.work_bucket, manifest_key)
+    manifest_ms = (perf_counter() - manifest_started) * 1000
     if prepared.get("job_id") != job_id:
         raise character_svg.CharacterSvgError("Prepare manifest belongs to another job")
     frame_count = int(prepared["frame_count"])
+    batch_manifest_started = perf_counter()
     frames, batch_manifests = _ordered_frames(
         job_id, frame_count, render_results, store=store, config=config
     )
+    batch_manifest_ms = (perf_counter() - batch_manifest_started) * 1000
     canvas = (int(frames[0]["canvas_width"]), int(frames[0]["canvas_height"]))
     final_key = str(prepared["final_key"])
     cached = (
@@ -114,6 +121,15 @@ def finalize_job(
         else None
     )
     if cached is not None:
+        log_event(
+            "finalize_profile",
+            job_id=job_id,
+            cache_hit=True,
+            frame_count=frame_count,
+            manifest_ms=round(manifest_ms, 1),
+            batch_manifest_ms=round(batch_manifest_ms, 1),
+            total_ms=round((perf_counter() - started) * 1000, 1),
+        )
         return {
             "url": f"{config.public_base_url}/{final_key}",
             "frame_count": frame_count,
@@ -128,34 +144,29 @@ def finalize_job(
 
     with tempfile.TemporaryDirectory(prefix=f"aqw-finalize-{job_id}-") as temporary:
         root = Path(temporary)
-        local_frames: list[tuple[Path, dict[str, Any]]] = []
-        # Download each render batch's WebP bundle once (one GET per batch)
-        # instead of one GET per frame; fall back to per-frame keys for
-        # legacy manifests written without a bundle.
-        for batch in batch_manifests:
-            bundle_key = batch.get("webp_bundle_key")
-            group = [frame for frame in batch["frames"]]
-            if not bundle_key:
-                for frame in group:
-                    path = store.download(
-                        config.work_bucket,
-                        frame["webp_key"],
-                        root / "frames" / f"{int(frame['frame']):06d}.webp",
-                        expected_sha256=frame["sha256"],
-                    )
-                    local_frames.append((path, frame))
-                continue
-            bundle_path = store.download(
+        download_started = perf_counter()
+        # Each renderer has already uploaded its encoded frame. Download the
+        # independent objects concurrently, avoiding output tar creation and
+        # extraction in both stages.
+        def download_frame(frame: dict[str, Any]) -> Path:
+            return store.download(
                 config.work_bucket,
-                bundle_key,
-                root / "bundles" / f"batch-{int(batch['batch']):04d}.tar.gz",
+                frame["webp_key"],
+                root / "frames" / f"{int(frame['frame']):06d}.webp",
+                expected_sha256=frame["sha256"],
             )
-            extract_dir = root / "extracted" / f"batch-{int(batch['batch']):04d}"
-            _extract_archive(bundle_path, extract_dir)
-            for frame in group:
-                path = extract_dir / f"{int(frame['frame']):06d}.webp"
-                local_frames.append((path, frame))
+
+        workers = min(
+            config.finalizer_download_concurrency,
+            max(1, len(frames)),
+        )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="frame") as executor:
+            frame_paths = list(executor.map(download_frame, frames))
+        local_frames = list(zip(frame_paths, frames, strict=True))
+        download_ms = (perf_counter() - download_started) * 1000
+
         output = root / "result.webp"
+        mux_started = perf_counter()
         command = [config.webpmux]
         for path, frame in local_frames:
             command.extend(
@@ -170,7 +181,10 @@ def finalize_job(
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             raise character_svg.CharacterSvgError(f"webpmux failed: {detail[-2000:]}")
+        mux_ms = (perf_counter() - mux_started) * 1000
+        validation_started = perf_counter()
         _validate_animation(output, frame_count=frame_count, canvas=canvas)
+        validation_ms = (perf_counter() - validation_started) * 1000
         duration_ms = sum(int(frame["duration"]) for frame in frames)
         temporary_key = f"jobs/{job_id}/final/result.webp"
         metadata = {
@@ -181,6 +195,7 @@ def finalize_job(
             "duration-ms": str(duration_ms),
             "sha256": file_sha256(output),
         }
+        publish_started = perf_counter()
         store.upload_file(
             output,
             config.work_bucket,
@@ -199,6 +214,22 @@ def finalize_job(
             )
         finally:
             store.delete(config.work_bucket, temporary_key)
+        publish_ms = (perf_counter() - publish_started) * 1000
+        log_event(
+            "finalize_profile",
+            job_id=job_id,
+            cache_hit=False,
+            frame_count=frame_count,
+            batch_count=len(batch_manifests),
+            download_concurrency=workers,
+            manifest_ms=round(manifest_ms, 1),
+            batch_manifest_ms=round(batch_manifest_ms, 1),
+            download_ms=round(download_ms, 1),
+            mux_ms=round(mux_ms, 1),
+            validation_ms=round(validation_ms, 1),
+            publish_ms=round(publish_ms, 1),
+            total_ms=round((perf_counter() - started) * 1000, 1),
+        )
         return {
             "url": f"{config.public_base_url}/{final_key}",
             "frame_count": frame_count,
