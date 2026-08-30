@@ -225,6 +225,67 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
             self.assertEqual(imported.bounds, (0.0, 0.0, 0.0, 0.0))
             self.assertEqual(imported.definition.get("id"), "symbol_unarmed")
 
+    def test_import_normalizes_ffdec_font_geometry_and_filter_zoom(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "text.svg"
+            source.write_text(
+                """<?xml version="1.0"?>
+                <svg xmlns="http://www.w3.org/2000/svg"
+                     xmlns:xlink="http://www.w3.org/1999/xlink"
+                     width="40px" height="20px">
+                  <g transform="matrix(2,0,0,2,0,0)">
+                    <use xlink:href="#text0"/>
+                  </g>
+                  <defs>
+                    <g id="text0">
+                      <use transform="matrix(0.2,0.04,-0.06,0.4,7,9)"
+                           filter="url(#textGlow)" xlink:href="#font_Arial_0"/>
+                    </g>
+                    <g id="font_Arial_0"><path d="M0 0h20v40z"/></g>
+                    <filter id="textGlow">
+                      <feOffset dx="4" dy="-2"/>
+                      <feGaussianBlur stdDeviation="6 8"/>
+                    </filter>
+                  </defs>
+                </svg>""",
+                encoding="utf-8",
+            )
+
+            imported = character_svg.import_ffdec_symbol(
+                "pet",
+                source,
+                zoom=2,
+                color_rules={},
+                root_class="Pet",
+            )
+
+            root = ET.Element("root")
+            root.extend(imported.definitions)
+            root.append(imported.definition)
+            font_use = next(
+                element
+                for element in root.iter()
+                if (element.get(f"{{{character_svg.XLINK_NS}}}href") or "").endswith(
+                    "font_Arial_0"
+                )
+            )
+            self.assertMatrixAlmostEqual(
+                character_svg.parse_matrix(font_use.get("transform")),
+                (0.1, 0.02, -0.03, 0.2, 7.0, 9.0),
+            )
+            offset = next(
+                element
+                for element in root.iter()
+                if element.tag.rsplit("}", 1)[-1] == "feOffset"
+            )
+            blur = next(
+                element
+                for element in root.iter()
+                if element.tag.rsplit("}", 1)[-1] == "feGaussianBlur"
+            )
+            self.assertEqual((offset.get("dx"), offset.get("dy")), ("2", "-1"))
+            self.assertEqual(blur.get("stdDeviation"), "3 4")
+
     def test_import_restores_nested_authored_color_transform(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "part.svg"

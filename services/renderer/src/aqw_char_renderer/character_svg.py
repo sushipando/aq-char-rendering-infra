@@ -1484,6 +1484,82 @@ def parse_color_scripts(
     return rules
 
 
+def _normalize_ffdec_font_export_zoom(root: ET.Element, zoom: float) -> None:
+    """Undo FFDec's extra export zoom on embedded font glyph geometry.
+
+    FFDec applies ``-zoom`` both to the outer SVG frame and directly to paths
+    inside its generated ``font_*`` definitions. Ordinary shape definitions
+    receive only the outer zoom. Because ``import_ffdec_symbol`` removes that
+    outer frame transform, leaving the font paths alone makes static text grow
+    by the export zoom relative to the surrounding artwork. This is visible on
+    interactive pet markers such as Drudgen's quest bubble.
+
+    Pre-scale uses of generated font definitions by the inverse zoom while
+    retaining their authored translation. FFDec also scales user-space blur
+    and offset primitives attached to those text uses, so normalize those once
+    per referenced filter as well.
+    """
+    if math.isclose(zoom, 1.0, rel_tol=0, abs_tol=1e-12):
+        return
+
+    font_ids = {
+        element.get("id")
+        for element in root.iter()
+        if (element.get("id") or "").startswith("font_")
+    }
+    if not font_ids:
+        return
+
+    filter_ids: set[str] = set()
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "use":
+            continue
+        href = element.get(f"{{{XLINK_NS}}}href") or element.get("href")
+        if not href or not href.startswith("#") or href[1:] not in font_ids:
+            continue
+        transform = parse_matrix(element.get("transform"))
+        if transform is None:
+            transform = IDENTITY
+        a, b, c, d, e, f = transform
+        element.set(
+            "transform",
+            matrix_text((a / zoom, b / zoom, c / zoom, d / zoom, e, f)),
+        )
+        filter_match = _URL_REF_RE.fullmatch(element.get("filter", ""))
+        if filter_match is not None:
+            filter_ids.add(filter_match.group(1))
+
+    def scaled_numbers(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        try:
+            values = [float(value) for value in re.split(r"[\s,]+", raw.strip())]
+        except ValueError:
+            return None
+        if not values or not all(math.isfinite(value) for value in values):
+            return None
+        return " ".join(f"{value / zoom:.12g}" for value in values)
+
+    for element in root.iter():
+        if (
+            element.tag.rsplit("}", 1)[-1] != "filter"
+            or element.get("id") not in filter_ids
+            or element.get("primitiveUnits") == "objectBoundingBox"
+        ):
+            continue
+        for primitive in element.iter():
+            local_name = primitive.tag.rsplit("}", 1)[-1]
+            if local_name == "feGaussianBlur":
+                scaled = scaled_numbers(primitive.get("stdDeviation"))
+                if scaled is not None:
+                    primitive.set("stdDeviation", scaled)
+            elif local_name == "feOffset":
+                for attribute in ("dx", "dy"):
+                    scaled = scaled_numbers(primitive.get(attribute))
+                    if scaled is not None:
+                        primitive.set(attribute, scaled)
+
+
 def _rewrite_references(root: ET.Element, prefix: str) -> None:
     id_map: dict[str, str] = {}
     for element in root.iter():
@@ -1886,6 +1962,7 @@ def import_ffdec_symbol(
     for definition in definitions:
         temporary_root.append(definition)
     temporary_root.append(root_definition)
+    _normalize_ffdec_font_export_zoom(temporary_root, zoom)
     _apply_authored_color_transforms(
         temporary_root,
         root_frame=frame,
