@@ -1,9 +1,9 @@
-"""Compose, rasterize, and delta-encode one batch of frames in a single stage.
+"""Compose, rasterize, and encode one batch of complete frames in a single stage.
 
 This merged stage replaces the old compose -> bounds -> raster chain. Prepare
-computes one shared animation canvas up front, so each worker can compose a
-frame in memory, rasterize it exactly once, and encode the delta WebP without
-any intermediate S3 round-trips.
+computes one shared animation canvas up front, so each worker can compose and
+rasterize exactly its configured frames. Complete WebP frames avoid computing
+the previous batch's overlap frame solely for delta cropping.
 """
 
 from __future__ import annotations
@@ -63,14 +63,16 @@ def _rasterize(
 
 def _encode_frame(
     current: Path,
-    previous: Path | None,
     output: Path,
     *,
     quality: float,
     method: int,
     cwebp: str,
 ) -> tuple[int, int, int, int, tuple[int, int]]:
-    x, y, width, height, canvas = character_svg.animation_delta_crop(current, previous)
+    with Image.open(current) as image:
+        canvas = image.size
+    x, y = 0, 0
+    width, height = canvas
     command = [
         cwebp,
         "-quiet",
@@ -81,8 +83,6 @@ def _encode_frame(
         "-m",
         str(method),
     ]
-    if (x, y, width, height) != (0, 0, canvas[0], canvas[1]):
-        command.extend(("-crop", str(x), str(y), str(width), str(height)))
     command.extend((str(current), "-o", str(output)))
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode:
@@ -102,7 +102,7 @@ def render_batch(
     config: RuntimeConfig,
 ) -> dict[str, Any]:
     """Render one batch: compose each frame from cached vector states,
-    rasterize it once at the manifest's shared canvas, and delta-encode the
+    rasterize it once at the manifest's shared canvas, and encode complete
     WebP frames. There is no probe/fit phase; the canvas comes from
     prepare_finish's union of each state's alpha-probed visible bounds.
     """
@@ -173,19 +173,24 @@ def render_batch(
         root = Path(temporary)
         part_roots: dict[str, Path] = {}
         archive_bytes = 0
-        # Fetch every (source, chunk ordinal) covering this batch's source
-        # frames plus the delta overlap frame, then extract each bundle once.
+        # Fetch every (source, chunk ordinal) covering only this batch's source
+        # frames, then extract each bundle once. Complete-frame encoding does
+        # not need the previous batch's frame.
         needed_pairs: set[tuple[int, int]] = set()
-        first_needed = frame_start - 1 if frame_start > 1 else frame_start
         for key, part in prepared["parts"].items():
             source_idx = int(part.get("source_idx", 0))
             source_bundles = (prepared.get("source_bundles") or {}).get(str(source_idx), {})
             if not source_bundles:
                 continue
-            for output_frame in range(first_needed, frame_end + 1):
+            for output_frame in range(frame_start, frame_end + 1):
                 source_frame = source_frame_for(key, output_frame)
                 if source_frame >= 1:
-                    needed_pairs.add((source_idx, (source_frame - 1) // config.batch_size))
+                    needed_pairs.add(
+                        (
+                            source_idx,
+                            (source_frame - 1) // config.source_bundle_frame_count,
+                        )
+                    )
         for source_idx, ordinal in sorted(needed_pairs):
             source_bundles = (prepared.get("source_bundles") or {}).get(str(source_idx), {})
             scoped = source_bundles.get(str(ordinal))
@@ -270,7 +275,7 @@ def render_batch(
             return output
 
         pngs: dict[int, Path] = {}
-        for frame_number in range(first_needed, frame_end + 1):
+        for frame_number in range(frame_start, frame_end + 1):
             compose_started = time.perf_counter()
             svg = compose_frame(frame_number)
             timings["compose_ms"] += (time.perf_counter() - compose_started) * 1000
@@ -293,7 +298,6 @@ def render_batch(
             encode_started = time.perf_counter()
             x, y, width, height, frame_canvas = _encode_frame(
                 pngs[frame_number],
-                pngs.get(frame_number - 1),
                 encoded,
                 quality=float(settings["webp_quality"]),
                 method=int(settings["webp_method"]),
@@ -355,7 +359,7 @@ def render_batch(
         timings["manifest_write_ms"] = (time.perf_counter() - manifest_write_started) * 1000
 
     total_ms = (time.perf_counter() - batch_started) * 1000
-    frames_rendered = frame_end - first_needed + 1
+    frames_rendered = frame_end - frame_start + 1
     accounted = sum(timings.values())
     log_event(
         "render_batch_profile",
@@ -365,7 +369,8 @@ def render_batch(
         frame_start=frame_start,
         frame_end=frame_end,
         frames_rendered=frames_rendered,
-        overlap_frame=frame_start > 1,
+        delta_encoded=False,
+        overlap_frame=False,
         part_count=len(prepared["parts"]),
         archive_bytes=archive_bytes,
         total_ms=round(total_ms, 1),

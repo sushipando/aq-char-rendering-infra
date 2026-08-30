@@ -10,12 +10,13 @@ test('dev environment targets the dedicated account and exposes tuning in one co
   expect(environment.stage).toBe('dev');
   expect(environment.tuning.prepareExportConcurrency).toBe(8);
   expect(environment.tuning.render).toMatchObject({
-    rendererVersion: 'v13',
+    rendererVersion: 'v14',
     maxSize: 2048,
     zoom: 1,
     completeLoop: true,
     maxFrames: 120,
-    frameBatchSize: 4,
+    framesPerRenderLambda: 1,
+    sourceBundleFrameCount: 4,
     mapConcurrency: 300,
     webpQuality: 85,
     allowOfficialAssetFallback: true,
@@ -60,6 +61,8 @@ test('Lambda request defaults come from the centralized environment tuning', () 
         CHAR_RENDER_DEFAULT_MAX_FRAMES: '120',
         CHAR_RENDER_DEFAULT_WEBP_QUALITY: '85',
         CHAR_RENDER_DEFAULT_WEBP_METHOD: '4',
+        CHAR_RENDER_FRAMES_PER_LAMBDA: '1',
+        CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT: '4',
         CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK: 'true',
       }),
     },

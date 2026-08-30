@@ -15,7 +15,8 @@ export interface RenderTuning {
   readonly completeLoop: boolean;
   readonly maxFrames: number;
   readonly subframeStart: number;
-  readonly frameBatchSize: number;
+  readonly framesPerRenderLambda: number;
+  readonly sourceBundleFrameCount: number;
   readonly mapConcurrency: number;
   readonly webpQuality: number;
   readonly webpMethod: number;
@@ -86,6 +87,9 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v14: render workers encode complete frames and compute exactly the
+    // configured number of frames. This removes the previous overlap-frame
+    // rasterization that every non-first batch needed for delta cropping.
     // v13: an Idle label immediately followed by stop() begins on that settled
     // root frame, fixing Drudgen's quest-bubble placement (frame 8 vs frame 7).
     // v12: a stopped startup parent begins on its settled frame while nested
@@ -104,7 +108,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v13',
+    rendererVersion: 'v14',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
@@ -123,12 +127,16 @@ const DEV_TUNING: InfrastructureTuning = {
     // zoom 2). 360 frames on such assets could never finish in 300s.
     maxFrames: 120,
     subframeStart: 1,
-    frameBatchSize: 4,
+    // Compute one complete frame per render Lambda. Source SVG bundles remain
+    // four frames apiece so prepare does not trade the render speedup for
+    // hundreds of additional small, serial S3 uploads.
+    framesPerRenderLambda: 1,
+    sourceBundleFrameCount: 4,
     // Dev concurrency was raised 10 -> 1000 (case 178797464300402), so small
-    // batches in a single wave are now the fast path: a 120-frame job is 30
-    // batches of 4, all concurrent. Memory stays capped at 3008 MiB (~1.7
-    // vCPU) so per-frame speed is unchanged, but wall time drops ~6x. (This
-    // was previously 30/4 because 10 slots made >4 contend.)
+    // render Lambdas in a single wave are now the fast path: a 120-frame job
+    // is 120 independent full-frame tasks. Memory stays capped at 3008 MiB
+    // (~1.7 vCPU), while the account's raised concurrency lets all tasks run
+    // without serializing four expensive rasterizations in each invocation.
     mapConcurrency: 300,
     webpQuality: 85,
     webpMethod: 4,

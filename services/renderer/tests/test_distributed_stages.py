@@ -50,7 +50,8 @@ def config(*, batch_size: int = 30) -> RuntimeConfig:
         asset_dataset_version="dev-v1",
         asset_manifest_key="datasets/dev-v1/manifest.json",
         character_renderer_key="character-renderer/dev-v1/characterB.swf",
-        batch_size=batch_size,
+        frames_per_render_lambda=batch_size,
+        source_bundle_frame_count=batch_size,
     )
 
 

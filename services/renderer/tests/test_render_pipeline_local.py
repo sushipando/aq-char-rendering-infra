@@ -11,12 +11,14 @@ import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 from PIL import Image
 
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
+from aqw_char_renderer.stages import render as render_stage
 from aqw_char_renderer.stages.finalize import finalize_job
 from aqw_char_renderer.stages.prepare import shared_viewbox
 from aqw_char_renderer.stages.render import render_batch
@@ -174,7 +176,9 @@ def test_render_then_finalize_produces_valid_animation() -> None:
         }
         assert len(canvases) == 1
         for frame in batch_manifest["frames"]:
-            assert frame["x"] % 2 == 0 and frame["y"] % 2 == 0
+            assert frame["x"] == 0 and frame["y"] == 0
+            assert frame["width"] == frame["canvas_width"]
+            assert frame["height"] == frame["canvas_height"]
 
         final = finalize_job(
             job_id=job_id,
@@ -201,6 +205,55 @@ def test_render_then_finalize_produces_valid_animation() -> None:
             config=config,
         )
         assert cached["cache_hit"] is True
+
+
+def test_render_batch_computes_only_its_requested_frames() -> None:
+    job_id = "job-one-frame"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        store = FilesystemObjectStore(root / "objects")
+        frame_paths = write_frames(
+            root,
+            [frame_svg(red=120), frame_svg(red=200, x_offset=2)],
+        )
+        archive_key = f"jobs/{job_id}/prepare/parts/armor.tar.gz"
+        store.upload_file(write_archive(root, "armor", frame_paths), "work", archive_key)
+        manifest_key = build_manifest(
+            store,
+            job_id=job_id,
+            frame_paths=frame_paths,
+            archive_key=archive_key,
+        )
+
+        with (
+            mock.patch.object(
+                render_stage,
+                "_rasterize",
+                wraps=render_stage._rasterize,
+            ) as rasterize,
+            mock.patch.object(
+                character_svg,
+                "animation_delta_crop",
+                side_effect=AssertionError("distributed rendering must not delta-crop"),
+            ),
+        ):
+            result = render_batch(
+                job_id=job_id,
+                manifest_key=manifest_key,
+                batch={"index": 1, "frame_start": 2, "frame_end": 2},
+                store=store,
+                config=pipeline_config(),
+            )
+
+        assert rasterize.call_count == 1
+        batch_manifest = store.read_json("work", result["batch_manifest_key"])
+        assert [frame["frame"] for frame in batch_manifest["frames"]] == [2]
+        frame = batch_manifest["frames"][0]
+        assert (frame["x"], frame["y"]) == (0, 0)
+        assert (frame["width"], frame["height"]) == (
+            frame["canvas_width"],
+            frame["canvas_height"],
+        )
 
 
 def test_blink_source_frames_freeze_after_one_shot() -> None:

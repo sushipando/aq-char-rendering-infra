@@ -64,7 +64,8 @@ class RuntimeConfig:
     asset_manifest_key: str
     character_renderer_key: str
     renderer_version: str = "v3"
-    batch_size: int = 30
+    frames_per_render_lambda: int = 30
+    source_bundle_frame_count: int = 30
     maximum_active_per_user: int = 2
     default_max_size: int = 2048
     default_zoom: float = 2.0
@@ -89,6 +90,7 @@ class RuntimeConfig:
     def from_env(cls, environment: Mapping[str, str] | None = None) -> RuntimeConfig:
         values = os.environ if environment is None else environment
         dataset = _required(values, "CHAR_RENDER_ASSET_DATASET_VERSION")
+        legacy_batch_size = _integer(values, "CHAR_RENDER_BATCH_SIZE", 30, 1, 60)
         return cls(
             source_bucket=_required(values, "CHAR_RENDER_SOURCE_BUCKET"),
             work_bucket=_required(values, "CHAR_RENDER_WORK_BUCKET"),
@@ -104,7 +106,20 @@ class RuntimeConfig:
                 f"character-renderer/{dataset}/characterB.swf",
             ),
             renderer_version=values.get("CHAR_RENDERER_VERSION", "v3"),
-            batch_size=_integer(values, "CHAR_RENDER_BATCH_SIZE", 30, 1, 60),
+            frames_per_render_lambda=_integer(
+                values,
+                "CHAR_RENDER_FRAMES_PER_LAMBDA",
+                legacy_batch_size,
+                1,
+                60,
+            ),
+            source_bundle_frame_count=_integer(
+                values,
+                "CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT",
+                legacy_batch_size,
+                1,
+                60,
+            ),
             maximum_active_per_user=_integer(values, "CHAR_RENDER_MAX_ACTIVE_PER_USER", 2, 1, 25),
             default_max_size=_integer(
                 values, "CHAR_RENDER_DEFAULT_MAX_SIZE", 2048, 64, 2048

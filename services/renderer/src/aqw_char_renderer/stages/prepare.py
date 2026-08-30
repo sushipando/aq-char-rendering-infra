@@ -1333,20 +1333,23 @@ def prepare_export_source(
         archive_directory.mkdir(parents=True, exist_ok=True)
         parts: list[dict[str, Any]] = []
         archive_bytes = 0
-        batch_size = config.batch_size
+        bundle_frame_count = config.source_bundle_frame_count
         # One archive per (source, chunk ordinal) containing every symbol of
         # this source, so a batch worker fetches ~1 GET per source instead of
         # ~1 GET per symbol. Entries are namespaced <symbol>/<frame>.svg.
         frame_count = int(prepared["export_frame_count"])
-        chunk_count = max(1, (frame_count + batch_size - 1) // batch_size)
+        chunk_count = max(
+            1,
+            (frame_count + bundle_frame_count - 1) // bundle_frame_count,
+        )
         bundle_paths = {
             ordinal: archive_directory / f"source.{ordinal}.tar.gz"
             for ordinal in range(chunk_count)
         }
         phase = time.perf_counter()
         for ordinal, bundle_path in sorted(bundle_paths.items()):
-            start = ordinal * batch_size
-            stop = start + batch_size
+            start = ordinal * bundle_frame_count
+            stop = start + bundle_frame_count
             with tarfile.open(bundle_path, "w:gz", compresslevel=1) as archive:
                 for symbol in sorted(requests, key=lambda item: item.key):
                     for index, path in enumerate(exported[symbol.key][start:stop], start=start + 1):
@@ -1700,7 +1703,10 @@ def prepare_finish(
             expected_sha256=prepared["character_renderer"]["sha256"],
         )
         frame_rate = character_svg.swf_frame_rate(character_renderer)
-        batches = [batch.to_dict() for batch in partition_frames(frame_count, config.batch_size)]
+        batches = [
+            batch.to_dict()
+            for batch in partition_frames(frame_count, config.frames_per_render_lambda)
+        ]
         manifest_key = f"jobs/{request.job_id}/prepare/manifest.json"
         manifest = {
             "schema_version": 1,
@@ -1726,8 +1732,12 @@ def prepare_finish(
                         f"{int(result['source_idx'])}.{ordinal}.tar.gz"
                     )
                     for ordinal in range(
-                        (int(prepared["export_frame_count"]) + config.batch_size - 1)
-                        // config.batch_size
+                        (
+                            int(prepared["export_frame_count"])
+                            + config.source_bundle_frame_count
+                            - 1
+                        )
+                        // config.source_bundle_frame_count
                     )
                 }
                 for result in export_key_to_result.values()
