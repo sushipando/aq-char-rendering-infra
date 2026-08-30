@@ -728,7 +728,24 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         """
         self.assertEqual(character_svg.decompiled_terminal_stop_frames(cape), (26,))
 
-    def test_stopped_direct_child_promotes_to_authored_stop_frame(self):
+    def test_settled_timeline_advances_adjacent_root_stop_frame(self):
+        request = character_svg.SymbolRequest(
+            "pet", Path("pet.swf"), "MiltonPoolSneevil1", 220, 7
+        )
+        settled = character_svg.settled_timeline(
+            request,
+            Path("unused.svg"),
+            {"miltonpoolsneevil1": 8},
+        )
+        self.assertIsNotNone(settled)
+        assert settled is not None
+        self.assertEqual(settled.request.class_name, "MiltonPoolSneevil1")
+        self.assertEqual(settled.request.character_id, 220)
+        self.assertEqual(settled.request.frame, 8)
+        self.assertEqual(settled.stop_frame, 8)
+        self.assertIsNone(settled.parent_placement)
+
+    def test_settled_timeline_promotes_direct_child_to_authored_stop_frame(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "cape.svg"
             source.write_text(
@@ -748,7 +765,7 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
             request = character_svg.SymbolRequest(
                 "cape", Path("cape.swf"), "DarkShadows", 28, 1
             )
-            settled = character_svg.stopped_direct_child_timeline(
+            settled = character_svg.settled_timeline(
                 request,
                 source,
                 {"darkshadowsr1_fla.capeidle_2": 26},
@@ -758,7 +775,10 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
             self.assertEqual(settled.request.character_id, 24)
             self.assertEqual(settled.request.class_name, "DarkShadowsr1_fla.CapeIdle_2")
             self.assertEqual(settled.request.frame, 26)
-            self.assertEqual(settled.placement, (1.2, 0.0, 0.0, 1, 5, 2))
+            self.assertEqual(
+                settled.parent_placement,
+                (1.2, 0.0, 0.0, 1, 5, 2),
+            )
             self.assertEqual(settled.stop_frame, 26)
 
     def test_transform_ffdec_registration_bakes_parent_placement(self):

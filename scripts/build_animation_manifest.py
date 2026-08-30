@@ -152,12 +152,12 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
             ffdec=ffdec,
             destination=root / "scripts",
         )
-        settled_timelines: dict[str, character_svg.StoppedChildTimeline] = {}
+        settled_timelines: dict[str, character_svg.SettledTimeline] = {}
         for request in exportable:
             paths = exported.get(request.key) or []
             if not paths:
                 continue
-            settled = character_svg.stopped_direct_child_timeline(
+            settled = character_svg.settled_timeline(
                 request, paths[0], terminal_stops
             )
             if settled is not None:
@@ -171,11 +171,14 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                 frame_count=scan_frames,
             )
             for key, settled in settled_timelines.items():
+                if settled.parent_placement is None:
+                    exported[key] = settled_exports[key]
+                    continue
                 exported[key] = [
                     character_svg.transform_ffdec_registration(
                         path,
                         root / "settled-transformed" / key / f"{index:06d}.svg",
-                        placement=settled.placement,
+                        placement=settled.parent_placement,
                         zoom=1.0,
                     )
                     for index, path in enumerate(settled_exports[key], start=1)

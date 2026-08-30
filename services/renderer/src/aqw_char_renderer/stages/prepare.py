@@ -1273,17 +1273,16 @@ def prepare_export_source(
         placement_colors = character_svg.authored_swf_color_transforms(swf)
         mark("source_metadata_ms", phase)
 
-        # FFDec advances nested timelines without running their frame scripts.
-        # If the selected idle state is a single child that settles on stop(),
-        # select that child at the authored stop frame. This skips the startup
-        # reveal while still advancing clips created by the settled frame (for
-        # example Shadow of Sepulchure's 49-frame breathing/pulse animation).
-        settled_timelines: dict[str, character_svg.StoppedChildTimeline] = {}
+        # FFDec advances timelines without running their frame scripts. Begin
+        # adjacent root-stop states (for example Drudgen's corrected quest
+        # bubble placement) and safe single-child stop states on their authored
+        # settled frame, while still advancing clips nested inside that frame.
+        settled_timelines: dict[str, character_svg.SettledTimeline] = {}
         for symbol in requests:
             frames = exported.get(symbol.key) or []
             if not frames:
                 continue
-            settled = character_svg.stopped_direct_child_timeline(
+            settled = character_svg.settled_timeline(
                 symbol, frames[0], terminal_stops
             )
             if settled is not None:
@@ -1301,11 +1300,21 @@ def prepare_export_source(
             mark("settled_ffdec_export_ms", phase)
             phase = time.perf_counter()
             for key, settled in settled_timelines.items():
+                if settled.parent_placement is None:
+                    exported[key] = settled_exports[key]
+                    signatures, bounds = _export_metadata(
+                        settled_exports[key],
+                        zoom=zoom,
+                        config=config,
+                    )
+                    vector_signatures[key] = signatures
+                    vector_bounds[key] = bounds
+                    continue
                 transformed_paths = [
                     character_svg.transform_ffdec_registration(
                         path,
                         root / "settled-transformed" / key / f"{index:06d}.svg",
-                        placement=settled.placement,
+                        placement=settled.parent_placement,
                         zoom=zoom,
                     )
                     for index, path in enumerate(settled_exports[key], start=1)

@@ -156,12 +156,14 @@ class SymbolRequest:
 
 
 @dataclass(frozen=True)
-class StoppedChildTimeline:
-    """A direct child whose authored timeline settles on a stop() frame."""
+class SettledTimeline:
+    """A root or direct child that should begin on an authored stop() frame."""
 
     request: SymbolRequest
-    placement: Matrix
     stop_frame: int
+    # Nested-child promotion needs its parent placement baked back into the
+    # exported SVG. A settled root already has the correct registration.
+    parent_placement: Matrix | None = None
 
 
 @dataclass
@@ -1658,20 +1660,42 @@ def parse_color_scripts(
     return rules
 
 
-def stopped_direct_child_timeline(
+def settled_timeline(
     request: SymbolRequest,
     source_svg: Path,
     terminal_stops: Mapping[str, int],
-) -> StoppedChildTimeline | None:
-    """Resolve a safe single-child timeline that should remain on ``stop()``.
+) -> SettledTimeline | None:
+    """Resolve a root or safe single-child timeline that settles on ``stop()``.
 
     FFDec's ``-sublength`` advances display-list timelines without executing
-    ActionScript. A child authored to ``stop()`` on its final pose therefore
-    wraps to frame 1 and appears to vanish. When the selected root frame is a
-    single named child, select that child at its authored stop frame. Its own
-    nested clips then continue normally: for Shadow of Sepulchure, the
-    26-frame reveal stays finished while its 49-frame shadow pulse keeps moving.
+    ActionScript. Two common AQW authoring patterns need emulation:
+
+    * An Idle label is immediately followed by a frame that calls ``stop()``.
+      Flash displays that second frame, but a static FFDec label export remains
+      one frame early. Drudgen uses this only to place its quest bubble.
+    * A selected root contains one named child that stops on its final pose.
+      Promote that child to its stop frame so the parent does not keep wrapping.
+
+    Nested clips continue normally after either correction. For Shadow of
+    Sepulchure, the 26-frame reveal stays finished while its 49-frame shadow
+    pulse keeps moving.
     """
+    root_stop_frame = int(terminal_stops.get(request.class_name.casefold()) or 0)
+    # Restrict root correction to the unambiguous adjacent-frame pattern. A
+    # later stop may be a deliberate one-shot animation that should remain
+    # visible rather than being skipped wholesale.
+    if root_stop_frame == request.frame + 1:
+        return SettledTimeline(
+            request=SymbolRequest(
+                key=request.key,
+                source=request.source,
+                class_name=request.class_name,
+                character_id=request.character_id,
+                frame=root_stop_frame,
+            ),
+            stop_frame=root_stop_frame,
+        )
+
     try:
         root = ET.parse(source_svg).getroot()
     except (OSError, ET.ParseError):
@@ -1701,7 +1725,7 @@ def stopped_direct_child_timeline(
     # child by a matrix alone. Restrict promotion to the common plain-use case.
     if any(child.get(name) for name in ("filter", "clip-path", "mask", "opacity")):
         return None
-    return StoppedChildTimeline(
+    return SettledTimeline(
         request=SymbolRequest(
             key=request.key,
             source=request.source,
@@ -1709,8 +1733,8 @@ def stopped_direct_child_timeline(
             character_id=character_id,
             frame=stop_frame,
         ),
-        placement=placement,
         stop_frame=stop_frame,
+        parent_placement=placement,
     )
 
 
@@ -3379,13 +3403,13 @@ def run(args: argparse.Namespace) -> Path:
             )
             for source in source_paths
         }
-        settled_timelines: dict[str, StoppedChildTimeline] = {}
+        settled_timelines: dict[str, SettledTimeline] = {}
         effective_requests = {request.key: request for request in requests}
         for request in requests:
             frames = raw_exports.get(request.key) or []
             if not frames:
                 continue
-            settled = stopped_direct_child_timeline(
+            settled = settled_timeline(
                 request,
                 frames[0],
                 terminal_stops_by_source.get(request.source, {}),
@@ -3403,11 +3427,14 @@ def run(args: argparse.Namespace) -> Path:
                 frame_count=export_frame_count,
             )
             for key, settled in settled_timelines.items():
+                if settled.parent_placement is None:
+                    raw_exports[key] = settled_exports[key]
+                    continue
                 raw_exports[key] = [
                     transform_ffdec_registration(
                         path,
                         work_dir / "settled-transformed" / key / f"{index:06d}.svg",
-                        placement=settled.placement,
+                        placement=settled.parent_placement,
                         zoom=args.zoom,
                     )
                     for index, path in enumerate(settled_exports[key], start=1)

@@ -86,6 +86,8 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v13: an Idle label immediately followed by stop() begins on that settled
+    // root frame, fixing Drudgen's quest-bubble placement (frame 8 vs frame 7).
     // v12: a stopped startup parent begins on its settled frame while nested
     // idle clips keep advancing; unlabeled weapon root timelines also advance
     // instead of being frozen on frame 1.
@@ -102,7 +104,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v12',
+    rendererVersion: 'v13',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
