@@ -39,7 +39,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 4);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 8);
+  template.resourceCountIs('AWS::Lambda::Function', 7);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);

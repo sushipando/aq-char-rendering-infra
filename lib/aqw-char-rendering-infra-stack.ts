@@ -29,7 +29,6 @@ interface RendererFunctions {
   readonly launcher: lambda.DockerImageFunction;
   readonly prepare: lambda.DockerImageFunction;
   readonly render: lambda.DockerImageFunction;
-  readonly fit: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
   readonly complete: lambda.DockerImageFunction;
   readonly cleanup: lambda.DockerImageFunction;
@@ -328,7 +327,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       launcher: make('Launcher', 'aqw_char_renderer.handlers.launcher.handler', tuning.functions.launcher),
       prepare: make('Prepare', 'aqw_char_renderer.handlers.prepare.handler', tuning.functions.prepare),
       render: make('Render', 'aqw_char_renderer.handlers.render.handler', tuning.functions.render),
-      fit: make('Fit', 'aqw_char_renderer.handlers.fit.handler', tuning.functions.fit),
       finalizer: make('Finalizer', 'aqw_char_renderer.handlers.finalize.handler', tuning.functions.finalizer),
       complete: make('Complete', 'aqw_char_renderer.handlers.complete.handler', tuning.functions.complete),
       cleanup: make('Cleanup', 'aqw_char_renderer.handlers.cleanup.handler', tuning.functions.cleanup),
@@ -397,42 +395,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       resultPath: '$.prepare',
     }).addRetry(lambdaRetry);
 
-    const probeMap = new sfn.Map(this, 'ProbeFrameBounds', {
-      itemsPath: '$.prepare.batches',
-      maxConcurrency: tuning.render.mapConcurrency,
-      resultPath: '$.probe_results',
-      itemSelector: {
-        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
-        manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
-        batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
-      },
-    });
-    probeMap.itemProcessor(
-      new tasks.LambdaInvoke(this, 'ProbeFrameBatch', {
-        lambdaFunction: functions.render,
-        payload: sfn.TaskInput.fromObject({
-          job_id: sfn.JsonPath.stringAt('$.job_id'),
-          manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
-          batch: sfn.JsonPath.objectAt('$.batch'),
-          mode: 'probe',
-        }),
-        payloadResponseOnly: true,
-      }).addRetry(lambdaRetry),
-    );
-
-    // Union the probed tight bounds into one fitted canvas before rasterizing,
-    // so every frame shares one pixel scale and the output is tightly cropped.
-    const fitCanvas = new tasks.LambdaInvoke(this, 'FitSharedCanvas', {
-      lambdaFunction: functions.fit,
-      payload: sfn.TaskInput.fromObject({
-        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
-        manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
-        probe_results: sfn.JsonPath.listAt('$.probe_results'),
-      }),
-      payloadResponseOnly: true,
-      resultPath: '$.fit',
-    }).addRetry(lambdaRetry);
-
+    // The shared canvas is computed in prepare_finish from each unique
+    // state's alpha-probed bounds, so there is no probe Map or Fit Lambda.
     const renderMap = new sfn.Map(this, 'RenderFrameBatches', {
       itemsPath: '$.prepare.batches',
       maxConcurrency: tuning.render.mapConcurrency,
@@ -441,7 +405,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
         manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
         batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
-        viewbox_key: sfn.JsonPath.stringAt('$.fit.fitted_canvas_key'),
       },
     });
     renderMap.itemProcessor(
@@ -451,8 +414,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           job_id: sfn.JsonPath.stringAt('$.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
           batch: sfn.JsonPath.objectAt('$.batch'),
-          viewbox_key: sfn.JsonPath.stringAt('$.viewbox_key'),
-          mode: 'raster',
         }),
         payloadResponseOnly: true,
       }).addRetry(lambdaRetry),
@@ -481,7 +442,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       payloadResponseOnly: true,
     }).addRetry(lambdaRetry);
 
-    const renderMiss = exportMap.next(prepareFinish).next(probeMap).next(fitCanvas).next(renderMap).next(finalize);
+    const renderMiss = exportMap.next(prepareFinish).next(renderMap).next(finalize);
     const cacheChoice = new sfn.Choice(this, 'CachedResultExists')
       .when(sfn.Condition.booleanEquals('$.prepare.cache_hit', true), completeCached)
       .otherwise(renderMiss);
@@ -544,7 +505,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     );
     workBucket.grantReadWrite(functions.prepare);
     workBucket.grantReadWrite(functions.render);
-    workBucket.grantReadWrite(functions.fit);
     workBucket.grantReadWrite(functions.finalizer);
     for (const fn of [
       functions.prepare,
@@ -561,7 +521,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       [functions.launcher.functionName]: tuning.functions.launcher.reservedConcurrency,
       [functions.prepare.functionName]: tuning.functions.prepare.reservedConcurrency,
       [functions.render.functionName]: tuning.functions.render.reservedConcurrency,
-      [functions.fit.functionName]: tuning.functions.fit.reservedConcurrency,
       [functions.finalizer.functionName]: tuning.functions.finalizer.reservedConcurrency,
     };
     functions.shutdown.addEnvironment('CHAR_RENDER_WORKER_CONCURRENCY', JSON.stringify(concurrency));
@@ -604,7 +563,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         functions.launcher.functionName,
         functions.prepare.functionName,
         functions.render.functionName,
-        functions.fit.functionName,
         functions.finalizer.functionName,
       ]),
     );

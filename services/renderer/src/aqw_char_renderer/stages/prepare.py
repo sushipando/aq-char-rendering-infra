@@ -40,7 +40,7 @@ from aqw_char_renderer.storage import StorageError
 from aqw_char_renderer.structured_logging import log_event
 
 FFDEC_VERSION = "26.2.1"
-VECTOR_CACHE_SCHEMA = 2
+VECTOR_CACHE_SCHEMA = 3  # v3: per-state bounds are alpha-probed (tight), not header-derived
 
 
 class StageStore(Protocol):
@@ -370,6 +370,42 @@ def _validated_cached_bounds(
     return parsed
 
 
+def _probe_state_bounds(
+    path: Path,
+    zoom: float,
+    rsvg_convert: str,
+) -> tuple[float, float, float, float] | None:
+    """Alpha-probe one exported state; return tight bounds in registration space.
+
+    The FFDec frame wrapper matrix carries the registration translation (e, f)
+    and scale (zoom). Probing the raster canvas yields tight pixel bounds; map
+    them back by the same zoom/translation to get the symbol-space bounds the
+    shared-canvas math expects (same space as export_frame_bounds).
+    """
+    data = path.read_bytes()
+    body = data
+    defs_start = data.find(b"<defs")
+    defs_end = data.find(b"</defs>")
+    if 0 <= defs_start < defs_end:
+        body = data[:defs_start] + data[defs_end + len(b"</defs>") :]
+    matrix_match = _MATRIX_ATTR_RE.search(body)
+    matrix = character_svg.parse_matrix(
+        matrix_match.group(1).decode("utf-8", "replace") if matrix_match else None
+    )
+    if matrix is None:
+        return None
+    a, _b, _c, d, e, f = matrix
+    if abs(a - zoom) > 1e-4 or abs(d - zoom) > 1e-4:
+        return None
+    probed = item_renderer.detect_svg_visible_viewbox(
+        path, rsvg_convert, probe_size=512, padding_pixels=1
+    )
+    if probed is None:
+        return None
+    x, y, width, height = probed
+    return ((x - e) / zoom, (y - f) / zoom, width / zoom, height / zoom)
+
+
 def _load_vector_cache(
     archive_path: Path,
     root: Path,
@@ -477,6 +513,7 @@ def _build_vector_cache(
     zoom: float,
     subframe_start: int,
     frame_count: int,
+    config: RuntimeConfig,
 ) -> tuple[
     Path,
     dict[str, list[str]],
@@ -505,7 +542,11 @@ def _build_vector_cache(
             if state_id is None:
                 state_id = len(states)
                 signature_to_state[signature] = state_id
-                visible_bounds = export_frame_bounds(path, zoom)
+                # Step 6: probe the state's tight visible bounds once at cache
+                # time; fall back to the loose header bounds if probing fails.
+                visible_bounds = _probe_state_bounds(path, zoom, config.rsvg_convert) or (
+                    export_frame_bounds(path, zoom)
+                )
                 cached_path = f"states/{identity}/{state_id}.svg"
                 states.append(
                     {
@@ -1000,6 +1041,7 @@ def prepare_export_source(
                 zoom=zoom,
                 subframe_start=subframe_start,
                 frame_count=export_frame_count,
+                config=config,
             )
             mark("vector_cache_build_ms", phase)
             phase = time.perf_counter()

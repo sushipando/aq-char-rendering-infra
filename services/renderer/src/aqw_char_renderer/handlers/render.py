@@ -27,8 +27,6 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         batch=event["batch"],
         store=S3ObjectStore(),
         config=config,
-        mode=event.get("mode", "raster"),
-        store_viewbox_key=event.get("viewbox_key"),
     )
     log_event(
         "render_batch_complete",
