@@ -25,6 +25,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
 
+import numpy as np
 from botocore.exceptions import ClientError
 
 from aqw_char_renderer import character_svg
@@ -40,7 +41,18 @@ from aqw_char_renderer.storage import StorageError
 from aqw_char_renderer.structured_logging import log_event
 
 FFDEC_VERSION = "26.2.1"
-VECTOR_CACHE_SCHEMA = 3  # v3: per-state bounds are alpha-probed (tight), not header-derived
+# v4: states that rasterize with zero visible pixels (e.g. opacity-0 blink
+# frames in an animated cape) store a null bound instead of the loose header
+# canvas. The old v3 behavior let one invisible state's full declared sprite
+# stage inflate the shared viewbox, leaving large empty margins.
+VECTOR_CACHE_SCHEMA = 4
+
+
+class _InvisibleState:
+    """Sentinel returned when a state rasterizes cleanly but has no pixels."""
+
+
+_INVISIBLE_STATE = _InvisibleState()
 
 
 class StageStore(Protocol):
@@ -370,17 +382,42 @@ def _validated_cached_bounds(
     return parsed
 
 
+def _svg_frame_author_invisible(data: bytes) -> bool:
+    """Cheap structural check for authored invisible states.
+
+    Animated AQW parts carry "blink" frames where every element is drawn at
+    opacity 0 (the timeline pauses a beat). The opacity attributes live inside
+    the nested sprite ``<defs>`` (the rendered wrapper only ``<use>``s them),
+    so scan the whole document: when every explicit opacity attribute is zero
+    the frame paints nothing and contributes nothing to the shared canvas.
+    """
+    text = data.decode("utf-8", errors="replace")
+    opacities = re.findall(r"opacity=\"([^\"]+)\"", text)
+    if not opacities:
+        return False
+    for value in opacities:
+        try:
+            if float(value.strip()) != 0.0:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
 def _probe_state_bounds(
     path: Path,
     zoom: float,
     rsvg_convert: str,
-) -> tuple[float, float, float, float] | None:
+) -> tuple[float, float, float, float] | None | _InvisibleState:
     """Alpha-probe one exported state; return tight bounds in registration space.
 
-    The FFDec frame wrapper matrix carries the registration translation (e, f)
-    and scale (zoom). Probing the raster canvas yields tight pixel bounds; map
-    them back by the same zoom/translation to get the symbol-space bounds the
-    shared-canvas math expects (same space as export_frame_bounds).
+    ``_INVISIBLE_STATE`` is returned when the state has no visible pixels by
+    construction (e.g. an opacity-0 blink frame in an animated cape): such a
+    state contributes nothing to the rendered animation, so it must also
+    contribute nothing to the shared canvas. Detection is cheap: one 512px
+    probe plus a structural opacity scan. ``None`` (probe/matrix failure or
+    ambiguous hairline geometry) keeps the caller's conservative header-canvas
+    fallback.
     """
     data = path.read_bytes()
     body = data
@@ -395,15 +432,50 @@ def _probe_state_bounds(
     if matrix is None:
         return None
     a, _b, _c, d, e, f = matrix
-    if abs(a - zoom) > 1e-4 or abs(d - zoom) > 1e-4:
+    # FFDec is asked to export at ``zoom``, but some sprites (e.g. DACE capes)
+    # ignore -zoom and export at their native scale with an identity wrapper.
+    # Normalize the wrapper scale so the registration math stays consistent
+    # regardless of whether the export actually applied zoom.
+    if abs(a - d) > 1e-4:
         return None
-    probed = item_renderer.detect_svg_visible_viewbox(
-        path, rsvg_convert, probe_size=512, padding_pixels=1
-    )
-    if probed is None:
+    frame_scale = (a + d) / 2.0
+    if frame_scale <= 0 or not math.isfinite(frame_scale):
         return None
-    x, y, width, height = probed
-    return ((x - e) / zoom, (y - f) / zoom, width / zoom, height / zoom)
+    if not (abs(frame_scale - zoom) < 1e-3 or abs(frame_scale - 1.0) < 1e-3):
+        return None
+    # Probe twice, bounded at 1024, so hairline content that aliases away at
+    # 512 is still caught while invisible blink states cost only two small
+    # renders (never the 2048 raster that previously blew the 900s export
+    # budget on flicker-heavy weapons/capes).
+    for probe_size in (512, 1024):
+        probe = item_renderer.probe_svg_alpha(path, rsvg_convert, probe_size=probe_size)
+        if probe is None:
+            # probe_svg_alpha collapses both "rasterized empty" and a render
+            # failure into None; keep trying the next size.
+            continue
+        canvas, alpha = probe
+        if not np.any(alpha):
+            continue
+        probed = item_renderer.visible_viewbox_from_probe(
+            (canvas, alpha),
+            padding_pixels=1,
+        )
+        if probed is None:
+            continue
+        x, y, width, height = probed
+        return (
+            (x - e) / frame_scale,
+            (y - f) / frame_scale,
+            width / frame_scale,
+            height / frame_scale,
+        )
+    # No pixels at either probe size. If the frame is authored invisible
+    # (every element's opacity is 0), mark it so without any extra
+    # rasterization; that is the AQW blink/rest pattern that previously
+    # inflated the shared canvas via the loose header fallback.
+    if _svg_frame_author_invisible(data):
+        return _INVISIBLE_STATE
+    return None
 
 
 def _load_vector_cache(
@@ -543,10 +615,24 @@ def _build_vector_cache(
                 state_id = len(states)
                 signature_to_state[signature] = state_id
                 # Step 6: probe the state's tight visible bounds once at cache
-                # time; fall back to the loose header bounds if probing fails.
-                visible_bounds = _probe_state_bounds(path, zoom, config.rsvg_convert) or (
-                    export_frame_bounds(path, zoom)
-                )
+                # time. Invisible states (opacity-0 blink/cape frames) get a
+                # null bound so they never inflate the shared canvas; only a
+                # genuine probe/raster failure falls back to the loose header
+                # canvas (conservative, keeps the artwork unclipped).
+                probed_state = _probe_state_bounds(path, zoom, config.rsvg_convert)
+                if probed_state is _INVISIBLE_STATE:
+                    visible_bounds = None
+                elif probed_state is None:
+                    try:
+                        visible_bounds = export_frame_bounds(path, zoom)
+                    except character_svg.CharacterSvgError:
+                        # Some sprites export at native scale with a
+                        # non-zoom identity wrapper that export_frame_bounds
+                        # rejects; that state adds no reliable extent, so
+                        # record null and let the shared canvas ignore it.
+                        visible_bounds = None
+                else:
+                    visible_bounds = probed_state
                 cached_path = f"states/{identity}/{state_id}.svg"
                 states.append(
                     {

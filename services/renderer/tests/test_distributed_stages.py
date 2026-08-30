@@ -6,17 +6,26 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import numpy as np
 import pytest
 
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.hashing import file_sha256
+from aqw_char_renderer.source_assets import SourceObject
+from aqw_char_renderer.stages import prepare as prepare_module
 from aqw_char_renderer.stages.finalize import _ordered_frames
 from aqw_char_renderer.stages.prepare import (
+    _INVISIBLE_STATE,
+    _build_vector_cache,
+    _probe_state_bounds,
     export_frame_bounds,
     prepare_export_source,
     shared_viewbox,
 )
+
+prepare = prepare_module
+from aqw_char_renderer.legacy import render_swf_items as item_renderer
 from aqw_char_renderer.storage import FilesystemObjectStore
 
 
@@ -373,3 +382,143 @@ def test_export_source_bundles_all_symbols_and_reuses_exact_vector_cache() -> No
             )
         assert second["vector_cache_hit"] is True
         assert export_calls == 1
+
+
+PROBE_SVG = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns:ffdec="https://www.free-decompiler.com/flash" xmlns:xlink="http://www.w3.org/1999/xlink" ffdec:objectType="frame" height="200px" width="100px" xmlns="http://www.w3.org/2000/svg">
+  <g transform="matrix(2.0, 0.0, 0.0, 2.0, 50.0, 60.0)"></g>
+</svg>
+"""
+
+PROBE_SVG_INVISIBLE = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns:ffdec="https://www.free-decompiler.com/flash" xmlns:xlink="http://www.w3.org/1999/xlink" ffdec:objectType="frame" height="200px" width="100px" xmlns="http://www.w3.org/2000/svg">
+  <g transform="matrix(2.0, 0.0, 0.0, 2.0, 50.0, 60.0)">
+    <use ffdec:characterId="2" opacity="0.0" xlink:href="#sprite0"/>
+    <use ffdec:characterId="3" opacity="0" xlink:href="#sprite1"/>
+  </g>
+</svg>
+"""
+
+
+def test_probe_state_bounds_marks_invisible_state() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        source = write_export(Path(temporary) / "invisible.svg", PROBE_SVG_INVISIBLE)
+        alpha = np.zeros((100, 100), dtype=np.uint8)
+        with mock.patch.object(
+            item_renderer, "probe_svg_alpha", return_value=((0.0, 0.0, 100.0, 200.0), alpha)
+        ):
+            bounds = _probe_state_bounds(source, zoom=2.0, rsvg_convert="rsvg-convert")
+    assert bounds is _INVISIBLE_STATE
+
+
+def test_probe_state_bounds_returns_none_when_empty_but_visible_markup() -> None:
+    # A frame that rasterizes empty but carries visible (hairline) geometry is
+    # ambiguous; keep the conservative header fallback rather than calling it
+    # invisible.
+    with tempfile.TemporaryDirectory() as temporary:
+        source = write_export(Path(temporary) / "hairline.svg", PROBE_SVG)
+        alpha = np.zeros((100, 100), dtype=np.uint8)
+        with mock.patch.object(
+            item_renderer, "probe_svg_alpha", return_value=((0.0, 0.0, 100.0, 200.0), alpha)
+        ):
+            bounds = _probe_state_bounds(source, zoom=2.0, rsvg_convert="rsvg-convert")
+    assert bounds is None
+
+
+def test_svg_frame_author_invisible_detects_opacity_zero_frames() -> None:
+    assert prepare._svg_frame_author_invisible(PROBE_SVG_INVISIBLE.encode())
+    assert not prepare._svg_frame_author_invisible(PROBE_SVG.encode())
+
+
+def test_probe_state_bounds_maps_visible_alpha_into_registration_space() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        source = write_export(Path(temporary) / "visible.svg", PROBE_SVG)
+        alpha = np.zeros((100, 100), dtype=np.uint8)
+        alpha[40:80, 30:70] = 255
+        probe = ((0.0, 0.0, 200.0, 200.0), alpha)
+        with mock.patch.object(item_renderer, "probe_svg_alpha", return_value=probe):
+            bounds = _probe_state_bounds(source, zoom=2.0, rsvg_convert="rsvg-convert")
+    assert bounds == pytest.approx((4.0, 9.0, 42.0, 42.0))
+
+
+def test_build_vector_cache_stores_null_bounds_for_invisible_state() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        request = character_svg.SymbolRequest(
+            key="cape",
+            source=Path("cape.swf"),
+            class_name="Cape",
+            character_id=1,
+            frame=1,
+        )
+        record = SourceObject(
+            remote_path="cape.swf",
+            key="cape.swf",
+            sha256="a" * 64,
+            size=1,
+        )
+        exported = {
+            "cape": [
+                write_export(root / "exports" / f"{index:06d}.svg", FFDEC_EXPORT)
+                for index in (1, 2)
+            ]
+        }
+        with (
+            mock.patch.object(
+                prepare, "_probe_state_bounds",
+                return_value=_INVISIBLE_STATE,
+            ),
+            mock.patch.object(
+                prepare, "export_frame_bounds",
+                side_effect=AssertionError("invisible state must not use header bounds"),
+            ),
+        ):
+            _archive, _signatures, bounds = _build_vector_cache(
+                root / "build",
+                record,
+                [request],
+                exported,
+                zoom=2.0,
+                subframe_start=1,
+                frame_count=2,
+                config=config(),
+            )
+    assert bounds["cape"] == [None, None]
+
+
+def test_build_vector_cache_keeps_header_bounds_on_probe_failure() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        request = character_svg.SymbolRequest(
+            key="cape",
+            source=Path("cape.swf"),
+            class_name="Cape",
+            character_id=1,
+            frame=1,
+        )
+        record = SourceObject(
+            remote_path="cape.swf",
+            key="cape.swf",
+            sha256="c" * 64,
+            size=1,
+        )
+        exported = {
+            "cape": [
+                write_export(root / "exports" / f"{index:06d}.svg", FFDEC_EXPORT)
+                for index in (1, 2)
+            ]
+        }
+        with mock.patch.object(prepare, "_probe_state_bounds", return_value=None):
+            _archive, _signatures, bounds = _build_vector_cache(
+                root / "build",
+                record,
+                [request],
+                exported,
+                zoom=2.0,
+                subframe_start=1,
+                frame_count=2,
+                config=config(),
+            )
+    # FFDEC_EXPORT header canvas is (-3, -4, 10, 5); a rasterizer failure keeps
+    # that conservative fallback so any real artwork is never clipped.
+    assert bounds["cape"] == [(-3.0, -4.0, 10.0, 5.0), (-3.0, -4.0, 10.0, 5.0)]

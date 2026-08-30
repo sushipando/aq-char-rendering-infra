@@ -75,7 +75,9 @@ const DEV_TUNING: InfrastructureTuning = {
     // units to remain unreserved, so dev uses the shared concurrency pool.
     launcher: mib(512, 512, 30),
     // This new AWS account currently enforces a 3008 MiB Lambda memory cap.
-    prepare: mib(3008, 4096, 900),
+    // 120-frame jobs must produce fast (<300s) and each source SWF spawns its
+    // own FFDec JVM, so prepare runs are capped at 300s.
+    prepare: mib(3008, 4096, 300),
     render: mib(3008, 4096, 900),
     finalizer: mib(3008, 4096, 300),
     complete: mib(512, 512, 60),
@@ -84,19 +86,32 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v9: invisible animation states (opacity-0 blink/cape frames) store null
+    // bounds instead of their loose header canvas, so the shared viewbox no
+    // longer includes their phantom stage and the animation fills the frame.
     // v8: random-pose ground cosmetics ping-pong their authored pose span so
     // the dragon bobs without the mid-timeline direction flip (v7 froze them).
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v8',
+    rendererVersion: 'v9',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
-    zoom: 2,
+    // FFDec SVG export at zoom 2 makes multi-state cosmetics (e.g. capes with
+    // 128 unique states) crawl at ~15s/frame -> a 32-minute export that blows
+    // the 300s prepare budget. Zoom 1 is fully supported by the compositor
+    // (export_zoom/minimum-stroke math) and keeps 120-frame jobs < 300s; the
+    // only loss is sub-pixel stroke crispness, which the 2048 canvas
+    // upscaling already smooths.
+    zoom: 1,
     padding: 0,
     completeLoop: true,
-    maxFrames: 360,
+    // 120-frame outputs keep every source FFDec export (and the render map)
+    // comfortably inside the 300s prepare budget, even for rare cosmetic
+    // assets with many unique states (e.g. DmnkAlterEgoGR: ~15s/frame at
+    // zoom 2). 360 frames on such assets could never finish in 300s.
+    maxFrames: 120,
     subframeStart: 1,
     frameBatchSize: 4,
     // Dev concurrency was raised 10 -> 1000 (case 178797464300402), so small
@@ -127,9 +142,10 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   workflowTimeoutMinutes: 60,
   // Prepare is split so each source SWF exports in its own Lambda; a
-  // character has ~5 sources, so a small concurrency is plenty, and Step
-  // Functions throttles excess invocations safely.
-  prepareExportConcurrency: 8,
+  // character has ~5 sources. Five parallel FFDec JVMs on ~1.7 vCPU each
+  // starve and blow the 300s budget, so cap export concurrency at 3 to keep
+  // 120-frame renders well under the timeout.
+  prepareExportConcurrency: 3,
   jobQueueVisibilitySeconds: 180,
 };
 
