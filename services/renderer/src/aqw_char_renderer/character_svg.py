@@ -151,6 +151,14 @@ class SymbolRequest:
     frame: int
 
 
+@dataclass(frozen=True)
+class StoppedChildTimeline:
+    """A direct child whose authored timeline settles on a stop() frame."""
+
+    class_name: str
+    stop_frame: int
+
+
 @dataclass
 class ImportedSymbol:
     key: str
@@ -1399,6 +1407,10 @@ _RANDOM_POSE_AS3_PATTERN = re.compile(
     r"gotoAndStop\s*\([^)]*Math\.random[^)]*\)",
     re.IGNORECASE | re.DOTALL,
 )
+_FRAME_SCRIPT_PAIR_PATTERN = re.compile(
+    r"(?P<index>\d+)\s*,\s*this\.(?P<method>[A-Za-z_]\w*)"
+)
+_STOP_CALL_PATTERN = re.compile(r"(?<![\w.])(?:this\.)?stop\s*\(\s*\)\s*;")
 
 
 def decompiled_has_random_pose(text: str) -> bool:
@@ -1412,14 +1424,46 @@ def decompiled_has_random_pose(text: str) -> bool:
     )
 
 
-def decompile_as3_has_random_pose(
+def _decompiled_function_body(text: str, method: str) -> str | None:
+    declaration = re.search(
+        rf"\bfunction\s+{re.escape(method)}\s*\([^)]*\)[^{{]*\{{",
+        text,
+    )
+    if declaration is None:
+        return None
+    opening = declaration.end() - 1
+    depth = 0
+    for index in range(opening, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[opening + 1 : index]
+    return None
+
+
+def decompiled_terminal_stop_frames(text: str) -> tuple[int, ...]:
+    """Return 1-based frames whose addFrameScript handler calls stop()."""
+    frames: set[int] = set()
+    for match in _FRAME_SCRIPT_PAIR_PATTERN.finditer(text):
+        body = _decompiled_function_body(text, match.group("method"))
+        if body is not None and _STOP_CALL_PATTERN.search(body):
+            frames.add(int(match.group("index")) + 1)
+    return tuple(sorted(frames))
+
+
+def _decompiled_as3_paths(
     source: Path,
     *,
     ffdec: Path,
     destination: Path,
-) -> bool:
-    """Best-effort check for the random-pose AS3 intent via FFDec."""
+) -> list[Path]:
+    """Export AS3 once per source/destination and reuse it across inspectors."""
     output = destination / (hashlib.sha1(str(source).encode()).hexdigest()[:12])
+    existing = sorted(output.rglob("*.as")) if output.is_dir() else []
+    if existing:
+        return existing
     command = _ffdec_command(
         ffdec,
         "-onerror",
@@ -1433,11 +1477,46 @@ def decompile_as3_has_random_pose(
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=240)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return []
     if result.returncode:
-        return False
+        return []
+    return sorted(output.rglob("*.as"))
+
+
+def parse_terminal_stop_frames(
+    source: Path,
+    *,
+    ffdec: Path,
+    destination: Path,
+) -> dict[str, int]:
+    """Map fully qualified AS3 class names to their first authored stop frame."""
+    stops: dict[str, int] = {}
+    for path in _decompiled_as3_paths(source, ffdec=ffdec, destination=destination):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        frames = decompiled_terminal_stop_frames(text)
+        class_match = _CLASS_RE.search(text)
+        if not frames or class_match is None:
+            continue
+        package_match = _PACKAGE_RE.search(text)
+        package = package_match.group(1) if package_match else ""
+        class_name = class_match.group(1)
+        full_name = f"{package}.{class_name}" if package else class_name
+        stops[full_name.casefold()] = frames[0]
+    return stops
+
+
+def decompile_as3_has_random_pose(
+    source: Path,
+    *,
+    ffdec: Path,
+    destination: Path,
+) -> bool:
+    """Best-effort check for the random-pose AS3 intent via FFDec."""
     try:
-        for path in output.rglob("*.as"):
+        for path in _decompiled_as3_paths(source, ffdec=ffdec, destination=destination):
             if decompiled_has_random_pose(
                 path.read_text(encoding="utf-8", errors="replace")
             ):
@@ -1454,20 +1533,8 @@ def parse_color_scripts(
     destination: Path,
 ) -> dict[str, tuple[str, str]]:
     """Decompile and recognize AQW's common per-symbol color script."""
-    output = destination / (hashlib.sha1(str(source).encode()).hexdigest()[:12])
-    command = _ffdec_command(
-        ffdec,
-        "-export",
-        "script",
-        str(output),
-        str(source),
-        home=destination / ".ffdec-home",
-    )
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode:
-        return {}
     rules: dict[str, tuple[str, str]] = {}
-    for path in output.rglob("*.as"):
+    for path in _decompiled_as3_paths(source, ffdec=ffdec, destination=destination):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -1482,6 +1549,69 @@ def parse_color_scripts(
         full_name = f"{package}.{class_name}" if package else class_name
         rules[full_name.casefold()] = (color.group(1), color.group(2))
     return rules
+
+
+def stopped_direct_child_timeline(
+    source_svg: Path,
+    terminal_stops: Mapping[str, int],
+) -> StoppedChildTimeline | None:
+    """Resolve a single child timeline that should remain on ``stop()``.
+
+    FFDec's ``-sublength`` advances display-list timelines without executing
+    ActionScript. A child authored to ``stop()`` on its final pose therefore
+    wraps to frame 1 and appears to vanish. For an idle render, the caller must
+    resolve the complete parent at the authored stop and reuse that settled
+    state from the first output frame. It must not promote nested artwork:
+    that can turn a startup reveal into an unintended independent loop.
+    """
+    try:
+        root = ET.parse(source_svg).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    _definitions, rendered = _rendered_svg_children(root)
+    if len(rendered) != 1:
+        return None
+    direct = list(rendered[0])
+    if len(direct) != 1 or direct[0].tag.rsplit("}", 1)[-1] != "use":
+        return None
+    child = direct[0]
+    class_name = child.get(f"{{{FFDEC_NS}}}characterName")
+    if not class_name:
+        return None
+    stop_frame = int(terminal_stops.get(class_name.casefold()) or 0)
+    # A frame-1 stop is already stable under FFDec's timeline wrapping and
+    # does not need remapping. Later stops are the one-shot settling case.
+    if stop_frame < 2:
+        return None
+    return StoppedChildTimeline(
+        class_name=class_name,
+        stop_frame=stop_frame,
+    )
+
+
+def stopped_timeline_frame_indexes(
+    frame_count: int,
+    *,
+    stop_frame: int,
+    subframe_start: int = 1,
+) -> tuple[int, ...]:
+    """Map a stopped idle timeline to its settled exported frame index.
+
+    AQW lets the child reach ``stop_frame`` while an item loads. An idle-only
+    render should begin after that startup has settled, so every output frame
+    reuses the complete stopped parent state. This also freezes all nested
+    artwork together instead of promoting it into an unintended loop.
+    """
+    if frame_count < 1 or stop_frame < 1 or subframe_start < 1:
+        raise CharacterSvgError("Frame counts and indexes must be positive")
+    stop_index = stop_frame - subframe_start
+    if stop_index < 0:
+        raise CharacterSvgError(
+            "Cannot reproduce a stop frame before the exported subframe start"
+        )
+    if stop_index >= frame_count:
+        return tuple(range(frame_count))
+    return (stop_index,) * frame_count
 
 
 def _normalize_ffdec_font_export_zoom(root: ET.Element, zoom: float) -> None:

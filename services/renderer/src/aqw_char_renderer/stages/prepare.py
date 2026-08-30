@@ -173,6 +173,41 @@ def _source_color_rules(
     return computed
 
 
+def _source_terminal_stops(
+    source: Path,
+    record: SourceObject,
+    *,
+    store: StageStore,
+    config: RuntimeConfig,
+    scripts_root: Path,
+) -> dict[str, int]:
+    """Authored AS3 stop frames for one immutable SWF, cached by hash."""
+    cache_key = f"timeline-stops/1/{record.sha256}.json"
+    try:
+        payload = store.read_json(config.work_bucket, cache_key)
+        if isinstance(payload, Mapping):
+            return {str(name): int(frame) for name, frame in payload.items()}
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") not in {
+            "NoSuchKey",
+            "NoSuchBucket",
+            "404",
+        }:
+            log_event("timeline_stops_cache_read_failed", key=cache_key, error=str(error))
+    except (StorageError, TypeError, ValueError, json.JSONDecodeError, OSError) as error:
+        log_event("timeline_stops_cache_corrupt", key=cache_key, error=str(error))
+    computed = character_svg.parse_terminal_stop_frames(
+        source,
+        ffdec=config.ffdec_path,
+        destination=scripts_root,
+    )
+    try:
+        store.write_json(config.work_bucket, cache_key, computed)
+    except (StorageError, ClientError, OSError) as error:
+        log_event("timeline_stops_cache_write_failed", key=cache_key, error=str(error))
+    return computed
+
+
 _SVG_ROOT_TAG_RE = re.compile(rb"<svg\b[^>]*>", re.DOTALL)
 _MATRIX_ATTR_RE = re.compile(rb'transform="(matrix\([^)]*\))"')
 
@@ -1186,8 +1221,45 @@ def prepare_export_source(
             config=config,
             scripts_root=root / "scripts",
         )
+        terminal_stops = _source_terminal_stops(
+            swf,
+            record,
+            store=store,
+            config=config,
+            scripts_root=root / "scripts",
+        )
         placement_colors = character_svg.authored_swf_color_transforms(swf)
         mark("source_metadata_ms", phase)
+
+        # FFDec advances nested timelines without running their frame scripts.
+        # If the selected idle state is a single child that settles on stop(),
+        # begin on that completed state and hold the complete parent. Startup
+        # effects are not part of the idle output, and promoting the stopped
+        # child's nested artwork would turn the finished pose into a false loop.
+        settled_timelines: dict[str, character_svg.StoppedChildTimeline] = {}
+        for symbol in requests:
+            frames = exported.get(symbol.key) or []
+            if not frames:
+                continue
+            settled = character_svg.stopped_direct_child_timeline(
+                frames[0], terminal_stops
+            )
+            if settled is not None:
+                settled_timelines[symbol.key] = settled
+        if settled_timelines:
+            phase = time.perf_counter()
+            for key, settled in settled_timelines.items():
+                indexes = character_svg.stopped_timeline_frame_indexes(
+                    len(exported[key]),
+                    stop_frame=settled.stop_frame,
+                    subframe_start=subframe_start,
+                )
+                exported[key] = [exported[key][index] for index in indexes]
+                vector_signatures[key] = [
+                    vector_signatures[key][index] for index in indexes
+                ]
+                vector_bounds[key] = [vector_bounds[key][index] for index in indexes]
+            mark("settled_freeze_ms", phase)
 
         archive_directory = root / "archives"
         archive_directory.mkdir(parents=True, exist_ok=True)
@@ -1261,6 +1333,11 @@ def prepare_export_source(
                     "mirror_flip_frame": mirror_flip_frame,
                     "random_pose_as3": random_pose,
                     "animated_span": animated_span,
+                    "settled_stop_frame": (
+                        settled_timelines[symbol.key].stop_frame
+                        if symbol.key in settled_timelines
+                        else None
+                    ),
                 },
             )
             parts.append(
@@ -1269,6 +1346,11 @@ def prepare_export_source(
                     "root_class": symbol.class_name,
                     "character_id": symbol.character_id,
                     "frame_count": len(frames),
+                    "settled_stop_frame": (
+                        settled_timelines[symbol.key].stop_frame
+                        if symbol.key in settled_timelines
+                        else None
+                    ),
                 }
             )
         mark("meta_upload_ms", phase)
@@ -1296,6 +1378,7 @@ def prepare_export_source(
         cache_hit=cache_hit,
         cache_created=cache_created,
         cache_key=cache_key,
+        settled_timelines=len(settled_timelines),
         duration_ms=round(total_ms, 1),
         unaccounted_ms=round(total_ms - accounted_ms, 1),
         **{key: round(value, 1) for key, value in sorted(timings.items())},
@@ -1410,6 +1493,8 @@ def prepare_finish(
                         for (parent_id, child_id), transform in sorted(placement.items())
                     },
                 }
+                if part.get("settled_stop_frame"):
+                    part_record["settled_stop_frame"] = int(part["settled_stop_frame"])
                 # Legacy manifests may still need the full per-symbol archive;
                 # new complete source bundles make that duplicate unnecessary.
                 if part.get("archive_key"):

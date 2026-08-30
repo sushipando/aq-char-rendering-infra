@@ -671,6 +671,58 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
             "gotoAndStop(Math.random()*10)"
         ))
 
+    def test_terminal_stop_frame_detection(self):
+        cape = """
+        package DarkShadowsr1_fla {
+          public dynamic class CapeIdle_2 extends MovieClip {
+            public function CapeIdle_2() {
+              addFrameScript(25,this.frame26,4,this.frame5);
+            }
+            internal function frame26() : * { stop(); }
+            internal function frame5() : * { gotoAndPlay(1); }
+          }
+        }
+        """
+        self.assertEqual(character_svg.decompiled_terminal_stop_frames(cape), (26,))
+
+    def test_stopped_direct_child_detects_authored_stop_frame(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "cape.svg"
+            source.write_text(
+                """<svg xmlns="http://www.w3.org/2000/svg"
+                xmlns:xlink="http://www.w3.org/1999/xlink"
+                xmlns:ffdec="https://www.free-decompiler.com/flash"
+                width="20px" height="10px">
+                  <g transform="matrix(2,0,0,2,6,8)">
+                    <use ffdec:characterId="24"
+                      ffdec:characterName="DarkShadowsr1_fla.CapeIdle_2"
+                      transform="matrix(1.2,0,0,1,5,2)" xlink:href="#sprite0"/>
+                  </g>
+                  <defs><g id="sprite0"/></defs>
+                </svg>""",
+                encoding="utf-8",
+            )
+            settled = character_svg.stopped_direct_child_timeline(
+                source,
+                {"darkshadowsr1_fla.capeidle_2": 26},
+            )
+            self.assertIsNotNone(settled)
+            assert settled is not None
+            self.assertEqual(settled.class_name, "DarkShadowsr1_fla.CapeIdle_2")
+            self.assertEqual(settled.stop_frame, 26)
+
+    def test_stopped_idle_timeline_uses_only_the_settled_frame(self):
+        self.assertEqual(
+            character_svg.stopped_timeline_frame_indexes(8, stop_frame=4),
+            (3, 3, 3, 3, 3, 3, 3, 3),
+        )
+        self.assertEqual(
+            character_svg.stopped_timeline_frame_indexes(
+                6, stop_frame=6, subframe_start=3
+            ),
+            (3, 3, 3, 3, 3, 3),
+        )
+
     def test_complete_loop_and_fixed_frames_are_mutually_exclusive(self):
         parser = character_svg.build_parser()
 

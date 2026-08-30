@@ -86,6 +86,11 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v11: idle AS3 timelines that settle on a later stop() frame start on and
+    // hold the complete finished parent state. v10 incorrectly promoted nested
+    // artwork and turned the finished state into a new loop.
+    // v10: detect later authored stop() frames instead of wrapping the parent
+    // back to frame 1.
     // v9: invisible animation states (opacity-0 blink/cape frames) store null
     // bounds instead of their loose header canvas, so the shared viewbox no
     // longer includes their phantom stage and the animation fills the frame.
@@ -94,7 +99,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v9',
+    rendererVersion: 'v11',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
@@ -115,7 +120,7 @@ const DEV_TUNING: InfrastructureTuning = {
     subframeStart: 1,
     frameBatchSize: 4,
     // Dev concurrency was raised 10 -> 1000 (case 178797464300402), so small
-    // batches in a single wave are now the fast path: a 360-frame job is 90
+    // batches in a single wave are now the fast path: a 120-frame job is 30
     // batches of 4, all concurrent. Memory stays capped at 3008 MiB (~1.7
     // vCPU) so per-frame speed is unchanged, but wall time drops ~6x. (This
     // was previously 30/4 because 10 slots made >4 contend.)
@@ -141,11 +146,10 @@ const DEV_TUNING: InfrastructureTuning = {
     shutdownPercent: 100,
   },
   workflowTimeoutMinutes: 60,
-  // Prepare is split so each source SWF exports in its own Lambda; a
-  // character has ~5 sources. Five parallel FFDec JVMs on ~1.7 vCPU each
-  // starve and blow the 300s budget, so cap export concurrency at 3 to keep
-  // 120-frame renders well under the timeout.
-  prepareExportConcurrency: 3,
+  // Each source SWF exports in its own Lambda, with its own CPU allocation.
+  // A character normally has about five sources, so keep enough concurrency
+  // to export all of them in one wave.
+  prepareExportConcurrency: 8,
   jobQueueVisibilitySeconds: 180,
 };
 

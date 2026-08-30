@@ -315,13 +315,17 @@ def test_export_source_bundles_all_symbols_and_reuses_exact_vector_cache() -> No
                 "aqw_char_renderer.stages.prepare._source_color_rules",
                 return_value={},
             ),
+            mock.patch(
+                "aqw_char_renderer.stages.prepare._source_terminal_stops",
+                return_value={},
+            ),
             mock.patch.object(
                 character_svg,
                 "authored_swf_color_transforms",
                 return_value={},
             ),
         )
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             first = prepare_export_source(
                 job_id="job-one",
                 input_key=write_input("job-one"),
@@ -364,6 +368,10 @@ def test_export_source_bundles_all_symbols_and_reuses_exact_vector_cache() -> No
             ),
             mock.patch(
                 "aqw_char_renderer.stages.prepare._source_color_rules",
+                return_value={},
+            ),
+            mock.patch(
+                "aqw_char_renderer.stages.prepare._source_terminal_stops",
                 return_value={},
             ),
             mock.patch.object(

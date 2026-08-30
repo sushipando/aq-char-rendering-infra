@@ -23,6 +23,7 @@ Output layout (per immutable SWF, one object):
         "period": P | null,
         "mirror_flip_frame": F | null,
         "random_pose_as3": true|false,
+        "settled_stop_frame": S | null,
         "states": ["<sha256-of-unique-state>", ...]
       }
     }
@@ -38,7 +39,6 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.hashing import canonical_json, file_sha256
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
@@ -125,7 +125,7 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                     destination=root / f"probe-{request.character_id}",
                     frame_count=8,
                 )
-            except Exception:  # noqa: BLE001 - class is not sprite-exportable
+            except Exception:  # noqa: BLE001, S112 - class is not sprite-exportable
                 continue
             exportable.append(request)
         if not exportable:
@@ -140,6 +140,28 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
             )
         except Exception:  # noqa: BLE001 - analyzer is best-effort per asset
             return None
+        terminal_stops = character_svg.parse_terminal_stop_frames(
+            swf,
+            ffdec=ffdec,
+            destination=root / "scripts",
+        )
+        settled_timelines: dict[str, character_svg.StoppedChildTimeline] = {}
+        for request in exportable:
+            paths = exported.get(request.key) or []
+            if not paths:
+                continue
+            settled = character_svg.stopped_direct_child_timeline(
+                paths[0], terminal_stops
+            )
+            if settled is not None:
+                settled_timelines[request.key] = settled
+        if settled_timelines:
+            for key, settled in settled_timelines.items():
+                indexes = character_svg.stopped_timeline_frame_indexes(
+                    len(exported[key]),
+                    stop_frame=settled.stop_frame,
+                )
+                exported[key] = [exported[key][index] for index in indexes]
         symbols: dict[str, Any] = {}
         for request in exportable:
             paths = exported.get(request.key)
@@ -175,6 +197,11 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                 "states": states,
                 "mirror_flip_frame": mirror_flip_frame,
                 "random_pose_as3": request.class_name and "random" in request.class_name.casefold(),
+                "settled_stop_frame": (
+                    settled_timelines[request.key].stop_frame
+                    if request.key in settled_timelines
+                    else None
+                ),
             }
     return {"schema_version": 1, "symbols": symbols}
 
