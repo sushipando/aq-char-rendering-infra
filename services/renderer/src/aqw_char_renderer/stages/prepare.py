@@ -787,8 +787,12 @@ def prepare_resolve(
                 if not missing:
                     # Recover each requested symbol's period from the metadata
                     # keyed by class name, then compute the combined loop.
+                    # A ground cosmetic analyzed as a random-pose display
+                    # (mirror-flip boundary) is frozen at its initial pose
+                    # rather than contributing its pose-cycle to the loop.
                     periods: list[int] = []
                     blink_period: int | None = None
+                    static_keys: list[str] = []
                     for symbol in requests:
                         source_meta = meta_by_source.get(symbol.source)
                         symbol_meta = (
@@ -797,6 +801,15 @@ def prepare_resolve(
                         if not symbol_meta or symbol_meta.get("period") is None:
                             missing = True
                             break
+                        if (
+                            symbol.key == "ground"
+                            and (
+                                bool(symbol_meta.get("random_pose_as3") or False)
+                                or int(symbol_meta.get("mirror_flip_frame") or 0) > 0
+                            )
+                        ):
+                            static_keys.append("ground")
+                            continue
                         if symbol.key == "armor_head":
                             blink_period = int(symbol_meta["period"])
                         else:
@@ -816,6 +829,7 @@ def prepare_resolve(
                             "detected_blink_frames": detected_blink_frames,
                             "frame_count": frame_count,
                             "source_count": len(meta_by_source),
+                            "static_keys": static_keys,
                         }
         except Exception:  # noqa: BLE001 - any manifest failure degrades to request-time scan
             manifest_meta = None
@@ -1105,6 +1119,26 @@ def prepare_export_source(
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
             meta_key = f"jobs/{job_id}/prepare/meta/{symbol.key}.json"
+            # Ground/misc cosmetics may be authored as random poses whose
+            # timeline mirrors the same display list mid-way. Export that
+            # boundary so finish can freeze the layer at its initial pose
+            # instead of looping the flip-flop.
+            mirror_flip_frame = (
+                character_svg.detect_mirror_flip_frame(frames)
+                if symbol.key == "ground"
+                else None
+            )
+            # Author intent is the definitive signal: does the source SWF's
+            # decompiled AS3 freezes on a random pose?
+            random_pose = (
+                character_svg.decompile_as3_has_random_pose(
+                    symbol.source,
+                    ffdec=config.ffdec_path,
+                    destination=root / "scripts",
+                )
+                if symbol.key == "ground"
+                else False
+            )
             store.write_json(
                 config.work_bucket,
                 meta_key,
@@ -1112,6 +1146,8 @@ def prepare_export_source(
                     "frame_signatures": vector_signatures[symbol.key],
                     "frame_bounds": vector_bounds[symbol.key],
                     "frame_count": len(frames),
+                    "mirror_flip_frame": mirror_flip_frame,
+                    "random_pose_as3": random_pose,
                 },
             )
             parts.append(
@@ -1204,6 +1240,8 @@ def prepare_finish(
         export_key_to_result = {int(result["source_idx"]): result for result in export_results}
         symbol_signatures: dict[str, list[str]] = {}
         symbol_bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
+        mirror_flip_frames: dict[str, int] = {}
+        random_pose_as3: dict[str, bool] = {}
         part_manifest: dict[str, Any] = {}
         all_color_rules: set[tuple[str, str]] = set()
         for result in sorted(
@@ -1229,6 +1267,8 @@ def prepare_finish(
                     None if value is None else tuple(float(v) for v in value)
                     for value in meta["frame_bounds"]
                 ]
+                mirror_flip_frames[part["key"]] = int(meta.get("mirror_flip_frame") or 0)
+                random_pose_as3[part["key"]] = bool(meta.get("random_pose_as3") or False)
                 part_record = {
                     "source_idx": int(result["source_idx"]),
                     "root_class": part["root_class"],
@@ -1266,12 +1306,31 @@ def prepare_finish(
         detected_item_loop: int | None = None
         detected_blink_frames: int | None = None
         ignored_loop_keys: tuple[str, ...] = ()
+        # Ground/misc cosmetics can be authored as random poses (the display
+        # list is mirrored mid-timeline, or the AS3 freezes on a random pose).
+        # Freeze those layers at their initial pose instead of looping the
+        # direction swap. The decompiled AS3 intent is the definitive signal;
+        # the structural mirror-flip detection is the fallback for SWFs where
+        # FFDec cannot cleanly decompile the timeline.
+        static_keys = tuple(
+            key
+            for key, flip_frame in mirror_flip_frames.items()
+            if key == "ground" and (random_pose_as3.get(key) or flip_frame > 0)
+        )
         warnings = list(prepared.get("warnings") or [])
+        if static_keys:
+            warnings.append(
+                "Froze "
+                + ", ".join(static_keys)
+                + " layer(s) at their initial pose (random-pose timeline detected)"
+            )
         precomputed = prepared.get("precomputed_loop") or {}
         if precomputed.get("frame_count"):
             frame_count = int(precomputed["frame_count"])
             detected_item_loop = precomputed.get("detected_item_loop")
             detected_blink_frames = precomputed.get("detected_blink_frames")
+            precomputed_static = tuple(precomputed.get("static_keys") or ())
+            static_keys = tuple(dict.fromkeys(static_keys + precomputed_static))
             detected_loop = (
                 character_svg.aligned_animation_frame_count(
                     detected_item_loop, detected_blink_frames
@@ -1282,6 +1341,9 @@ def prepare_finish(
             ignored_loop_keys = ("armor_head",)
         elif request.render.complete_loop:
             loop_sigs, ignored_loop_keys = character_svg.loop_driver_from_signatures(detection_sigs)
+            loop_sigs = {
+                key: sigs for key, sigs in loop_sigs.items() if key not in static_keys
+            }
             detected_item_loop = character_svg.detect_loop_from_signatures(
                 loop_sigs, max_frames=request.render.max_frames
             )
@@ -1351,6 +1413,7 @@ def prepare_finish(
             "aliases": dict(sorted(prepared["aliases"].items())),
             "weapon_type": prepared["weapon_type"],
             "parts": part_manifest,
+            "static_keys": list(static_keys),
             # Reconstruct the per-source bundle keys deterministically instead
             # of shipping ~5000 entries through Step Functions state.
             "source_bundles": {

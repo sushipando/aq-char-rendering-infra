@@ -714,6 +714,15 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           actions: ['s3:GetObject'],
           resources: [manifestArn, dynamicAssetArn],
         }),
+        // s3:ListBucket lets HeadObject/GetObject on a not-yet-seeded
+        // dynamic-assets key receive a 404 instead of a 403, so the bot can
+        // detect corpus-missing SWFs and seed them from AQW. Without it,
+        // first-time characters (e.g. a standalone ground item) fail with
+        // "temporarily unavailable" during source preparation.
+        new iam.PolicyStatement({
+          actions: ['s3:ListBucket'],
+          resources: [sourceBucket.bucketArn],
+        }),
         new iam.PolicyStatement({
           actions: ['s3:PutObject'],
           resources: [dynamicAssetArn],

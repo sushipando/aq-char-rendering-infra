@@ -142,8 +142,13 @@ def render_batch(
     all_warnings: list[str] = []
     detected_blink_frames = prepared.get("detected_blink_frames")
     ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
+    static_keys = set(prepared.get("static_keys") or ())
 
     def source_frame_for(key: str, frame_number: int) -> int:
+        if key in static_keys:
+            # Random-pose ground cosmetics are frozen at their initial pose
+            # instead of looping the mid-timeline direction flip.
+            return 1
         if detected_blink_frames and key in ignored_loop_keys and detected_blink_frames > 0:
             zero_based = character_svg.one_shot_source_frame_index(
                 frame_number - 1,

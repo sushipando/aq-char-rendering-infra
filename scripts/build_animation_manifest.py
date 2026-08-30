@@ -21,6 +21,8 @@ Output layout (per immutable SWF, one object):
         "frame_signatures": ["<sha256>", ...],
         "unique_states": K,
         "period": P | null,
+        "mirror_flip_frame": F | null,
+        "random_pose_as3": true|false,
         "states": ["<sha256-of-unique-state>", ...]
       }
     }
@@ -36,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.hashing import canonical_json, file_sha256
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
@@ -122,7 +125,7 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                     destination=root / f"probe-{request.character_id}",
                     frame_count=8,
                 )
-            except Exception:  # noqa: BLE001,S112 - class is not sprite-exportable
+            except Exception:  # noqa: BLE001 - class is not sprite-exportable
                 continue
             exportable.append(request)
         if not exportable:
@@ -156,12 +159,22 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                 max_frames=max(1, scan_frames - character_svg.LOOP_VALIDATION_FRAMES),
                 validation_frames=character_svg.LOOP_VALIDATION_FRAMES,
             )
+            # Random-pose cosmetics mirror the same display list mid-timeline
+            # (the ground gate reads as "swapping direction" when looped).
+            # These items are authored to freeze on a random pose via AS3.
+            # Scan only the leading window; the runtime export path repeats
+            # this detection when the source is dynamic and has no manifest.
+            mirror_flip_frame = (
+                character_svg.detect_mirror_flip_frame(paths[:120]) or 0
+            )
             symbols[request.class_name.casefold()] = {
                 "root_frame": request.frame,
                 "frame_signatures": signatures,
                 "unique_states": len(states),
                 "period": period,
                 "states": states,
+                "mirror_flip_frame": mirror_flip_frame,
+                "random_pose_as3": request.class_name and "random" in request.class_name.casefold(),
             }
     return {"schema_version": 1, "symbols": symbols}
 

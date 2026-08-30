@@ -489,6 +489,76 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         self.assertEqual(character_svg.one_shot_source_frame_index(87, one_shot_frames=87), 86)
         self.assertEqual(character_svg.one_shot_source_frame_index(119, one_shot_frames=87), 86)
 
+    def _write_frame(self, root: Path, frame_index: int, *, flip_at: int | None = None,
+                     spawn_at: int | None = None) -> Path:
+        flipped = flip_at is not None and frame_index >= flip_at
+        transform = (
+            "matrix(-1.0, 0.0, 0.0, 1.0, 0.0, 0.0)" if flipped else "matrix(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)"
+        )
+        body = (
+            '<svg xmlns="http://www.w3.org/2000/svg" '
+            'xmlns:xlink="http://www.w3.org/1999/xlink" '
+            'xmlns:ffdec="https://www.free-decompiler.com/flash" width="10" height="10">'
+            f'<use ffdec:characterId="7" transform="{transform}" xlink:href="#sprite0"/>'
+            '<use ffdec:characterId="3" transform="matrix(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)" '
+            'xlink:href="#sprite1"/>'
+        )
+        if spawn_at is not None and frame_index >= spawn_at:
+            body += '<use ffdec:characterId="9" transform="matrix(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)" '
+            body += 'xlink:href="#sprite2"/>'
+        body += '</svg>'
+        path = root / f"{frame_index}.svg"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_detect_mirror_flip_locates_mid_timeline_pose_swap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [self._write_frame(root, index, flip_at=10) for index in range(60)]
+            self.assertEqual(character_svg.detect_mirror_flip_frame(paths), 10)
+            # The flipped run is only 50 frames long, so a taller minimum
+            # run must reject the boundary.
+            self.assertEqual(
+                character_svg.detect_mirror_flip_frame(paths, min_run=60),
+                None,
+            )
+
+    def test_detect_mirror_flip_is_none_when_timeline_is_stable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [self._write_frame(root, index) for index in range(30)]
+            self.assertIsNone(character_svg.detect_mirror_flip_frame(paths))
+
+    def test_detect_mirror_flip_ignores_element_set_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # The display list grows before any mirror; the flip detector only
+            # fires on an identical element set whose flags toggle, so a
+            # spawned-in animation layer must not register as a pose swap.
+            paths = [
+                self._write_frame(root, index, flip_at=25, spawn_at=20)
+                for index in range(40)
+            ]
+            self.assertIsNone(character_svg.detect_mirror_flip_frame(paths))
+
+    def test_random_pose_as3_detection(self):
+        gate = (
+            "package LaeDWearGoldDragon_fla; "
+            "public dynamic class RandomDragon_3 extends MovieClip { "
+            "internal function frame1() : * { "
+            "gotoAndStop(Math.round(Math.random() * (this.totalFrames - 1) + 1)); "
+            "} }"
+        )
+        static = (
+            "public dynamic class Weapon_2 extends MovieClip { "
+            "internal function frame1() : * { gotoAndStop(1); } }"
+        )
+        self.assertTrue(character_svg.decompiled_has_random_pose(gate))
+        self.assertFalse(character_svg.decompiled_has_random_pose(static))
+        self.assertTrue(character_svg.decompiled_has_random_pose(
+            "gotoAndStop(Math.random()*10)"
+        ))
+
     def test_complete_loop_and_fixed_frames_are_mutually_exclusive(self):
         parser = character_svg.build_parser()
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass
@@ -1280,6 +1280,143 @@ def one_shot_source_frame_index(
     if output_frame_index < 0 or one_shot_frames < 1:
         raise CharacterSvgError("Animation frame indexes must be nonnegative")
     return min(output_frame_index, one_shot_frames - 1)
+
+
+def exported_frame_use_fingerprint(path: Path) -> list[tuple[str, bool]]:
+    """Structural fingerprint of one FFDec frame export (best effort).
+
+    Records every visible ``<use>`` as ``(character id or href, mirrored)``
+    where ``mirrored`` is the sign of the placement matrix determinant. A
+    mirrored copy of a frame therefore has the same element set but toggled
+    flags, while a stable animated model keeps both the set and the flags
+    unchanged.
+    """
+    tree = ET.parse(path)
+    root = tree.getroot()
+    entries: list[tuple[str, bool]] = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "use":
+            continue
+        character = element.get(f"{{{FFDEC_NS}}}characterId")
+        reference = element.get(f"{{{XLINK_NS}}}href") or element.get("href") or ""
+        key = character if character is not None else reference
+        if not key:
+            continue
+        matrix = parse_matrix(element.get("transform"))
+        mirrored = (
+            matrix is not None
+            and matrix[0] * matrix[3] - matrix[1] * matrix[2] < 0.0
+        )
+        entries.append((key, mirrored))
+    return sorted(entries)
+
+
+def detect_mirror_flip_frame(
+    exports: Sequence[Path],
+    *,
+    min_run: int = 5,
+    min_scan: int = 16,
+) -> int | None:
+    """Locate a mid-timeline pose flip; return its 0-based frame index.
+
+    Some AQW ground/misc cosmetics are authored as a set of poses rather than
+    a motion loop: their root timeline re-places the same display list with
+    one or more child matrices mirrored (the item may even stop on a random
+    pose via ``gotoAndStop(Math.random() * totalFrames)`` AS3). FFDec exports
+    that as an identical element set whose mirror flags toggle for a
+    contiguous run, and a loop over the whole timeline reads as the ground
+    swapping direction every few frames. Detecting that run lets the caller
+    freeze the layer at its initial (authored) pose instead.
+    """
+    if len(exports) < min_scan:
+        return None
+    fingerprints: list[list[tuple[str, bool]]] = []
+    for path in exports:
+        try:
+            fingerprints.append(exported_frame_use_fingerprint(path))
+        except (OSError, ET.ParseError) as error:
+            raise CharacterSvgError(f"Invalid FFDec SVG {path}: {error}") from error
+    first = fingerprints[0]
+    first_counts = Counter(key for key, _ in first)
+
+    def flipped(index: int) -> bool:
+        current = fingerprints[index]
+        if Counter(key for key, _ in current) != first_counts:
+            return False
+        return any(
+            initial_flag != current_flag
+            for (_, initial_flag), (_, current_flag) in zip(first, current)
+        )
+
+    run_start: int | None = None
+    for index in range(1, len(fingerprints)):
+        if flipped(index):
+            if run_start is None:
+                run_start = index
+            elif index - run_start + 1 >= min_run:
+                return run_start
+        else:
+            run_start = None
+    return None
+
+
+# --- AS3 "random pose" detection -------------------------------------------
+# AQW cosmetics are a mix of seamless animation loops and "random pose"
+# items. A random-pose timeline is authored as separate static segments (a
+# walking pet, a weapon that picks from poses, a ground gate) and the AS3 freezes
+# on a random frame via ``gotoAndStop(Math.round(Math.random() *
+# (this.totalFrames - 1) + 1))``. Such items are NOT meant to loop; looping them
+# reads as the ground/Weapon swapping direction every few frames.
+_RANDOM_POSE_AS3_PATTERN = re.compile(
+    r"gotoAndStop\s*\([^)]*Math\.random[^)]*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def decompiled_has_random_pose(text: str) -> bool:
+    """True when one decompiled class freezes on a random pose."""
+    if _RANDOM_POSE_AS3_PATTERN.search(text):
+        return True
+    return bool(
+        "random" in text.casefold()
+        and "gotoandstop" in text.casefold()
+        and "totalframes" in text.casefold()
+    )
+
+
+def decompile_as3_has_random_pose(
+    source: Path,
+    *,
+    ffdec: Path,
+    destination: Path,
+) -> bool:
+    """Best-effort check for the random-pose AS3 intent via FFDec."""
+    output = destination / (hashlib.sha1(str(source).encode()).hexdigest()[:12])
+    command = _ffdec_command(
+        ffdec,
+        "-onerror",
+        "ignore",
+        "-export",
+        "script",
+        str(output),
+        str(source),
+        home=destination / ".ffdec-home",
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode:
+        return False
+    try:
+        for path in output.rglob("*.as"):
+            if decompiled_has_random_pose(
+                path.read_text(encoding="utf-8", errors="replace")
+            ):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def parse_color_scripts(

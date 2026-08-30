@@ -84,9 +84,12 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
+    // their initial pose instead of looping the direction swap, so v6 cache
+    // entries are invalidated.
     // v6: probe-fit-raster canvas tightening fills the output instead of the
     // ~45%-of-width vector-bound canvas, so v5 cache entries are invalidated.
-    rendererVersion: 'v6',
+    rendererVersion: 'v7',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,
