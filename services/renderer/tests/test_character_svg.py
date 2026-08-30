@@ -74,6 +74,40 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         fields["strHairName"] = "Blank"
         self.assertNotIn("hair", character_svg.appearance_assets(fields))
 
+    def test_pet_is_parsed_and_respects_visibility_bit_2(self):
+        fields = {
+            "strGender": "M",
+            "strClassFile": "Base.swf",
+            "strClassLink": "Base",
+            "strPetFile": "items/pets/CutePet.swf",
+            "strPetLink": "CutePet",
+            "strPetName": "Drudgen",
+        }
+        assets = character_svg.appearance_assets(fields)
+        self.assertEqual(assets["pet"].remote_path, "items/pets/CutePet.swf")
+        self.assertEqual(assets["pet"].link, "CutePet")
+
+        fields["ia1"] = "4"  # bit 2 = pet hidden
+        self.assertNotIn("pet", character_svg.appearance_assets(fields))
+
+    def test_pet_layer_is_drawn_last_on_top(self):
+        aliases = {"chest": "chest", "pet": "pet", "weapon": "weapon"}
+        names = [
+            layer.name
+            for layer in character_svg.build_layers(aliases, weapon_type="Sword")
+        ]
+        self.assertIn("pet", names)
+        self.assertEqual(names[-1], "pet")
+
+    def test_pet_transform_matches_avatar_mc_placements(self):
+        # AvatarMC.onLoadPetComplete: mc.x = -40; mc.y = 10; addChild(mc).
+        self.assertEqual(
+            character_svg.PART_TRANSFORMS["pet"],
+            item_renderer.CHARACTER_PET_TRANSFORM,
+        )
+        self.assertEqual(character_svg.PART_TRANSFORMS["pet"][:4], (1.0, 0.0, 0.0, 1.0))
+        self.assertEqual(character_svg.PART_TRANSFORMS["pet"][4:], (-40.0, 10.0))
+
     def test_character_page_403_uses_official_flashvars_fallback(self):
         fallback = "&strName=Artix&strGender=M"
         calls = []

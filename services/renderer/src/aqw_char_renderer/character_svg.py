@@ -73,6 +73,9 @@ PART_TRANSFORMS: dict[str, Matrix] = {
     "gauntlet_front": (0.206598424, -0.043264031, -0.043294388, -0.206465767, -17.467639200, -61.770611980),
     "gauntlet_back": (0.157597434, -0.108324928, -0.108376495, -0.157499143, 16.267327920, -57.569202040),
     "ground": item_renderer.CHARACTER_GROUND_TRANSFORM,
+    # AvatarMC.onLoadPetComplete() places the pet directly on AvatarMC at
+    # (-40, 10) with no scale or rotation, on top of everything else.
+    "pet": item_renderer.CHARACTER_PET_TRANSFORM,
 }
 
 _BACKHAIR_HOLDER: Matrix = (
@@ -616,6 +619,13 @@ def appearance_assets(
             "cape", tryon.normalize_asset_path(cape_file), cape_link
         )
 
+    pet_file = str(fields.get("strPetFile", "") or "")
+    pet_link = str(fields.get("strPetLink", "") or "")
+    if not flags & (1 << 2) and pet_file and pet_file.casefold() != "none":
+        assets["pet"] = AppearanceAsset(
+            "pet", tryon.normalize_asset_path(pet_file), pet_link
+        )
+
     ground_file = str(fields.get("strMiscFile", "") or "")
     ground_link = str(fields.get("strMiscLink", "") or "")
     if ground_file and ground_file.casefold() != "none":
@@ -852,7 +862,7 @@ def build_symbol_requests(
         )
         aliases[logical] = key
 
-    for slot in ("weapon", "cape", "helm", "ground", "hair"):
+    for slot in ("weapon", "cape", "helm", "ground", "pet", "hair"):
         asset = assets.get(slot)
         if asset is None:
             continue
@@ -2219,6 +2229,9 @@ def build_layers(
     add("front_hand", "hand", "front_hand")
     if normalized_weapon_type == "gauntlet":
         add("gauntlet_front", "weapon", "gauntlet_front")
+    # The pet is addChild()'d straight onto AvatarMC, so it draws on top of
+    # the whole character (including the ground).
+    add("pet", "pet", "pet")
     return layers
 
 

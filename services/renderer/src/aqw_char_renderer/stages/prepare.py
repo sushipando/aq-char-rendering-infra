@@ -802,7 +802,7 @@ def prepare_resolve(
                         if not symbol_meta or symbol_meta.get("period") is None:
                             missing = True
                             break
-                        if symbol.key == "ground" and (
+                        if symbol.key in ("ground", "pet") and (
                             bool(symbol_meta.get("random_pose_as3") or False)
                             or int(symbol_meta.get("mirror_flip_frame") or 0) > 0
                         ):
@@ -812,9 +812,9 @@ def prepare_resolve(
                                 # authored bobbing animation (ping-pong);
                                 # mirror_flip_frame is 0-based, so the
                                 # unflipped span equals it.
-                                ground_animate["ground"] = flip_frame
+                                ground_animate[symbol.key] = flip_frame
                             else:
-                                static_keys.append("ground")
+                                static_keys.append(symbol.key)
                             continue
                         if symbol.key == "armor_head":
                             blink_period = int(symbol_meta["period"])
@@ -1126,13 +1126,13 @@ def prepare_export_source(
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
             meta_key = f"jobs/{job_id}/prepare/meta/{symbol.key}.json"
-            # Ground/misc cosmetics may be authored as random poses whose
-            # timeline mirrors the same display list mid-way. Export that
+            # Ground/misc cosmetics (and pets) may be authored as random poses
+            # whose timeline mirrors the same display list mid-way. Export that
             # boundary so finish can freeze the layer at its initial pose
             # instead of looping the flip-flop.
             mirror_flip_frame = (
                 character_svg.detect_mirror_flip_frame(frames)
-                if symbol.key == "ground"
+                if symbol.key in ("ground", "pet")
                 else None
             )
             # Author intent is the definitive signal: does the source SWF's
@@ -1143,10 +1143,10 @@ def prepare_export_source(
                     ffdec=config.ffdec_path,
                     destination=root / "scripts",
                 )
-                if symbol.key == "ground"
+                if symbol.key in ("ground", "pet")
                 else False
             )
-            if symbol.key == "ground":
+            if symbol.key in ("ground", "pet"):
                 # The leading, non-mirrored segment (frames 1..span) is the
                 # authored bobbing animation; ping-ponging it keeps the motion
                 # without looping the mid-timeline direction flip. Without any
@@ -1344,14 +1344,14 @@ def prepare_finish(
         static_keys = tuple(
             key
             for key, flip_frame in mirror_flip_frames.items()
-            if key == "ground"
+            if key in ("ground", "pet")
             and (random_pose_as3.get(key) or flip_frame > 0)
             and ground_animate.get(key, 0) < 2
         )
         ground_animate = {
             key: span
             for key, span in ground_animate.items()
-            if key == "ground" and span >= 2
+            if key in ("ground", "pet") and span >= 2
         }
         warnings = list(prepared.get("warnings") or [])
         if static_keys:
