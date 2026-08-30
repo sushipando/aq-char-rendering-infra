@@ -143,8 +143,20 @@ def render_batch(
     detected_blink_frames = prepared.get("detected_blink_frames")
     ignored_loop_keys = set(prepared.get("ignored_loop_keys") or ())
     static_keys = set(prepared.get("static_keys") or ())
+    ground_animate = {
+        str(key): int(span)
+        for key, span in (prepared.get("ground_animate") or {}).items()
+    }
 
     def source_frame_for(key: str, frame_number: int) -> int:
+        span = ground_animate.get(key, 0)
+        if span >= 2:
+            # Random-pose ground cosmetics bob inside their leading pose span;
+            # ping-pong it so the motion stays without the direction flip.
+            return character_svg.pingpong_source_frame_index(
+                frame_number - 1,
+                span=span,
+            )
         if key in static_keys:
             # Random-pose ground cosmetics are frozen at their initial pose
             # instead of looping the mid-timeline direction flip.

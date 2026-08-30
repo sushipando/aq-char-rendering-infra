@@ -793,6 +793,7 @@ def prepare_resolve(
                     periods: list[int] = []
                     blink_period: int | None = None
                     static_keys: list[str] = []
+                    ground_animate: dict[str, int] = {}
                     for symbol in requests:
                         source_meta = meta_by_source.get(symbol.source)
                         symbol_meta = (
@@ -801,14 +802,19 @@ def prepare_resolve(
                         if not symbol_meta or symbol_meta.get("period") is None:
                             missing = True
                             break
-                        if (
-                            symbol.key == "ground"
-                            and (
-                                bool(symbol_meta.get("random_pose_as3") or False)
-                                or int(symbol_meta.get("mirror_flip_frame") or 0) > 0
-                            )
+                        if symbol.key == "ground" and (
+                            bool(symbol_meta.get("random_pose_as3") or False)
+                            or int(symbol_meta.get("mirror_flip_frame") or 0) > 0
                         ):
-                            static_keys.append("ground")
+                            flip_frame = int(symbol_meta.get("mirror_flip_frame") or 0)
+                            if flip_frame >= 2:
+                                # The leading non-mirrored segment is the
+                                # authored bobbing animation (ping-pong);
+                                # mirror_flip_frame is 0-based, so the
+                                # unflipped span equals it.
+                                ground_animate["ground"] = flip_frame
+                            else:
+                                static_keys.append("ground")
                             continue
                         if symbol.key == "armor_head":
                             blink_period = int(symbol_meta["period"])
@@ -830,6 +836,7 @@ def prepare_resolve(
                             "frame_count": frame_count,
                             "source_count": len(meta_by_source),
                             "static_keys": static_keys,
+                            "ground_animate": ground_animate,
                         }
         except Exception:  # noqa: BLE001 - any manifest failure degrades to request-time scan
             manifest_meta = None
@@ -1139,6 +1146,20 @@ def prepare_export_source(
                 if symbol.key == "ground"
                 else False
             )
+            if symbol.key == "ground":
+                # The leading, non-mirrored segment (frames 1..span) is the
+                # authored bobbing animation; ping-ponging it keeps the motion
+                # without looping the mid-timeline direction flip. Without any
+                # detected flip the layer freezes at its initial pose instead.
+                # mirror_flip_frame is the 0-based index of the first flipped
+                # subframe, so the unflipped span equals that index.
+                animated_span = (
+                    mirror_flip_frame
+                    if mirror_flip_frame is not None and mirror_flip_frame >= 2
+                    else (1 if random_pose else None)
+                )
+            else:
+                animated_span = None
             store.write_json(
                 config.work_bucket,
                 meta_key,
@@ -1148,6 +1169,7 @@ def prepare_export_source(
                     "frame_count": len(frames),
                     "mirror_flip_frame": mirror_flip_frame,
                     "random_pose_as3": random_pose,
+                    "animated_span": animated_span,
                 },
             )
             parts.append(
@@ -1242,6 +1264,7 @@ def prepare_finish(
         symbol_bounds: dict[str, list[tuple[float, float, float, float] | None]] = {}
         mirror_flip_frames: dict[str, int] = {}
         random_pose_as3: dict[str, bool] = {}
+        ground_animate: dict[str, int] = {}
         part_manifest: dict[str, Any] = {}
         all_color_rules: set[tuple[str, str]] = set()
         for result in sorted(
@@ -1269,6 +1292,10 @@ def prepare_finish(
                 ]
                 mirror_flip_frames[part["key"]] = int(meta.get("mirror_flip_frame") or 0)
                 random_pose_as3[part["key"]] = bool(meta.get("random_pose_as3") or False)
+                animated_span = meta.get("animated_span")
+                ground_animate[part["key"]] = (
+                    int(animated_span) if animated_span is not None else 0
+                )
                 part_record = {
                     "source_idx": int(result["source_idx"]),
                     "root_class": part["root_class"],
@@ -1308,21 +1335,36 @@ def prepare_finish(
         ignored_loop_keys: tuple[str, ...] = ()
         # Ground/misc cosmetics can be authored as random poses (the display
         # list is mirrored mid-timeline, or the AS3 freezes on a random pose).
-        # Freeze those layers at their initial pose instead of looping the
-        # direction swap. The decompiled AS3 intent is the definitive signal;
-        # the structural mirror-flip detection is the fallback for SWFs where
+        # The leading non-mirrored segment is the authored bobbing animation:
+        # ping-pong frames 1..span keeps the up/down motion without looping the
+        # direction swap. Layers with no such segment freeze at their initial
+        # pose. The decompiled AS3 intent is the definitive signal; the
+        # structural mirror-flip detection is the fallback for SWFs where
         # FFDec cannot cleanly decompile the timeline.
         static_keys = tuple(
             key
             for key, flip_frame in mirror_flip_frames.items()
-            if key == "ground" and (random_pose_as3.get(key) or flip_frame > 0)
+            if key == "ground"
+            and (random_pose_as3.get(key) or flip_frame > 0)
+            and ground_animate.get(key, 0) < 2
         )
+        ground_animate = {
+            key: span
+            for key, span in ground_animate.items()
+            if key == "ground" and span >= 2
+        }
         warnings = list(prepared.get("warnings") or [])
         if static_keys:
             warnings.append(
                 "Froze "
                 + ", ".join(static_keys)
                 + " layer(s) at their initial pose (random-pose timeline detected)"
+            )
+        if ground_animate:
+            warnings.append(
+                "Ping-pong animation for "
+                + ", ".join(ground_animate)
+                + " layer(s) over their authored pose span (random-pose timeline detected)"
             )
         precomputed = prepared.get("precomputed_loop") or {}
         if precomputed.get("frame_count"):
@@ -1331,6 +1373,12 @@ def prepare_finish(
             detected_blink_frames = precomputed.get("detected_blink_frames")
             precomputed_static = tuple(precomputed.get("static_keys") or ())
             static_keys = tuple(dict.fromkeys(static_keys + precomputed_static))
+            precomputed_animate = precomputed.get("ground_animate") or {}
+            ground_animate = {
+                key: int(span)
+                for key, span in precomputed_animate.items()
+                if int(span) >= 2
+            }
             detected_loop = (
                 character_svg.aligned_animation_frame_count(
                     detected_item_loop, detected_blink_frames
@@ -1414,6 +1462,7 @@ def prepare_finish(
             "weapon_type": prepared["weapon_type"],
             "parts": part_manifest,
             "static_keys": list(static_keys),
+            "ground_animate": {key: span for key, span in sorted(ground_animate.items())},
             # Reconstruct the per-source bundle keys deterministically instead
             # of shipping ~5000 entries through Step Functions state.
             "source_bundles": {

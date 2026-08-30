@@ -84,12 +84,12 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v8: random-pose ground cosmetics ping-pong their authored pose span so
+    // the dragon bobs without the mid-timeline direction flip (v7 froze them).
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    // v6: probe-fit-raster canvas tightening fills the output instead of the
-    // ~45%-of-width vector-bound canvas, so v5 cache entries are invalidated.
-    rendererVersion: 'v7',
+    rendererVersion: 'v8',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,

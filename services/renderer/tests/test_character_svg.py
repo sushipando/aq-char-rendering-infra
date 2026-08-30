@@ -489,6 +489,23 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         self.assertEqual(character_svg.one_shot_source_frame_index(87, one_shot_frames=87), 86)
         self.assertEqual(character_svg.one_shot_source_frame_index(119, one_shot_frames=87), 86)
 
+    def test_pingpong_source_frame_maps_within_pose_span(self):
+        # span=49 mirrors the Hype Golden Dragon Gate's leading animation.
+        expected = (
+            list(range(1, 50))
+            + list(range(48, 1, -1))
+        )
+        actual = [character_svg.pingpong_source_frame_index(i, span=49) for i in range(96)]
+        self.assertEqual(actual, expected)
+        # Cycles repeat cleanly and stay inside 1..span.
+        self.assertEqual(character_svg.pingpong_source_frame_index(96, span=49), actual[0])
+        self.assertEqual(
+            [character_svg.pingpong_source_frame_index(i, span=3) for i in range(8)],
+            [1, 2, 3, 2, 1, 2, 3, 2],
+        )
+        with self.assertRaises(character_svg.CharacterSvgError):
+            character_svg.pingpong_source_frame_index(0, span=1)
+
     def _write_frame(self, root: Path, frame_index: int, *, flip_at: int | None = None,
                      spawn_at: int | None = None) -> Path:
         flipped = flip_at is not None and frame_index >= flip_at

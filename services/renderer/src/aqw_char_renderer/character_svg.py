@@ -1282,6 +1282,24 @@ def one_shot_source_frame_index(
     return min(output_frame_index, one_shot_frames - 1)
 
 
+def pingpong_source_frame_index(output_frame_index: int, *, span: int) -> int:
+    """Map one output frame index to a 1-based pose within ``1..span``.
+
+    Random-pose ground cosmetics author their bobbing inside the leading,
+    non-mirrored segment of the timeline (the remainder re-displays the same
+    content mirrored, which reads as a direction flip when looped). Playing
+    that leading segment forward and backward keeps the motion continuous
+    without ever crossing the mid-timeline mirror.
+    """
+    if output_frame_index < 0 or span < 2:
+        raise CharacterSvgError("Ping-pong span must be at least 2")
+    period = 2 * (span - 1)
+    position = output_frame_index % period
+    if position < span:
+        return position + 1
+    return 2 * span - position - 1
+
+
 def exported_frame_use_fingerprint(path: Path) -> list[tuple[str, bool]]:
     """Structural fingerprint of one FFDec frame export (best effort).
 
