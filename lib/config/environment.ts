@@ -86,6 +86,9 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v12: a stopped startup parent begins on its settled frame while nested
+    // idle clips keep advancing; unlabeled weapon root timelines also advance
+    // instead of being frozen on frame 1.
     // v11: idle AS3 timelines that settle on a later stop() frame start on and
     // hold the complete finished parent state. v10 incorrectly promoted nested
     // artwork and turned the finished state into a new loop.
@@ -99,7 +102,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v11',
+    rendererVersion: 'v12',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     maxSize: 2048,

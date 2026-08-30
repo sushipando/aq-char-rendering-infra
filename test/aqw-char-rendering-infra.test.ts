@@ -10,7 +10,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
   expect(environment.stage).toBe('dev');
   expect(environment.tuning.prepareExportConcurrency).toBe(8);
   expect(environment.tuning.render).toMatchObject({
-    rendererVersion: 'v11',
+    rendererVersion: 'v12',
     maxSize: 2048,
     zoom: 1,
     completeLoop: true,

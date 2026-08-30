@@ -11,7 +11,7 @@ Output layout (per immutable SWF, one object):
   animation-metadata/<schema>/<ffdec-version>/<swf-sha256>.json
 
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "swf_sha256": "...",
     "ffdec_version": "26.2.1",
     "scan_frames": 2008,
@@ -44,6 +44,7 @@ from aqw_char_renderer.hashing import canonical_json, file_sha256
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
 
 FFDEC_VERSION = "26.2.1"
+ANIMATION_METADATA_SCHEMA = 2
 MAX_OUTPUT_FRAMES = 2000
 SCAN_FRAMES = MAX_OUTPUT_FRAMES + character_svg.LOOP_VALIDATION_FRAMES
 
@@ -96,6 +97,9 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                     class_name=swf.stem,
                     character_id=root_id,
                     frame=1,
+                    root_timeline_frames=character_svg.unlabeled_root_timeline_frame_count(
+                        swf, swf.stem
+                    ),
                 )
             )
     else:
@@ -108,6 +112,9 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                     class_name=class_name or f"symbol_{character_id}",
                     character_id=character_id,
                     frame=frame,
+                    root_timeline_frames=character_svg.unlabeled_root_timeline_frame_count(
+                        swf, class_name
+                    ),
                 )
             )
     if not requests:
@@ -151,17 +158,28 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
             if not paths:
                 continue
             settled = character_svg.stopped_direct_child_timeline(
-                paths[0], terminal_stops
+                request, paths[0], terminal_stops
             )
             if settled is not None:
                 settled_timelines[request.key] = settled
         if settled_timelines:
+            settled_exports = character_svg.export_requested_symbol_frames(
+                [settled.request for settled in settled_timelines.values()],
+                ffdec=ffdec,
+                zoom=1.0,
+                destination=root / "settled-exports",
+                frame_count=scan_frames,
+            )
             for key, settled in settled_timelines.items():
-                indexes = character_svg.stopped_timeline_frame_indexes(
-                    len(exported[key]),
-                    stop_frame=settled.stop_frame,
-                )
-                exported[key] = [exported[key][index] for index in indexes]
+                exported[key] = [
+                    character_svg.transform_ffdec_registration(
+                        path,
+                        root / "settled-transformed" / key / f"{index:06d}.svg",
+                        placement=settled.placement,
+                        zoom=1.0,
+                    )
+                    for index, path in enumerate(settled_exports[key], start=1)
+                ]
         symbols: dict[str, Any] = {}
         for request in exportable:
             paths = exported.get(request.key)
@@ -191,6 +209,7 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
             )
             symbols[request.class_name.casefold()] = {
                 "root_frame": request.frame,
+                "root_timeline_frames": request.root_timeline_frames,
                 "frame_signatures": signatures,
                 "unique_states": len(states),
                 "period": period,
@@ -203,7 +222,7 @@ def analyze_one(swf: Path, ffdec: Path, scan_frames: int) -> dict[str, Any] | No
                     else None
                 ),
             }
-    return {"schema_version": 1, "symbols": symbols}
+    return {"schema_version": ANIMATION_METADATA_SCHEMA, "symbols": symbols}
 
 
 def _root_frame(source: Path, class_name: str, character_id: int) -> int:
@@ -230,7 +249,10 @@ def main() -> int:
 
     def run_one(path: Path) -> str:
         digest = file_sha256(path)
-        key = f"animation-metadata/1/{FFDEC_VERSION}/{digest}.json"
+        key = (
+            f"animation-metadata/{ANIMATION_METADATA_SCHEMA}/"
+            f"{FFDEC_VERSION}/{digest}.json"
+        )
         try:
             client.head_object(Bucket=args.bucket, Key=key)
         except Exception:  # noqa: BLE001,S110 - missing means compute

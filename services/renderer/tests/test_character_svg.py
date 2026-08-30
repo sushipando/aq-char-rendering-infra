@@ -382,6 +382,49 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
             sublength_index = observed_command.index("-sublength")
             self.assertEqual(observed_command[sublength_index + 1], "3")
 
+    def test_multi_frame_export_advances_an_unlabeled_root_timeline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "weapon.swf"
+            source.write_bytes(b"FWS")
+            request = character_svg.SymbolRequest(
+                "weapon",
+                source,
+                "Weapon",
+                19,
+                1,
+                root_timeline_frames=5,
+            )
+            observed_command: list[str] = []
+
+            def fake_run(command, **_kwargs):
+                observed_command.extend(command)
+                export_index = command.index("-export")
+                output = Path(command[export_index + 2])
+                directory = output / "DefineSprite_19_Weapon"
+                directory.mkdir(parents=True)
+                for frame in (2, 3, 4):
+                    (directory / f"{frame}.svg").write_text("<svg/>", encoding="utf-8")
+                return mock.Mock(returncode=0, stderr="", stdout="")
+
+            with mock.patch.object(character_svg.subprocess, "run", side_effect=fake_run):
+                exported = character_svg.export_requested_symbol_frames(
+                    [request],
+                    ffdec=root / "ffdec.jar",
+                    zoom=1,
+                    destination=root / "export",
+                    subframe_start=2,
+                    frame_count=3,
+                )
+
+            self.assertNotIn("-sublength", observed_command)
+            select_index = observed_command.index("-select")
+            self.assertEqual(observed_command[select_index + 1], "19:2-4")
+            self.assertEqual(
+                [path.name for path in exported["weapon"]],
+                ["2.svg", "3.svg", "4.svg"],
+            )
+
     def test_legacy_unnamed_sprite_export_uses_generic_ffdec_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -685,7 +728,7 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         """
         self.assertEqual(character_svg.decompiled_terminal_stop_frames(cape), (26,))
 
-    def test_stopped_direct_child_detects_authored_stop_frame(self):
+    def test_stopped_direct_child_promotes_to_authored_stop_frame(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "cape.svg"
             source.write_text(
@@ -702,26 +745,53 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
                 </svg>""",
                 encoding="utf-8",
             )
+            request = character_svg.SymbolRequest(
+                "cape", Path("cape.swf"), "DarkShadows", 28, 1
+            )
             settled = character_svg.stopped_direct_child_timeline(
+                request,
                 source,
                 {"darkshadowsr1_fla.capeidle_2": 26},
             )
             self.assertIsNotNone(settled)
             assert settled is not None
-            self.assertEqual(settled.class_name, "DarkShadowsr1_fla.CapeIdle_2")
+            self.assertEqual(settled.request.character_id, 24)
+            self.assertEqual(settled.request.class_name, "DarkShadowsr1_fla.CapeIdle_2")
+            self.assertEqual(settled.request.frame, 26)
+            self.assertEqual(settled.placement, (1.2, 0.0, 0.0, 1, 5, 2))
             self.assertEqual(settled.stop_frame, 26)
 
-    def test_stopped_idle_timeline_uses_only_the_settled_frame(self):
-        self.assertEqual(
-            character_svg.stopped_timeline_frame_indexes(8, stop_frame=4),
-            (3, 3, 3, 3, 3, 3, 3, 3),
-        )
-        self.assertEqual(
-            character_svg.stopped_timeline_frame_indexes(
-                6, stop_frame=6, subframe_start=3
-            ),
-            (3, 3, 3, 3, 3, 3),
-        )
+    def test_transform_ffdec_registration_bakes_parent_placement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.svg"
+            destination = root / "transformed.svg"
+            source.write_text(
+                """<svg xmlns="http://www.w3.org/2000/svg"
+                xmlns:xlink="http://www.w3.org/1999/xlink"
+                xmlns:ffdec="https://www.free-decompiler.com/flash"
+                width="20px" height="10px">
+                  <g transform="matrix(2,0,0,2,6,8)">
+                    <use ffdec:characterId="23" xlink:href="#sprite0"/>
+                  </g>
+                  <defs><g id="sprite0"><rect width="10" height="5"/></g></defs>
+                </svg>""",
+                encoding="utf-8",
+            )
+            character_svg.transform_ffdec_registration(
+                source,
+                destination,
+                placement=(1.0, 0.0, 0.0, 1.0, 5.0, -2.0),
+                zoom=2,
+            )
+            imported = character_svg.import_ffdec_symbol(
+                "cape",
+                destination,
+                zoom=2,
+                color_rules={},
+                root_class="CapeIdle",
+            )
+            self.assertEqual(imported.bounds, (2.0, -6.0, 10.0, 5.0))
 
     def test_complete_loop_and_fixed_frames_are_mutually_exclusive(self):
         parser = character_svg.build_parser()

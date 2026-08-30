@@ -41,11 +41,14 @@ from aqw_char_renderer.storage import StorageError
 from aqw_char_renderer.structured_logging import log_event
 
 FFDEC_VERSION = "26.2.1"
+ANIMATION_METADATA_SCHEMA = 2
+# v5: cache identity includes whether the exported symbol advances its own
+# root timeline instead of only nested subframes.
 # v4: states that rasterize with zero visible pixels (e.g. opacity-0 blink
 # frames in an animated cape) store a null bound instead of the loose header
 # canvas. The old v3 behavior let one invisible state's full declared sprite
 # stage inflate the shared viewbox, leaving large empty margins.
-VECTOR_CACHE_SCHEMA = 4
+VECTOR_CACHE_SCHEMA = 5
 
 
 class _InvisibleState:
@@ -369,6 +372,7 @@ def _vector_symbol_identity(request: character_svg.SymbolRequest) -> str:
             "character_id": request.character_id,
             "class_name": request.class_name,
             "root_frame": request.frame,
+            "root_timeline_frames": request.root_timeline_frames,
         }
     )[:24]
 
@@ -388,6 +392,7 @@ def _vector_cache_key(
                 "character_id": request.character_id,
                 "class_name": request.class_name,
                 "root_frame": request.frame,
+                "root_timeline_frames": request.root_timeline_frames,
             }
             for request in sorted(
                 requests,
@@ -518,6 +523,35 @@ def _probe_state_bounds(
     return None
 
 
+def _export_metadata(
+    paths: Sequence[Path],
+    *,
+    zoom: float,
+    config: RuntimeConfig,
+) -> tuple[list[str], list[tuple[float, float, float, float] | None]]:
+    """Hash and bound an effective timeline produced after cache loading."""
+    signatures: list[str] = []
+    bounds: list[tuple[float, float, float, float] | None] = []
+    bounds_by_signature: dict[str, tuple[float, float, float, float] | None] = {}
+    for path in paths:
+        signature = file_sha256(path)
+        if signature not in bounds_by_signature:
+            probed = _probe_state_bounds(path, zoom, config.rsvg_convert)
+            if probed is _INVISIBLE_STATE:
+                visible_bounds = None
+            elif probed is None:
+                try:
+                    visible_bounds = export_frame_bounds(path, zoom)
+                except character_svg.CharacterSvgError:
+                    visible_bounds = None
+            else:
+                visible_bounds = probed
+            bounds_by_signature[signature] = visible_bounds
+        signatures.append(signature)
+        bounds.append(bounds_by_signature[signature])
+    return signatures, bounds
+
+
 def _load_vector_cache(
     archive_path: Path,
     root: Path,
@@ -573,6 +607,8 @@ def _load_vector_cache(
             raw_symbol.get("class_name") != request.class_name
             or raw_symbol.get("character_id") != request.character_id
             or raw_symbol.get("root_frame") != request.frame
+            or raw_symbol.get("root_timeline_frames", 1)
+            != request.root_timeline_frames
         ):
             raise character_svg.CharacterSvgError(
                 f"Vector cache symbol metadata does not match {request.class_name}"
@@ -688,6 +724,7 @@ def _build_vector_cache(
             "class_name": request.class_name,
             "character_id": request.character_id,
             "root_frame": request.frame,
+            "root_timeline_frames": request.root_timeline_frames,
             "schedule": schedule,
             "states": states,
         }
@@ -828,6 +865,7 @@ def prepare_resolve(
                     "class_name": symbol.class_name,
                     "character_id": symbol.character_id,
                     "frame": symbol.frame,
+                    "root_timeline_frames": symbol.root_timeline_frames,
                     "source_sha256": source_records[symbol.source].sha256,
                 }
                 for symbol in requests
@@ -904,7 +942,8 @@ def prepare_resolve(
                     try:
                         manifest_meta = store.read_json(
                             config.source_bucket,
-                            f"animation-metadata/1/{FFDEC_VERSION}/{record.sha256}.json",
+                            f"animation-metadata/{ANIMATION_METADATA_SCHEMA}/"
+                            f"{FFDEC_VERSION}/{record.sha256}.json",
                         )
                     except Exception:  # noqa: BLE001 - missing metadata is a miss
                         missing = True
@@ -1013,6 +1052,7 @@ def prepare_resolve(
                                 "class_name": symbol.class_name,
                                 "character_id": symbol.character_id,
                                 "frame": symbol.frame,
+                                "root_timeline_frames": symbol.root_timeline_frames,
                             }
                             for symbol in sorted(
                                 group,
@@ -1054,6 +1094,7 @@ def prepare_resolve(
                             "class_name": symbol.class_name,
                             "character_id": symbol.character_id,
                             "frame": symbol.frame,
+                            "root_timeline_frames": symbol.root_timeline_frames,
                         }
                         for symbol in sorted(group, key=lambda item: item.key)
                     ],
@@ -1119,6 +1160,7 @@ def prepare_export_source(
                 class_name=str(request["class_name"]),
                 character_id=int(request["character_id"]),
                 frame=int(request["frame"]),
+                root_timeline_frames=int(request.get("root_timeline_frames", 1)),
             )
             for request in source["requests"]
         ]
@@ -1233,33 +1275,50 @@ def prepare_export_source(
 
         # FFDec advances nested timelines without running their frame scripts.
         # If the selected idle state is a single child that settles on stop(),
-        # begin on that completed state and hold the complete parent. Startup
-        # effects are not part of the idle output, and promoting the stopped
-        # child's nested artwork would turn the finished pose into a false loop.
+        # select that child at the authored stop frame. This skips the startup
+        # reveal while still advancing clips created by the settled frame (for
+        # example Shadow of Sepulchure's 49-frame breathing/pulse animation).
         settled_timelines: dict[str, character_svg.StoppedChildTimeline] = {}
         for symbol in requests:
             frames = exported.get(symbol.key) or []
             if not frames:
                 continue
             settled = character_svg.stopped_direct_child_timeline(
-                frames[0], terminal_stops
+                symbol, frames[0], terminal_stops
             )
             if settled is not None:
                 settled_timelines[symbol.key] = settled
         if settled_timelines:
             phase = time.perf_counter()
+            settled_exports = character_svg.export_requested_symbol_frames(
+                [settled.request for settled in settled_timelines.values()],
+                ffdec=config.ffdec_path,
+                zoom=zoom,
+                destination=root / "settled-exports",
+                subframe_start=subframe_start,
+                frame_count=export_frame_count,
+            )
+            mark("settled_ffdec_export_ms", phase)
+            phase = time.perf_counter()
             for key, settled in settled_timelines.items():
-                indexes = character_svg.stopped_timeline_frame_indexes(
-                    len(exported[key]),
-                    stop_frame=settled.stop_frame,
-                    subframe_start=subframe_start,
-                )
-                exported[key] = [exported[key][index] for index in indexes]
-                vector_signatures[key] = [
-                    vector_signatures[key][index] for index in indexes
+                transformed_paths = [
+                    character_svg.transform_ffdec_registration(
+                        path,
+                        root / "settled-transformed" / key / f"{index:06d}.svg",
+                        placement=settled.placement,
+                        zoom=zoom,
+                    )
+                    for index, path in enumerate(settled_exports[key], start=1)
                 ]
-                vector_bounds[key] = [vector_bounds[key][index] for index in indexes]
-            mark("settled_freeze_ms", phase)
+                exported[key] = transformed_paths
+                signatures, bounds = _export_metadata(
+                    transformed_paths,
+                    zoom=zoom,
+                    config=config,
+                )
+                vector_signatures[key] = signatures
+                vector_bounds[key] = bounds
+            mark("settled_transform_ms", phase)
 
         archive_directory = root / "archives"
         archive_directory.mkdir(parents=True, exist_ok=True)
@@ -1288,6 +1347,11 @@ def prepare_export_source(
         phase = time.perf_counter()
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
+            effective_symbol = (
+                settled_timelines[symbol.key].request
+                if symbol.key in settled_timelines
+                else symbol
+            )
             meta_key = f"jobs/{job_id}/prepare/meta/{symbol.key}.json"
             # Ground/misc cosmetics (and pets) may be authored as random poses
             # whose timeline mirrors the same display list mid-way. Export that
@@ -1333,6 +1397,7 @@ def prepare_export_source(
                     "mirror_flip_frame": mirror_flip_frame,
                     "random_pose_as3": random_pose,
                     "animated_span": animated_span,
+                    "root_timeline_frames": symbol.root_timeline_frames,
                     "settled_stop_frame": (
                         settled_timelines[symbol.key].stop_frame
                         if symbol.key in settled_timelines
@@ -1343,9 +1408,10 @@ def prepare_export_source(
             parts.append(
                 {
                     "key": symbol.key,
-                    "root_class": symbol.class_name,
-                    "character_id": symbol.character_id,
+                    "root_class": effective_symbol.class_name,
+                    "character_id": effective_symbol.character_id,
                     "frame_count": len(frames),
+                    "root_timeline_frames": symbol.root_timeline_frames,
                     "settled_stop_frame": (
                         settled_timelines[symbol.key].stop_frame
                         if symbol.key in settled_timelines
@@ -1475,6 +1541,9 @@ def prepare_finish(
                     "root_class": part["root_class"],
                     "character_id": part["character_id"],
                     "frame_count": part["frame_count"],
+                    "root_timeline_frames": int(
+                        part.get("root_timeline_frames", 1)
+                    ),
                     "color_rules": {key: list(value) for key, value in sorted(rules.items())},
                     "placement_colors": {
                         f"{parent_id},{child_id}": {

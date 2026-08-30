@@ -149,13 +149,18 @@ class SymbolRequest:
     class_name: str
     character_id: int
     frame: int
+    # Number of authored root frames to advance. Most AQW item roots select a
+    # fixed Idle/Ready frame and animate only their nested clips. Some weapons
+    # instead author their visible effect directly on the exported root.
+    root_timeline_frames: int = 1
 
 
 @dataclass(frozen=True)
 class StoppedChildTimeline:
     """A direct child whose authored timeline settles on a stop() frame."""
 
-    class_name: str
+    request: SymbolRequest
+    placement: Matrix
     stop_frame: int
 
 
@@ -814,6 +819,24 @@ def _symbol_frame(source: Path, class_name: str) -> int:
     return item_renderer.select_static_root_frame(metadata)
 
 
+def unlabeled_root_timeline_frame_count(source: Path, class_name: str) -> int:
+    """Return an authored root span when the symbol has no state labels.
+
+    A labeled AQW item root is a state switcher: the renderer selects Idle or
+    Ready and only advances children below that fixed root frame. A number of
+    weapons have no labels at all and put their shine/spark animation directly
+    on the exported root, so freezing root frame 1 loses that animation.
+    """
+    try:
+        metadata = item_renderer.parse_swf_sprite_metadata(source.read_bytes(), class_name)
+    except OSError:
+        return 1
+    if metadata.get("idle_frame") or metadata.get("ready_frame"):
+        return 1
+    frame_count = metadata.get("root_frame_count")
+    return frame_count if isinstance(frame_count, int) and frame_count > 1 else 1
+
+
 def build_symbol_requests(
     assets: Mapping[str, AppearanceAsset],
     sources: Mapping[str, Path],
@@ -878,6 +901,11 @@ def build_symbol_requests(
         found = symbol_id(source, asset.link)
         assert found is not None
         key = slot
+        root_timeline_frames = (
+            unlabeled_root_timeline_frame_count(source, found[1])
+            if slot == "weapon"
+            else 1
+        )
         requests.append(
             SymbolRequest(
                 key,
@@ -885,6 +913,7 @@ def build_symbol_requests(
                 found[1],
                 found[0],
                 _symbol_frame(source, found[1]),
+                root_timeline_frames,
             )
         )
         aliases[slot] = key
@@ -919,10 +948,15 @@ def build_symbol_requests(
 
     # The same exported class can satisfy multiple semantic requests. FFDec only
     # needs to export it once; aliases still point at the first definition.
-    unique: dict[tuple[Path, int, int], SymbolRequest] = {}
+    unique: dict[tuple[Path, int, int, int], SymbolRequest] = {}
     remapped: dict[str, str] = {}
     for request in requests:
-        signature = (request.source, request.character_id, request.frame)
+        signature = (
+            request.source,
+            request.character_id,
+            request.frame,
+            request.root_timeline_frames,
+        )
         previous = unique.get(signature)
         if previous is None:
             unique[signature] = request
@@ -963,6 +997,8 @@ def export_requested_symbol_frames(
     """
     if subframe_start < 1 or frame_count < 1:
         raise CharacterSvgError("Subframe start and frame count must be positive")
+    if any(request.root_timeline_frames < 1 for request in requests):
+        raise CharacterSvgError("Root timeline frame counts must be positive")
     grouped: dict[Path, list[SymbolRequest]] = defaultdict(list)
     for request in requests:
         grouped[request.source].append(request)
@@ -973,46 +1009,65 @@ def export_requested_symbol_frames(
         # Each source gets its own FFDec home so concurrent exports never
         # share mutable JVM state.
         ffdec_home = destination / f".ffdec-home-{index:02d}"
-        output = destination / f"asset_{index:02d}"
-        selected_ids = ",".join(str(request.character_id) for request in group)
-        selected_frames = ",".join(
-            f"{request.character_id}:{request.frame}" for request in group
-        )
-        arguments: list[str] = []
-        if zoom != 1:
-            arguments.extend(("-zoom", f"{zoom:.12g}"))
-        if frame_count > 1 or subframe_start > 1:
-            arguments.extend(("-sublength", str(subframe_end)))
-        arguments.extend(
-            (
-                "-selectid",
-                selected_ids,
-                "-select",
-                selected_frames,
-                "-format",
-                "sprite:svg",
-                "-export",
-                "sprite",
-                str(output),
-                str(source),
-            )
-        )
-        command = _ffdec_command(ffdec, *arguments, home=ffdec_home)
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode:
-            detail = (result.stderr or result.stdout).strip()
-            raise CharacterSvgError(
-                f"FFDec SVG export failed for {source}: {detail[-2000:]}"
-            )
         source_exported: dict[str, list[Path]] = {}
-        for request in group:
+
+        def run_export(
+            selected: Sequence[SymbolRequest],
+            *,
+            output: Path,
+            frame_selection: str,
+            nested: bool,
+        ) -> None:
+            if not selected:
+                return
+            arguments: list[str] = []
+            if zoom != 1:
+                arguments.extend(("-zoom", f"{zoom:.12g}"))
+            if nested and (frame_count > 1 or subframe_start > 1):
+                arguments.extend(("-sublength", str(subframe_end)))
+            arguments.extend(
+                (
+                    "-selectid",
+                    ",".join(str(request.character_id) for request in selected),
+                    "-select",
+                    frame_selection,
+                    "-format",
+                    "sprite:svg",
+                    "-export",
+                    "sprite",
+                    str(output),
+                    str(source),
+                )
+            )
+            command = _ffdec_command(ffdec, *arguments, home=ffdec_home)
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                raise CharacterSvgError(
+                    f"FFDec SVG export failed for {source}: {detail[-2000:]}"
+                )
+
+        def sprite_directories(output: Path, request: SymbolRequest) -> list[Path]:
             generic_directory = output / f"DefineSprite_{request.character_id}"
-            directories = sorted(
+            return sorted(
                 {
                     *output.glob(f"DefineSprite_{request.character_id}_*"),
                     *([generic_directory] if generic_directory.is_dir() else []),
                 }
             )
+
+        nested_group = [request for request in group if request.root_timeline_frames == 1]
+        nested_output = destination / f"asset_{index:02d}_nested"
+        run_export(
+            nested_group,
+            output=nested_output,
+            frame_selection=",".join(
+                f"{request.character_id}:{request.frame}" for request in nested_group
+            ),
+            nested=True,
+        )
+        for request in nested_group:
+            directories = sprite_directories(nested_output, request)
             frames: list[Path] = []
             for subframe in range(subframe_start, subframe_end + 1):
                 candidates = [
@@ -1032,6 +1087,58 @@ def export_requested_symbol_frames(
                     )
                 frames.append(frame)
             source_exported[request.key] = frames
+
+        # A root-authored timeline cannot be advanced with -sublength: that
+        # option freezes the selected root frame and advances only descendants.
+        # Export the actual root frame range and schedule those SVGs directly.
+        root_group = [request for request in group if request.root_timeline_frames > 1]
+        root_output = destination / f"asset_{index:02d}_root"
+        root_schedules = {
+            request.key: [
+                request.frame
+                + ((subframe_start - 1 + offset) % request.root_timeline_frames)
+                for offset in range(frame_count)
+            ]
+            for request in root_group
+        }
+
+        def ranges(values: Sequence[int]) -> str:
+            ordered = sorted(set(values))
+            chunks: list[str] = []
+            start = previous = ordered[0]
+            for value in ordered[1:]:
+                if value == previous + 1:
+                    previous = value
+                    continue
+                chunks.append(str(start) if start == previous else f"{start}-{previous}")
+                start = previous = value
+            chunks.append(str(start) if start == previous else f"{start}-{previous}")
+            return ",".join(chunks)
+
+        run_export(
+            root_group,
+            output=root_output,
+            frame_selection=",".join(
+                f"{request.character_id}:{ranges(root_schedules[request.key])}"
+                for request in root_group
+            ),
+            nested=False,
+        )
+        for request in root_group:
+            directories = sprite_directories(root_output, request)
+            by_frame: dict[int, Path] = {}
+            for root_frame in sorted(set(root_schedules[request.key])):
+                candidates = [directory / f"{root_frame}.svg" for directory in directories]
+                frame = next((candidate for candidate in candidates if candidate.is_file()), None)
+                if frame is None:
+                    raise CharacterSvgError(
+                        f"FFDec did not export sprite {request.character_id} root frame "
+                        f"{root_frame} ({request.class_name}) from {source.name}"
+                    )
+                by_frame[root_frame] = frame
+            source_exported[request.key] = [
+                by_frame[root_frame] for root_frame in root_schedules[request.key]
+            ]
         return source_exported
 
     exported: dict[str, list[Path]] = {}
@@ -1552,17 +1659,18 @@ def parse_color_scripts(
 
 
 def stopped_direct_child_timeline(
+    request: SymbolRequest,
     source_svg: Path,
     terminal_stops: Mapping[str, int],
 ) -> StoppedChildTimeline | None:
-    """Resolve a single child timeline that should remain on ``stop()``.
+    """Resolve a safe single-child timeline that should remain on ``stop()``.
 
     FFDec's ``-sublength`` advances display-list timelines without executing
     ActionScript. A child authored to ``stop()`` on its final pose therefore
-    wraps to frame 1 and appears to vanish. For an idle render, the caller must
-    resolve the complete parent at the authored stop and reuse that settled
-    state from the first output frame. It must not promote nested artwork:
-    that can turn a startup reveal into an unintended independent loop.
+    wraps to frame 1 and appears to vanish. When the selected root frame is a
+    single named child, select that child at its authored stop frame. Its own
+    nested clips then continue normally: for Shadow of Sepulchure, the
+    26-frame reveal stays finished while its 49-frame shadow pulse keeps moving.
     """
     try:
         root = ET.parse(source_svg).getroot()
@@ -1576,42 +1684,107 @@ def stopped_direct_child_timeline(
         return None
     child = direct[0]
     class_name = child.get(f"{{{FFDEC_NS}}}characterName")
-    if not class_name:
+    raw_character_id = child.get(f"{{{FFDEC_NS}}}characterId")
+    if not class_name or raw_character_id is None:
         return None
     stop_frame = int(terminal_stops.get(class_name.casefold()) or 0)
     # A frame-1 stop is already stable under FFDec's timeline wrapping and
-    # does not need remapping. Later stops are the one-shot settling case.
+    # does not need promotion. Later stops are the one-shot settling case.
     if stop_frame < 2:
         return None
+    try:
+        character_id = int(raw_character_id)
+    except ValueError:
+        return None
+    placement = parse_matrix(child.get("transform")) or IDENTITY
+    # Parent-level effects cannot be faithfully transferred to the promoted
+    # child by a matrix alone. Restrict promotion to the common plain-use case.
+    if any(child.get(name) for name in ("filter", "clip-path", "mask", "opacity")):
+        return None
     return StoppedChildTimeline(
-        class_name=class_name,
+        request=SymbolRequest(
+            key=request.key,
+            source=request.source,
+            class_name=class_name,
+            character_id=character_id,
+            frame=stop_frame,
+        ),
+        placement=placement,
         stop_frame=stop_frame,
     )
 
 
-def stopped_timeline_frame_indexes(
-    frame_count: int,
+def transform_ffdec_registration(
+    source_svg: Path,
+    destination_svg: Path,
     *,
-    stop_frame: int,
-    subframe_start: int = 1,
-) -> tuple[int, ...]:
-    """Map a stopped idle timeline to its settled exported frame index.
+    placement: Matrix,
+    zoom: float,
+) -> Path:
+    """Bake a promoted child's parent placement into a raw FFDec SVG."""
+    try:
+        tree = ET.parse(source_svg)
+    except (OSError, ET.ParseError) as error:
+        raise CharacterSvgError(f"Invalid FFDec SVG {source_svg}: {error}") from error
+    root = tree.getroot()
 
-    AQW lets the child reach ``stop_frame`` while an item loads. An idle-only
-    render should begin after that startup has settled, so every output frame
-    reuses the complete stopped parent state. This also freezes all nested
-    artwork together instead of promoting it into an unintended loop.
-    """
-    if frame_count < 1 or stop_frame < 1 or subframe_start < 1:
-        raise CharacterSvgError("Frame counts and indexes must be positive")
-    stop_index = stop_frame - subframe_start
-    if stop_index < 0:
+    def dimension(name: str) -> float:
+        match = re.fullmatch(r"([-+0-9.eE]+)(?:px)?", str(root.get(name, "")).strip())
+        if match is None:
+            raise CharacterSvgError(f"FFDec SVG has no usable {name}: {source_svg}")
+        return float(match.group(1))
+
+    width = dimension("width")
+    height = dimension("height")
+    _definitions, rendered = _rendered_svg_children(root)
+    if len(rendered) != 1:
         raise CharacterSvgError(
-            "Cannot reproduce a stop frame before the exported subframe start"
+            f"Expected one FFDec frame wrapper in {source_svg}, found {len(rendered)}"
         )
-    if stop_index >= frame_count:
-        return tuple(range(frame_count))
-    return (stop_index,) * frame_count
+    frame = rendered[0]
+    export_matrix = parse_matrix(frame.get("transform"))
+    if export_matrix is None:
+        raise CharacterSvgError(f"FFDec frame wrapper has no matrix: {source_svg}")
+    a, b, c, d, e, f = export_matrix
+    if (
+        abs(b) > 1e-8
+        or abs(c) > 1e-8
+        or abs(a - zoom) > 1e-5
+        or abs(d - zoom) > 1e-5
+    ):
+        raise CharacterSvgError(
+            f"Unexpected FFDec crop/zoom matrix {export_matrix} in {source_svg}"
+        )
+    child_bounds = (-e / zoom, -f / zoom, width / zoom, height / zoom)
+    x, y, transformed_width, transformed_height = _transformed_bounds(
+        child_bounds, placement
+    )
+
+    root.remove(frame)
+    frame.set("transform", matrix_text(placement))
+    wrapper = ET.Element(
+        f"{{{SVG_NS}}}g",
+        {
+            "transform": matrix_text(
+                (zoom, 0.0, 0.0, zoom, -x * zoom, -y * zoom)
+            )
+        },
+    )
+    wrapper.append(frame)
+    first_defs_index = next(
+        (
+            index
+            for index, child in enumerate(list(root))
+            if child.tag.rsplit("}", 1)[-1] == "defs"
+        ),
+        len(root),
+    )
+    root.insert(first_defs_index, wrapper)
+    root.set("width", f"{transformed_width * zoom:.12g}px")
+    root.set("height", f"{transformed_height * zoom:.12g}px")
+    destination_svg.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(destination_svg, encoding="utf-8", xml_declaration=True)
+    return destination_svg
 
 
 def _normalize_ffdec_font_export_zoom(root: ET.Element, zoom: float) -> None:
@@ -3197,6 +3370,48 @@ def run(args: argparse.Namespace) -> Path:
             subframe_start=args.subframe_start,
             frame_count=export_frame_count,
         )
+        source_paths = sorted({request.source for request in requests})
+        terminal_stops_by_source = {
+            source: parse_terminal_stop_frames(
+                source,
+                ffdec=ffdec,
+                destination=work_dir / "scripts",
+            )
+            for source in source_paths
+        }
+        settled_timelines: dict[str, StoppedChildTimeline] = {}
+        effective_requests = {request.key: request for request in requests}
+        for request in requests:
+            frames = raw_exports.get(request.key) or []
+            if not frames:
+                continue
+            settled = stopped_direct_child_timeline(
+                request,
+                frames[0],
+                terminal_stops_by_source.get(request.source, {}),
+            )
+            if settled is not None:
+                settled_timelines[request.key] = settled
+                effective_requests[request.key] = settled.request
+        if settled_timelines:
+            settled_exports = export_requested_symbol_frames(
+                [settled.request for settled in settled_timelines.values()],
+                ffdec=ffdec,
+                zoom=args.zoom,
+                destination=work_dir / "settled-exports",
+                subframe_start=args.subframe_start,
+                frame_count=export_frame_count,
+            )
+            for key, settled in settled_timelines.items():
+                raw_exports[key] = [
+                    transform_ffdec_registration(
+                        path,
+                        work_dir / "settled-transformed" / key / f"{index:06d}.svg",
+                        placement=settled.placement,
+                        zoom=args.zoom,
+                    )
+                    for index, path in enumerate(settled_exports[key], start=1)
+                ]
         if args.complete_loop:
             loop_exports, ignored_loop_keys = loop_driver_exports(raw_exports)
             detected_item_loop = detect_complete_loop_frame_count(
@@ -3269,7 +3484,6 @@ def run(args: argparse.Namespace) -> Path:
                     + "."
                 )
             return output_paths[0]
-        source_paths = sorted({request.source for request in requests})
         placement_colors_by_source = {
             source: authored_swf_color_transforms(source) for source in source_paths
         }
@@ -3303,6 +3517,7 @@ def run(args: argparse.Namespace) -> Path:
             frame_index, frame_output = task
             imported: dict[str, ImportedSymbol] = {}
             for request in requests:
+                effective_request = effective_requests[request.key]
                 rules = rules_by_source.get(request.source, {})
                 source_frame_index = frame_index
                 if (
@@ -3319,11 +3534,11 @@ def run(args: argparse.Namespace) -> Path:
                     raw_exports[request.key][source_frame_index],
                     zoom=args.zoom,
                     color_rules=rules,
-                    root_class=request.class_name,
+                    root_class=effective_request.class_name,
                     placement_colors=placement_colors_by_source.get(
                         request.source, {}
                     ),
-                    root_character_id=request.character_id,
+                    root_character_id=effective_request.character_id,
                 )
             if (
                 svg_override_path is not None
