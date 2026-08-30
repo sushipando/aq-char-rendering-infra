@@ -266,8 +266,11 @@ def shared_viewbox(
         raise character_svg.CharacterSvgError(
             "Character composition produced no visible layers"
         ) from error
-    # Match compose_svg's conservative page margin so filter glow is not clipped.
-    margin = max(tight[2], tight[3]) * 0.1 + 2
+    # Zero margin: the per-state alpha probes already pin the tight visible
+    # bounds with 1px padding, so no additional page is needed. Clipping a
+    # filter glow is an accepted trade-off for a fully-filled frame (the old
+    # 10%% margin just expanded the canvas into empty bands).
+    margin = 0.0
     return shared_canvas(
         [(tight[0] - margin, tight[1] - margin, tight[2] + margin * 2, tight[3] + margin * 2)],
         max_size=max_size,
@@ -308,7 +311,9 @@ def shared_viewbox_from_bounds(
         raise character_svg.CharacterSvgError(
             "Character composition produced no visible layers"
         ) from error
-    margin = max(ans[2], ans[3]) * 0.1 + 2
+    # Zero margin: per-state alpha probes are exact (1px padding), so the
+    # garbage 10%% cushion is removed entirely (glow clipping accepted).
+    margin = 0.0
     return shared_canvas(
         [(ans[0] - margin, ans[1] - margin, ans[2] + margin * 2, ans[3] + margin * 2)],
         max_size=max_size,

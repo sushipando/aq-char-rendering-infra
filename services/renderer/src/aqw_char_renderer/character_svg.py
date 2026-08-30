@@ -2463,9 +2463,10 @@ def compose_svg(
         )
 
     initial = _union_bounds(computed_bounds)
-    # Give filters a conservative initial page. A raster alpha probe below can
-    # then tighten it without clipping glows at the first render.
-    margin = max(initial[2], initial[3]) * 0.1 + 2
+    # The raster alpha probe below re-tightens the page to the exact visible
+    # bounds, so there is no need for a conservative glow cushion here (clipped
+    # filter glows are an accepted trade-off for a fully-filled frame).
+    margin = 0.0
     initial = (
         initial[0] - margin,
         initial[1] - margin,

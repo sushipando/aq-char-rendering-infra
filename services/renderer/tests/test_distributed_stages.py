@@ -140,12 +140,11 @@ def test_shared_viewbox_unions_all_frames_with_margin() -> None:
             max_size=1024,
             padding=0,
         )
-        # Layer bounds before the display scale and margin:
+        # Layer bounds before the display scale and a zero margin:
         #   armor frames: (-3, -4, 10, 5); weapon frame: (7, -4, 10, 5)
         tight = (-3.0 * scale, -4.0 * scale, 20.0 * scale, 5.0 * scale)
-        margin = max(tight[2], tight[3]) * 0.1 + 2
         assert viewbox == pytest.approx(
-            (tight[0] - margin, tight[1] - margin, tight[2] + 2 * margin, tight[3] + 2 * margin)
+            (tight[0], tight[1], tight[2], tight[3])
         )
 
 
