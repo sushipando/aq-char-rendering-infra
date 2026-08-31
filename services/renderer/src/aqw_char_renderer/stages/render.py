@@ -61,6 +61,53 @@ def _rasterize(
         return image.size
 
 
+def _downsample(source: Path, *, output_size: int) -> tuple[int, int]:
+    """Shrink one RGBA raster with premultiplied-alpha Lanczos filtering.
+
+    The no-op path intentionally does not rewrite the PNG. Besides avoiding
+    work when raster and output sizes match, this keeps the existing pixel
+    output byte-for-byte unchanged.
+    """
+    with Image.open(source) as image:
+        if image.mode != "RGBA":
+            raise character_svg.CharacterSvgError("Raster frame is not transparent RGBA")
+        image.load()
+        width, height = image.size
+        longest = max(width, height)
+        if longest == output_size:
+            return image.size
+        if longest < output_size:
+            raise character_svg.CharacterSvgError(
+                "Output size cannot exceed the raster frame size"
+            )
+        scale = output_size / longest
+        target = (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        )
+        # Filtering premultiplied RGB avoids pulling arbitrary transparent RGB
+        # into antialiased edges while the supersampled frame is reduced.
+        premultiplied = image.convert("RGBa")
+
+    resized: Image.Image | None = None
+    rgba: Image.Image | None = None
+    try:
+        resized = premultiplied.resize(
+            target,
+            Image.Resampling.LANCZOS,
+            reducing_gap=3.0,
+        )
+        rgba = resized.convert("RGBA")
+        rgba.save(source, format="PNG")
+    finally:
+        premultiplied.close()
+        if resized is not None:
+            resized.close()
+        if rgba is not None:
+            rgba.close()
+    return target
+
+
 def _encode_frame(
     current: Path,
     output: Path,
@@ -114,6 +161,7 @@ def render_batch(
         "compose_ms": 0.0,
         "probe_ms": 0.0,
         "rasterize_ms": 0.0,
+        "downsample_ms": 0.0,
         "encode_ms": 0.0,
         "upload_ms": 0.0,
     }
@@ -135,7 +183,8 @@ def render_batch(
     if len(viewbox) != 4:
         raise character_svg.CharacterSvgError("Prepare manifest has no usable shared viewbox")
     settings = prepared["settings"]
-    max_size = int(settings["max_size"])
+    raster_size = int(settings["raster_size"])
+    output_size = int(settings["output_size"])
     zoom = float(settings["zoom"])
     durations = [int(value) for value in prepared["frame_durations"]]
     records: list[dict[str, Any]] = []
@@ -264,7 +313,7 @@ def render_batch(
                 fields=prepared["fields"],
                 all_color_rules=[tuple(value) for value in prepared["all_color_rules"]],
                 output=output,
-                max_size=max_size,
+                max_size=raster_size,
                 padding=0,
                 facing=settings["facing"],
                 rsvg_convert=None,
@@ -285,10 +334,16 @@ def render_batch(
                 svg,
                 png,
                 viewbox=viewbox,  # type: ignore[arg-type]
-                max_size=max_size,
+                max_size=raster_size,
                 rsvg_convert=config.rsvg_convert,
             )
             timings["rasterize_ms"] += (time.perf_counter() - rasterize_started) * 1000
+            if output_size < raster_size:
+                downsample_started = time.perf_counter()
+                _downsample(png, output_size=output_size)
+                timings["downsample_ms"] += (
+                    time.perf_counter() - downsample_started
+                ) * 1000
             pngs[frame_number] = png
 
         canvas_size: tuple[int, int] | None = None

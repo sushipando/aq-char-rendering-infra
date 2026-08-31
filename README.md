@@ -52,16 +52,17 @@ All environment-specific tuning lives in
 [`lib/config/environment.ts`](lib/config/environment.ts). It controls:
 
 - Lambda memory, `/tmp`, timeout, and reserved concurrency per stage;
-- maximum render size, FFDec zoom, frame cap, frame batch size, Step Functions
-  Map concurrency, and Q85 WebP settings;
+- raster and final output sizes, FFDec zoom, frame cap, frame batch size, Step
+  Functions Map concurrency, and Q85 WebP settings;
 - official AQW missing-asset fallback and timeout;
 - per-Discord-user active job limit;
 - S3/DynamoDB/log retention;
 - queue/workflow timeouts and monthly budget shutdown threshold.
 
-The launcher hydrates sparse `/char` requests from this configuration, so the
-Discord bot only sends the username. A setting changed here is injected into
-new jobs by CDK rather than being duplicated in the bot.
+The launcher hydrates sparse requests from this configuration. `/char-hd`
+exposes only a named final-size choice; the bot derives `raster_size` as
+exactly twice `output_size`. Matching sizes from other clients still skip
+resampling, while larger rasters are downsampled once before WebP encoding.
 
 ## Architecture
 
@@ -71,7 +72,7 @@ Discord bot -> DynamoDB admission transaction -> job SQS -> launcher
       -> Prepare (resolve character, FFDec export, loop/cache detection,
          shared-canvas computation, per-part frame archives)
       -> parallel render batches (compose in memory -> rasterize once
-         against the shared canvas -> delta WebP encode)
+         against the shared canvas -> optional downsample -> WebP encode)
       -> final WebP mux, immutable promotion, and inline job completion
       -> result SQS -> Discord bot
 

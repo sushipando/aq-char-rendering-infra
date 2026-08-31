@@ -889,7 +889,7 @@ def prepare_resolve(
         final_key = render_key(
             config.renderer_version,
             request.render.webp_quality,
-            request.render.max_size,
+            request.render.output_size,
             digest,
         )
         cached = (
@@ -1690,7 +1690,7 @@ def prepare_finish(
             frame_count=frame_count,
             facing=request.render.facing,
             zoom=float(prepared["settings"]["zoom"]),
-            max_size=int(prepared["settings"]["max_size"]),
+            max_size=int(prepared["settings"]["output_size"]),
             padding=int(prepared["settings"]["padding"]),
         )
         mark("viewbox_ms", phase)

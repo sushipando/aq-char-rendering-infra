@@ -82,7 +82,8 @@ def request_payload() -> dict:
             "max_frames": 360,
             "subframe_start": 1,
             "zoom": 2,
-            "max_size": 2048,
+            "raster_size": 2048,
+            "output_size": 1024,
             "padding": 0,
             "webp_quality": 85,
             "webp_method": 4,
@@ -141,7 +142,8 @@ def test_launcher_hydrates_sparse_request_from_runtime_tuning() -> None:
         asset_dataset_version="dev-v1",
         asset_manifest_key="datasets/dev-v1/manifest.json",
         character_renderer_key="character-renderer/dev-v1/characterB.swf",
-        default_max_size=1024,
+        default_raster_size=2048,
+        default_output_size=1024,
         default_zoom=1.5,
         default_max_frames=120,
         default_webp_quality=80,
@@ -149,7 +151,8 @@ def test_launcher_hydrates_sparse_request_from_runtime_tuning() -> None:
 
     request = JobRequest.from_dict(hydrate_request_defaults(payload, config))
 
-    assert request.render.max_size == 1024
+    assert request.render.raster_size == 2048
+    assert request.render.output_size == 1024
     assert request.render.zoom == 1.5
     assert request.render.max_frames == 120
     assert request.render.webp_quality == 80
@@ -160,7 +163,8 @@ def test_launcher_hydrates_sparse_request_from_runtime_tuning() -> None:
     [
         (("schema_version",), 2),
         (("render", "username"), "https://example.com/bad.swf"),
-        (("render", "max_size"), 4096),
+        (("render", "raster_size"), 4097),
+        (("render", "output_size"), 2049),
         (("render", "padding"), 1024),
         (("discord", "user_id"), "not-a-user"),
     ],
@@ -180,6 +184,35 @@ def test_request_contract_rejects_unknown_fields() -> None:
     payload["render"]["arbitrary_url"] = "https://example.com/item.swf"
     with pytest.raises(ContractError, match="unsupported field"):
         JobRequest.from_dict(payload)
+
+
+def test_request_contract_rejects_output_larger_than_raster() -> None:
+    payload = request_payload()
+    payload["render"]["raster_size"] = 1024
+    payload["render"]["output_size"] = 2048
+
+    with pytest.raises(ContractError, match="must not exceed"):
+        JobRequest.from_dict(payload)
+
+
+def test_launcher_normalizes_legacy_max_size() -> None:
+    payload = request_payload()
+    payload["render"] = {"username": "Artix", "max_size": 1024}
+    config = RuntimeConfig(
+        source_bucket="source",
+        work_bucket="work",
+        job_table="jobs",
+        result_queue_url="https://sqs.example/results",
+        public_base_url="https://chars.example.com",
+        asset_dataset_version="dev-v1",
+        asset_manifest_key="datasets/dev-v1/manifest.json",
+        character_renderer_key="character-renderer/dev-v1/characterB.swf",
+    )
+
+    request = JobRequest.from_dict(hydrate_request_defaults(payload, config))
+
+    assert request.render.raster_size == 1024
+    assert request.render.output_size == 1024
 
 
 def test_frame_batches_are_contiguous_and_deterministic() -> None:

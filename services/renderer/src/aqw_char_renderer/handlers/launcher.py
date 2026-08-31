@@ -30,6 +30,15 @@ def hydrate_request_defaults(value: Any, config: RuntimeConfig) -> dict[str, Any
     if not isinstance(raw_render, Mapping):
         return payload
     render = dict(raw_render)
+    # Normalize the pre-v17 size field before injecting the new defaults so
+    # already-queued requests retain their original one-size behavior.
+    if "max_size" in render and not {
+        "raster_size",
+        "output_size",
+    }.intersection(render):
+        legacy_size = render.pop("max_size")
+        render["raster_size"] = legacy_size
+        render["output_size"] = legacy_size
     for name, default in config.render_defaults().items():
         render.setdefault(name, default)
     payload["render"] = render

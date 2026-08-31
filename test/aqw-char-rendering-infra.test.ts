@@ -10,8 +10,9 @@ test('dev environment targets the dedicated account and exposes tuning in one co
   expect(environment.stage).toBe('dev');
   expect(environment.tuning.prepareExportConcurrency).toBe(8);
   expect(environment.tuning.render).toMatchObject({
-    rendererVersion: 'v16',
-    maxSize: 2048,
+    rendererVersion: 'v17',
+    rasterSize: 2048,
+    outputSize: 2048,
     zoom: 1,
     completeLoop: true,
     maxFrames: 120,
@@ -56,7 +57,8 @@ test('Lambda request defaults come from the centralized environment tuning', () 
   template.hasResourceProperties('AWS::Lambda::Function', {
     Environment: {
       Variables: Match.objectLike({
-        CHAR_RENDER_DEFAULT_MAX_SIZE: '2048',
+        CHAR_RENDER_DEFAULT_RASTER_SIZE: '2048',
+        CHAR_RENDER_DEFAULT_OUTPUT_SIZE: '2048',
         CHAR_RENDER_DEFAULT_ZOOM: '1',
         CHAR_RENDER_DEFAULT_COMPLETE_LOOP: 'true',
         CHAR_RENDER_DEFAULT_MAX_FRAMES: '120',

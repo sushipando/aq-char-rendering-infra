@@ -30,6 +30,6 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def render_key(renderer_version: str, quality: float, max_size: int, digest: str) -> str:
+def render_key(renderer_version: str, quality: float, output_size: int, digest: str) -> str:
     quality_name = f"q{quality:g}".replace(".", "_")
-    return f"renders/{renderer_version}/{quality_name}/{max_size}/{digest[:2]}/{digest}.webp"
+    return f"renders/{renderer_version}/{quality_name}/{output_size}/{digest[:2]}/{digest}.webp"

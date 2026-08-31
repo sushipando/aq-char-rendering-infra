@@ -161,7 +161,8 @@ class RenderSettings:
     max_frames: int = 360
     subframe_start: int = 1
     zoom: float = 2.0
-    max_size: int = 2048
+    raster_size: int = 2048
+    output_size: int = 2048
     padding: int = 0
     webp_quality: float = 85.0
     webp_method: int = 4
@@ -179,6 +180,9 @@ class RenderSettings:
             "max_frames",
             "subframe_start",
             "zoom",
+            "raster_size",
+            "output_size",
+            # Backward-compatible alias for requests queued before v17.
             "max_size",
             "padding",
             "webp_quality",
@@ -188,10 +192,34 @@ class RenderSettings:
         facing = str(payload.get("facing", "right")).casefold()
         if facing not in {"left", "right"}:
             raise ContractError("render.facing must be left or right")
-        max_size = _integer(payload.get("max_size", 2048), "render.max_size", 64, 2048)
+        legacy_size = payload.get("max_size")
+        if legacy_size is not None and (
+            "raster_size" in payload or "output_size" in payload
+        ):
+            raise ContractError(
+                "render.max_size cannot be combined with render.raster_size or "
+                "render.output_size"
+            )
+        raster_size = _integer(
+            payload.get("raster_size", legacy_size if legacy_size is not None else 2048),
+            "render.raster_size",
+            64,
+            4096,
+        )
+        output_size = _integer(
+            payload.get(
+                "output_size",
+                legacy_size if legacy_size is not None else raster_size,
+            ),
+            "render.output_size",
+            64,
+            2048,
+        )
+        if output_size > raster_size:
+            raise ContractError("render.output_size must not exceed render.raster_size")
         padding = _integer(payload.get("padding", 0), "render.padding", 0, 1023)
-        if padding * 2 >= max_size:
-            raise ContractError("render.padding must be less than half render.max_size")
+        if padding * 2 >= output_size:
+            raise ContractError("render.padding must be less than half render.output_size")
         return cls(
             username=normalize_username(payload.get("username")),
             base_items=_boolean(payload.get("base_items", False), "render.base_items"),
@@ -204,7 +232,8 @@ class RenderSettings:
                 payload.get("subframe_start", 1), "render.subframe_start", 1, 10_000
             ),
             zoom=_number(payload.get("zoom", 2), "render.zoom", 0.25, 8),
-            max_size=max_size,
+            raster_size=raster_size,
+            output_size=output_size,
             padding=padding,
             webp_quality=_number(payload.get("webp_quality", 85), "render.webp_quality", 0, 100),
             webp_method=_integer(payload.get("webp_method", 4), "render.webp_method", 0, 6),

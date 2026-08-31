@@ -436,7 +436,8 @@ Example request:
     "max_frames": 360,
     "subframe_start": 1,
     "zoom": 2.0,
-    "max_size": 2048,
+    "raster_size": 2048,
+    "output_size": 1024,
     "padding": 0,
     "webp_quality": 85,
     "webp_method": 4
@@ -607,10 +608,15 @@ right  = max(frame.x + frame.width)
 bottom = max(frame.y + frame.height)
 margin = max(width, height) * 0.1 + 2
 
-content_pixels = max(1, max_size - 2 * padding)
+content_pixels = max(1, output_size - 2 * padding)
 units_per_pixel = max(width, height) / content_pixels
 padding_units = padding * units_per_pixel
 ```
+
+The shared viewbox uses `output_size` so padding remains expressed in final
+pixels. Each frame is rasterized with longest side `raster_size`, then reduced
+with premultiplied-alpha Lanczos filtering to `output_size`. When the two sizes
+match, the PNG is passed directly to WebP encoding without a resize/rewrite.
 
 The first frame of a batch still depends on the prior global frame for the
 smallest delta. Avoid dependencies between concurrently running batches by
@@ -871,7 +877,8 @@ The Lambda/stack configuration should include:
 ```text
 CHAR_RENDER_SCHEMA_VERSION=1
 CHAR_RENDERER_VERSION=v3
-CHAR_RENDER_MAX_SIZE=2048
+CHAR_RENDER_DEFAULT_RASTER_SIZE=2048
+CHAR_RENDER_DEFAULT_OUTPUT_SIZE=2048
 CHAR_RENDER_ZOOM=2
 CHAR_RENDER_PADDING=0
 CHAR_RENDER_MAX_FRAMES=360

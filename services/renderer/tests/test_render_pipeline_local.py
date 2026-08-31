@@ -132,6 +132,8 @@ def build_manifest(
     job_id: str,
     frame_paths: list[Path],
     archive_key: str,
+    raster_size: int = 512,
+    output_size: int = 512,
 ) -> str:
     frame_count = len(frame_paths)
     layers = character_svg.build_layers({"chest": "armor"}, weapon_type="Sword")
@@ -141,7 +143,7 @@ def build_manifest(
         frame_count=frame_count,
         facing="right",
         zoom=ZOOM,
-        max_size=512,
+        max_size=output_size,
         padding=0,
     )
     manifest: dict[str, Any] = {
@@ -168,7 +170,8 @@ def build_manifest(
         "settings": {
             "facing": "right",
             "zoom": ZOOM,
-            "max_size": 512,
+            "raster_size": raster_size,
+            "output_size": output_size,
             "padding": 0,
             "webp_quality": 80,
             "webp_method": 4,
@@ -285,6 +288,11 @@ def test_render_batch_computes_only_its_requested_frames() -> None:
                 "animation_delta_crop",
                 side_effect=AssertionError("distributed rendering must not delta-crop"),
             ),
+            mock.patch.object(
+                render_stage,
+                "_downsample",
+                side_effect=AssertionError("matching sizes must skip downsampling"),
+            ),
         ):
             result = render_batch(
                 job_id=job_id,
@@ -303,6 +311,36 @@ def test_render_batch_computes_only_its_requested_frames() -> None:
             frame["canvas_width"],
             frame["canvas_height"],
         )
+
+
+def test_render_batch_downsamples_before_encoding() -> None:
+    job_id = "job-downsample"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        store = FilesystemObjectStore(root / "objects")
+        frame_paths = write_frames(root, [frame_svg(red=200)])
+        archive_key = f"jobs/{job_id}/prepare/parts/armor.tar.gz"
+        store.upload_file(write_archive(root, "armor", frame_paths), "work", archive_key)
+        manifest_key = build_manifest(
+            store,
+            job_id=job_id,
+            frame_paths=frame_paths,
+            archive_key=archive_key,
+            raster_size=512,
+            output_size=256,
+        )
+
+        result = render_batch(
+            job_id=job_id,
+            manifest_key=manifest_key,
+            batch={"index": 0, "frame_start": 1, "frame_end": 1},
+            store=store,
+            config=pipeline_config(),
+        )
+
+        batch = store.read_json("work", result["batch_manifest_key"])
+        frame = batch["frames"][0]
+        assert max(frame["canvas_width"], frame["canvas_height"]) == 256
 
 
 def test_blink_source_frames_freeze_after_one_shot() -> None:

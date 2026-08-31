@@ -9,7 +9,8 @@ export interface RenderTuning {
   readonly schemaVersion: number;
   readonly rendererVersion: string;
   readonly assetDatasetVersion: string;
-  readonly maxSize: number;
+  readonly rasterSize: number;
+  readonly outputSize: number;
   readonly zoom: number;
   readonly padding: number;
   readonly completeLoop: boolean;
@@ -88,6 +89,8 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v17: separate high-resolution rasterization from delivered image size;
+    // optional premultiplied-alpha Lanczos downsampling happens before WebP.
     // v16: render workers upload individual WebP frames and the finalizer
     // downloads them concurrently, removing output tar creation/extraction.
     // v15: finalizer batch-manifest reads and rendered-frame bundle downloads
@@ -113,10 +116,13 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v16',
+    rendererVersion: 'v17',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
-    maxSize: 2048,
+    // Raster at full resolution, then optionally downsample once before WebP
+    // encoding. Matching sizes bypass resampling entirely.
+    rasterSize: 2048,
+    outputSize: 2048,
     // FFDec SVG export at zoom 2 makes multi-state cosmetics (e.g. capes with
     // 128 unique states) crawl at ~15s/frame -> a 32-minute export that blows
     // the 300s prepare budget. Zoom 1 is fully supported by the compositor

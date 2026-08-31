@@ -68,7 +68,8 @@ class RuntimeConfig:
     source_bundle_frame_count: int = 30
     finalizer_download_concurrency: int = 16
     maximum_active_per_user: int = 2
-    default_max_size: int = 2048
+    default_raster_size: int = 2048
+    default_output_size: int = 2048
     default_zoom: float = 2.0
     default_padding: int = 0
     default_complete_loop: bool = True
@@ -92,7 +93,7 @@ class RuntimeConfig:
         values = os.environ if environment is None else environment
         dataset = _required(values, "CHAR_RENDER_ASSET_DATASET_VERSION")
         legacy_batch_size = _integer(values, "CHAR_RENDER_BATCH_SIZE", 30, 1, 60)
-        return cls(
+        config = cls(
             source_bucket=_required(values, "CHAR_RENDER_SOURCE_BUCKET"),
             work_bucket=_required(values, "CHAR_RENDER_WORK_BUCKET"),
             job_table=_required(values, "CHAR_RENDER_JOB_TABLE"),
@@ -129,8 +130,11 @@ class RuntimeConfig:
                 64,
             ),
             maximum_active_per_user=_integer(values, "CHAR_RENDER_MAX_ACTIVE_PER_USER", 2, 1, 25),
-            default_max_size=_integer(
-                values, "CHAR_RENDER_DEFAULT_MAX_SIZE", 2048, 64, 2048
+            default_raster_size=_integer(
+                values, "CHAR_RENDER_DEFAULT_RASTER_SIZE", 2048, 64, 4096
+            ),
+            default_output_size=_integer(
+                values, "CHAR_RENDER_DEFAULT_OUTPUT_SIZE", 2048, 64, 2048
             ),
             default_zoom=_number(values, "CHAR_RENDER_DEFAULT_ZOOM", 2, 0.25, 8),
             default_padding=_integer(
@@ -163,6 +167,17 @@ class RuntimeConfig:
             cwebp=values.get("CHAR_RENDER_CWEBP", "/usr/bin/cwebp"),
             webpmux=values.get("CHAR_RENDER_WEBPMUX", "/usr/bin/webpmux"),
         )
+        if config.default_output_size > config.default_raster_size:
+            raise ConfigurationError(
+                "CHAR_RENDER_DEFAULT_OUTPUT_SIZE must not exceed "
+                "CHAR_RENDER_DEFAULT_RASTER_SIZE"
+            )
+        if config.default_padding * 2 >= config.default_output_size:
+            raise ConfigurationError(
+                "CHAR_RENDER_DEFAULT_PADDING must be less than half "
+                "CHAR_RENDER_DEFAULT_OUTPUT_SIZE"
+            )
+        return config
 
     def worker_concurrency(self, environment: Mapping[str, str] | None = None) -> dict[str, int]:
         values = os.environ if environment is None else environment
@@ -182,7 +197,8 @@ class RuntimeConfig:
             "max_frames": self.default_max_frames,
             "subframe_start": self.default_subframe_start,
             "zoom": self.default_zoom,
-            "max_size": self.default_max_size,
+            "raster_size": self.default_raster_size,
+            "output_size": self.default_output_size,
             "padding": self.default_padding,
             "webp_quality": self.default_webp_quality,
             "webp_method": self.default_webp_method,

@@ -37,6 +37,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-active", type=int, default=2)
     result.add_argument("--dataset-version", default="dev-v1")
     result.add_argument("--max-frames", type=int, default=8)
+    result.add_argument(
+        "--output-size",
+        type=int,
+        choices=(256, 512, 1024, 2048),
+        default=256,
+        help="Final longest dimension; frames rasterize at twice this size",
+    )
     result.add_argument("--timeout-seconds", type=int, default=1_200)
     result.add_argument("--poll-seconds", type=float, default=5)
     return result
@@ -179,7 +186,12 @@ def main() -> int:
             channel_id=args.channel_id,
             guild_id=args.guild_id,
         ),
-        render=RenderSettings(username=args.username, max_frames=args.max_frames),
+        render=RenderSettings(
+            username=args.username,
+            max_frames=args.max_frames,
+            raster_size=args.output_size * 2,
+            output_size=args.output_size,
+        ),
         appearance=appearance,
     )
     jobs = JobStore(outputs["JobTableName"])
@@ -189,6 +201,8 @@ def main() -> int:
     queue_payload["render"] = {
         "username": request.render.username,
         "max_frames": request.render.max_frames,
+        "raster_size": request.render.raster_size,
+        "output_size": request.render.output_size,
     }
     sqs = boto3.client("sqs")
     try:
@@ -228,6 +242,11 @@ def main() -> int:
         result = payload.get("result")
         if not isinstance(result, dict) or not isinstance(result.get("url"), str):
             raise TypeError(f"Malformed success result: {json.dumps(payload, sort_keys=True)}")
+        dimensions = (int(result.get("width", 0)), int(result.get("height", 0)))
+        if max(dimensions) != args.output_size:
+            raise RuntimeError(
+                f"Expected {args.output_size}px output, got {dimensions[0]}x{dimensions[1]}"
+            )
         verified = verify_webp(result["url"], outputs["CloudFrontBaseUrl"])
         summary = {
             "event": "verified",

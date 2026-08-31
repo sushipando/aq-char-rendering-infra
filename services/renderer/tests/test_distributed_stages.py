@@ -8,6 +8,7 @@ from unittest import mock
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from aqw_char_renderer import character_svg
 from aqw_char_renderer.config import RuntimeConfig
@@ -23,6 +24,7 @@ from aqw_char_renderer.stages.prepare import (
     prepare_export_source,
     shared_viewbox,
 )
+from aqw_char_renderer.stages.render import _downsample
 
 prepare = prepare_module
 from aqw_char_renderer.legacy import render_swf_items as item_renderer
@@ -59,6 +61,31 @@ def write_export(path: Path, body: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def test_downsample_skips_rewriting_when_sizes_match() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "frame.png"
+        Image.new("RGBA", (64, 32), (255, 0, 0, 128)).save(path)
+        before = path.read_bytes()
+
+        size = _downsample(path, output_size=64)
+
+        assert size == (64, 32)
+        assert path.read_bytes() == before
+
+
+def test_downsample_reduces_longest_dimension() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "frame.png"
+        Image.new("RGBA", (64, 32), (255, 0, 0, 128)).save(path)
+
+        size = _downsample(path, output_size=16)
+
+        assert size == (16, 8)
+        with Image.open(path) as image:
+            assert image.mode == "RGBA"
+            assert image.size == (16, 8)
 
 
 FFDEC_EXPORT = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
