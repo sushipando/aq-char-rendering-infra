@@ -32,6 +32,7 @@ interface RendererFunctions {
   readonly finalizer: lambda.DockerImageFunction;
   readonly componentRaster: lambda.DockerImageFunction;
   readonly componentCompose: lambda.DockerImageFunction;
+  readonly componentComposeRust: lambda.DockerImageFunction;
   readonly complete: lambda.DockerImageFunction;
   readonly cleanup: lambda.DockerImageFunction;
   readonly shutdown: lambda.DockerImageFunction;
@@ -343,6 +344,45 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         tracing: lambda.Tracing.ACTIVE,
       });
     };
+
+    // Isolated Rust component-compose candidate (see
+    // docs/rust-component-compose-plan.md). Disconnected from SQS, Step
+    // Functions, and the budget shutdown list; reserved concurrency one for
+    // the direct-Lambda benchmark. The first production rollout points
+    // ComposeComponentFrameChunk at it only after local and deployed pixel
+    // comparisons pass.
+    const rustContext = path.join(__dirname, '..', 'services', 'component-compose-rust');
+    const componentComposeRustName = `aqw-char-${stageName}-componentcompose-rust`;
+    const componentComposeRustLogGroup = new logs.LogGroup(this, 'ComponentComposeRustLogGroup', {
+      logGroupName: `/aws/lambda/${componentComposeRustName}`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    const componentComposeRust = new lambda.DockerImageFunction(this, 'ComponentComposeRustFunction', {
+      functionName: componentComposeRustName,
+      architecture: lambda.Architecture.X86_64,
+      code: lambda.DockerImageCode.fromImageAsset(rustContext, {
+        cmd: ['bootstrap'],
+        platform: ecrAssets.Platform.LINUX_AMD64,
+      }),
+      description: `AQW character renderer component compose candidate (Rust, isolated benchmark)`,
+      environment: {
+        CHAR_RENDER_WORK_BUCKET: workBucket.bucketName,
+        CHAR_RENDER_COMPONENT_COMPOSE_DOWNLOAD_CONCURRENCY: String(
+          tuning.render.finalizerDownloadConcurrency,
+        ),
+        CHAR_RENDER_CWEBP: '/opt/libwebp/bin/cwebp',
+      },
+      ephemeralStorageSize: cdk.Size.mebibytes(
+        tuning.functions.componentCompose.ephemeralStorageMiB,
+      ),
+      logGroup: componentComposeRustLogGroup,
+      memorySize: tuning.functions.componentCompose.memoryMiB,
+      reservedConcurrentExecutions: 1,
+      timeout: cdk.Duration.seconds(tuning.functions.componentCompose.timeoutSeconds),
+      tracing: lambda.Tracing.ACTIVE,
+    });
+
     return {
       launcher: make('Launcher', 'aqw_char_renderer.handlers.launcher.handler', tuning.functions.launcher),
       prepare: make('Prepare', 'aqw_char_renderer.handlers.prepare.handler', tuning.functions.prepare),
@@ -350,6 +390,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       finalizer: make('Finalizer', 'aqw_char_renderer.handlers.finalize.handler', tuning.functions.finalizer),
       componentRaster: make('ComponentRaster', 'aqw_char_renderer.handlers.component_raster.handler', tuning.functions.componentRaster),
       componentCompose: make('ComponentCompose', 'aqw_char_renderer.handlers.component_compose.handler', tuning.functions.componentCompose),
+      componentComposeRust,
       complete: make('Complete', 'aqw_char_renderer.handlers.complete.handler', tuning.functions.complete),
       cleanup: make('Cleanup', 'aqw_char_renderer.handlers.cleanup.handler', tuning.functions.cleanup),
       shutdown: make('Shutdown', 'aqw_char_renderer.handlers.shutdown.handler', tuning.functions.shutdown),
@@ -605,6 +646,10 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     workBucket.grantReadWrite(functions.finalizer);
     workBucket.grantReadWrite(functions.componentRaster);
     workBucket.grantReadWrite(functions.componentCompose);
+    // Least-privilege S3 policy for the isolated Rust candidate. No source
+    // bucket, table, or queue access: it only reads the prepare manifest and
+    // component rasters and writes frames plus the compose-batch manifest.
+    workBucket.grantReadWrite(functions.componentComposeRust);
     for (const fn of [
       functions.prepare,
       functions.finalizer,

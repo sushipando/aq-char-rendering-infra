@@ -51,7 +51,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 4);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 9);
+  template.resourceCountIs('AWS::Lambda::Function', 10);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
@@ -119,7 +119,13 @@ test('dev Lambda sizing stays within the new-account limits', () => {
   const functions = template.findResources('AWS::Lambda::Function');
   for (const resource of Object.values(functions)) {
     expect(resource.Properties.MemorySize).toBeLessThanOrEqual(3008);
-    expect(resource.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
+    // The isolated Rust component-compose candidate alone reserves one
+    // execution while the rest of the dev pipeline shares the account pool.
+    if (resource.Properties.FunctionName === 'aqw-char-dev-componentcompose-rust') {
+      expect(resource.Properties.ReservedConcurrentExecutions).toBe(1);
+    } else {
+      expect(resource.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
+    }
   }
 });
 

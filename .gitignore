@@ -25,3 +25,6 @@ __pycache__/
 render_outputs/
 jobs/
 tmp/
+
+# Rust component-compose worker
+services/component-compose-rust/target/

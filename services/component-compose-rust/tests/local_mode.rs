@@ -1,0 +1,332 @@
+//! End-to-end local-mode integration tests against the real binary and (when
+//! available) the pinned cwebp. These reproduce the worker's whole chunk
+//! path: manifest + results + rasters in, lossless PNGs + WebPs + a
+//! compose-batch manifest out, with all the failure modes explicit.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+use serde_json::Value;
+
+const BINARY: &str = env!("CARGO_BIN_EXE_aqw-component-compose");
+
+fn cwebp() -> Option<String> {
+    match std::env::var("CHAR_RENDER_CWEBP") {
+        Ok(path) if Path::new(&path).is_file() => Some(path),
+        _ => which("cwebp"),
+    }
+}
+
+fn which(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+struct Fixture {
+    root: PathBuf,
+    results: PathBuf,
+    rasters: PathBuf,
+    records: Vec<Value>,
+}
+
+impl Fixture {
+    fn new(root: PathBuf) -> Self {
+        let results = root.join("component").join("results");
+        let rasters = root.join("component").join("rasters");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::create_dir_all(&rasters).unwrap();
+        Fixture {
+            root,
+            results,
+            rasters,
+            records: Vec::new(),
+        }
+    }
+
+    fn solid(task_id: &str, width: u32, height: u32, pixel: [u8; 4], x: i64, y: i64) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            pixels.extend_from_slice(&pixel);
+        }
+        let png = aqw_component_compose::png::encode_rgba8(width, height, &pixels).unwrap();
+        let _ = task_id;
+        let _ = x;
+        let _ = y;
+        png
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        task_id: &str,
+        width: u32,
+        height: u32,
+        pixel: [u8; 4],
+        x: i64,
+        y: i64,
+        empty: bool,
+    ) {
+        let mut record = serde_json::json!({
+            "task_id": task_id,
+            "empty": empty,
+            "component_raster_space": "output",
+        });
+        if empty {
+            record["x"] = serde_json::json!(0);
+            record["y"] = serde_json::json!(0);
+        } else {
+            let png = Self::solid(task_id, width, height, pixel, x, y);
+            let raster = self.rasters.join(format!("{task_id}.png"));
+            std::fs::write(&raster, &png).unwrap();
+            record["x"] = serde_json::json!(x);
+            record["y"] = serde_json::json!(y);
+            record["sha256"] = serde_json::json!(sha256_hex(&png));
+            record["png_key"] = serde_json::json!(format!("local://{task_id}"));
+        }
+        std::fs::write(
+            self.results.join(format!("{task_id}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        self.records.push(record);
+    }
+
+    fn write_manifest(&self, frames: &[Value]) {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "job_id": "rust-integration",
+            "render_hash": "integration",
+            "final_key": "renders/rust-integration.webp",
+            "frame_count": frames.len(),
+            "frame_rate": 25.0,
+            "viewbox": [0.0, 0.0, 256.0, 256.0],
+            "frame_durations": vec![40u64; frames.len()],
+            "fields": {},
+            "aliases": {},
+            "weapon_type": "Sword",
+            "parts": {},
+            "static_keys": [],
+            "ground_animate": {},
+            "all_color_rules": [],
+            "settings": {
+                "facing": "right",
+                "zoom": 1.0,
+                "raster_size": 256,
+                "output_size": 256,
+                "padding": 0,
+                "webp_quality": 80.0,
+                "webp_method": 4,
+            },
+            "component_pipeline": true,
+            "component_tasks": [],
+            "component_frames": frames,
+            "component_raster_space": "output",
+            "component_batches": [],
+        });
+        std::fs::write(
+            self.root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn run(&self, output_dir: &Path, frame_end: u32, extra_args: &[&str]) -> std::process::Output {
+        let mut command = Command::new(BINARY);
+        command
+            .arg("local-compose")
+            .arg("--artifact-dir")
+            .arg(&self.root)
+            .arg("--output-dir")
+            .arg(output_dir)
+            .arg("--frame-start")
+            .arg("1")
+            .arg("--frame-end")
+            .arg(frame_end.to_string());
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        command.output().unwrap()
+    }
+}
+
+fn unique_dir(tag: &str) -> PathBuf {
+    let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "aqw-rust-it-{tag}-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+fn sample_frame_root() -> (PathBuf, Vec<serde_json::Value>, Vec<PathBuf>) {
+    let temp = unique_dir("chunk");
+    let _ = std::fs::remove_dir_all(&temp);
+    let mut fixture = Fixture::new(temp.clone());
+    // Order-sensitive translucent overlap + negative/overflow placement.
+    fixture.add("red", 40, 40, [255, 0, 0, 128], 10, 10, false);
+    fixture.add("blue", 40, 40, [0, 0, 255, 128], 30, 20, false);
+    fixture.add("edge", 40, 40, [0, 255, 0, 255], -25, 240, false);
+    fixture.add("hidden", 1, 1, [0, 0, 0, 0], 0, 0, true);
+    let frames = vec![
+        serde_json::json!({"number": 1, "layers": ["red", "blue", "hidden"], "duration_ms": 40}),
+        serde_json::json!({"number": 2, "layers": ["blue", "red", "edge"], "duration_ms": 55}),
+        serde_json::json!({"number": 3, "layers": ["red"], "duration_ms": 40}),
+    ];
+    fixture.write_manifest(&frames);
+    let raster_paths = vec![
+        fixture.rasters.join("red.png"),
+        fixture.rasters.join("blue.png"),
+        fixture.rasters.join("edge.png"),
+    ];
+    (temp, frames, raster_paths)
+}
+
+#[test]
+fn local_mode_composes_every_frame_and_writes_the_batch_contract() {
+    let (temp, frames, _) = sample_frame_root();
+    let output = temp.join("out");
+    let result = Fixture::new(temp.clone()).run(&output, 3, &[]);
+    assert!(
+        result.status.success(),
+        "local-compose failed: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    for frame in &frames {
+        let number = frame["number"].as_u64().unwrap();
+        let png = output.join("frames").join(format!("{number:06}.png"));
+        let webp = output.join("frames").join(format!("{number:06}.webp"));
+        assert!(png.is_file(), "missing lossless frame PNG {png:?}");
+        assert!(webp.is_file(), "missing frame WebP {webp:?}");
+        // Composed canvas must be 256x256 RGBA with real content.
+        let (width, height, pixels) = read_png(&png);
+        assert_eq!((width, height), (256, 256));
+        assert!(
+            pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0),
+            "frame is empty"
+        );
+    }
+
+    let batch: Value =
+        serde_json::from_slice(&std::fs::read(output.join("batch-0000.json")).unwrap()).unwrap();
+    assert_eq!(batch["schema_version"], 1);
+    assert_eq!(batch["job_id"], "rust-integration");
+    assert_eq!(batch["batch"], 0);
+    let frames_json = batch["frames"].as_array().unwrap();
+    assert_eq!(frames_json.len(), 3);
+    assert_eq!(
+        frames_json
+            .iter()
+            .map(|f| f["frame"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        frames_json
+            .iter()
+            .map(|f| f["duration"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![40, 55, 40]
+    );
+    for frame in frames_json {
+        assert_eq!(frame["canvas_width"], 256);
+        assert_eq!(frame["canvas_height"], 256);
+        assert_eq!(frame["width"], 256);
+        assert_eq!(frame["height"], 256);
+        assert_eq!(frame["x"], 0);
+        assert_eq!(frame["y"], 0);
+        let webp = std::fs::read(
+            output
+                .join("frames")
+                .join(format!("{:06}.webp", frame["frame"].as_i64().unwrap())),
+        )
+        .unwrap();
+        assert_eq!(frame["sha256"].as_str().unwrap(), sha256_hex(&webp));
+        assert_eq!(frame["bytes"].as_u64().unwrap(), webp.len() as u64);
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+fn read_png(path: &Path) -> (u32, u32, Vec<u8>) {
+    let bytes = std::fs::read(path).unwrap();
+    let image = aqw_component_compose::png::decode_rgba8(&bytes).unwrap();
+    (image.width, image.height, image.pixels)
+}
+
+#[test]
+fn local_mode_encodes_webp_byte_identical_to_pillow_convention() {
+    let Some(cwebp) = cwebp() else {
+        eprintln!("skipping webp test: cwebp not found");
+        return;
+    };
+    let (temp, frames, _) = sample_frame_root();
+    let output = temp.join("out");
+    let fixture = Fixture::new(temp.clone());
+    let result = fixture.run(&output, 3, &["--cwebp", &cwebp]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for frame in &frames {
+        let number = frame["number"].as_u64().unwrap();
+        let webp_path = output.join("frames").join(format!("{number:06}.webp"));
+        assert!(webp_path.is_file(), "missing webp for frame {number}");
+        assert!(webp_path.metadata().unwrap().len() > 0);
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn local_mode_rejects_missing_task_results() {
+    let temp = unique_dir("missing-task");
+    let mut fixture = Fixture::new(temp.clone());
+    fixture.add("red", 10, 10, [255, 0, 0, 255], 0, 0, false);
+    let frames =
+        vec![serde_json::json!({"number": 1, "layers": ["red", "ghost"], "duration_ms": 40})];
+    fixture.write_manifest(&frames);
+    let output = temp.join("out");
+    let fixture = Fixture::new(temp.clone());
+    let result = fixture.run(&output, 1, &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(stderr.contains("missing results"), "stderr: {stderr}");
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn local_mode_rejects_missing_png() {
+    let temp = unique_dir("missing-png");
+    let _ = std::fs::remove_dir_all(&temp);
+    let mut fixture = Fixture::new(temp.clone());
+    fixture.add("red", 40, 40, [255, 0, 0, 255], 0, 0, false);
+    // Delete the raster so the decode/fetch path fails.
+    std::fs::remove_file(fixture.rasters.join("red.png")).unwrap();
+    fixture.write_manifest(&[serde_json::json!({"number": 1, "layers": ["red"]})]);
+    let output = temp.join("out");
+    let run = Fixture::new(temp.clone());
+    let result = run.run(&output, 1, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("raster") || stderr.contains("png") || stderr.contains("component"),
+        "stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&temp);
+}

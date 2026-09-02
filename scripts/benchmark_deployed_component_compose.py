@@ -25,6 +25,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--compositor", choices=("pillow", "pyvips"), default="pillow")
     result.add_argument("--frame-start", type=int, default=1)
     result.add_argument("--frame-end", type=int)
+    result.add_argument(
+        "--benchmark-output-prefix",
+        type=str,
+        help=(
+            "S3 prefix (e.g. benchmarks/rust-compose/<job-id>) where frames and "
+            "the compose-batch manifest are written instead of the job's normal "
+            "jobs/<job-id>/component/... keys. Required for candidate functions "
+            "so they never touch a completed job's intermediate frames."
+        ),
+    )
     return result
 
 
@@ -68,7 +78,9 @@ def main() -> int:
     args = parser().parse_args()
     if args.runs < 1:
         raise SystemExit("--runs must be positive")
-    manifest = json.loads((args.artifact_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (args.artifact_dir / "manifest.json").read_text(encoding="utf-8")
+    )
     frame_count = int(manifest["frame_count"])
     frame_end = args.frame_end if args.frame_end is not None else frame_count
     if args.frame_start < 1 or frame_end < args.frame_start or frame_end > frame_count:
@@ -91,6 +103,8 @@ def main() -> int:
             "frame_end": frame_end,
         },
     }
+    if args.benchmark_output_prefix:
+        event["benchmark_output_prefix"] = args.benchmark_output_prefix
     client = boto3.Session(
         profile_name=args.profile,
         region_name=args.region,
