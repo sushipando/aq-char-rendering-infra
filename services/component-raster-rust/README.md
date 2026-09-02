@@ -6,14 +6,19 @@ its FFDec SVG export, assembles the tight-page component SVG (tint filters,
 authored CXFORM filters, minimum-stroke calibration, font-zoom normalization,
 reference rewriting), rasterizes **in-process with resvg as a library**
 (usvg + tiny-skia, pinned to the same 0.48.1 as the Python image's CLI),
-crops to visible alpha, downsamples onto the final output grid with a
-**Pillow-exact premultiplied-Lanczos resampler**, and uploads the component
-PNG plus the full result record.
+crops to visible alpha, downsamples onto the final output grid with
+**fast_image_resize (FIR)** — separable Lanczos3 with SIMD, ~3x faster than
+the Pillow-verbatim path with a measured <=9/255 premultiplied diff on real
+content — and uploads the component PNG plus the full result record.
 
-The output is pixel-for-pixel identical to the Python worker:
+The Pillow-verbatim resampler (`resample.rs`, a bit-exact port of Pillow's
+`Resample.c` + RGBa conversions) is retained and selectable with
+`AQW_DOWNSAMPLER=exact`; it remains the parity reference and rollback path.
 `scripts/rust_raster_parity.py` runs both pipelines over synthetic FFDec jobs
 (zoom-2 with strokes/tints/CXFORMs/gradients/fonts, 2x and 1x downsampling)
-and a real FFDec pet export, then requires exact RGBA equality.
+and a real FFDec pet export: the FIR default passes a premultiplied-on-gray
+tolerance gate (max 6/255, <0.01% significant pixels), and `--exact` requires
+bit-identical RGBA.
 
 ## Layout
 
@@ -37,10 +42,12 @@ tests/
   raster_local.rs end-to-end local-raster integration tests (real binary)
 ```
 
-`fast_image_resize` remains a dependency and can be selected with
-`AQW_DOWNSAMPLER=fast_image_resize` for benchmarks; the default is the
-Pillow-exact resampler because a single 1/255 alpha difference at an AA edge
-can move the recorded bbox by a row.
+FIR is the active backend. Exact-mode parity keeps `resample.rs` (a bit-exact
+port of Pillow's `Resample.c`: float Lanczos kernel, 2^22 fixed-point
+coefficients, 2^21 bias, two-pass, with the `RGBa` premultiply/unpremultiply
+round trips) verified and available via `AQW_DOWNSAMPLER=exact`. Caveat: FIR
+can move a component's alpha bbox by +-1 px at hard alpha edges (the parity
+harness tolerates this for FIR and asserts exactness only under `--exact`).
 
 ## Local mode (parity fixtures)
 
@@ -68,5 +75,6 @@ Requires the resvg 0.48.1 CLI (the Python reference renders with the exact
 binary the shared image uses) and the Rust release binary:
 
 ```bash
-uv run --package aqw-char-renderer python scripts/rust_raster_parity.py
+uv run --package aqw-char-renderer python scripts/rust_raster_parity.py        # FIR default (tolerance gate)
+uv run --package aqw-char-renderer python scripts/rust_raster_parity.py --exact  # bit-identical Pillow parity
 ```

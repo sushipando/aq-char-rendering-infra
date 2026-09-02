@@ -317,21 +317,6 @@ pub async fn run_raster_task(
             let mut component_x = left + crop_left as i64;
             let mut component_y = top + crop_top as i64;
 
-            // Debug aid (AQW_DUMP_RASTER_COMPONENT): write the cropped
-            // raster-space component so both downsamplers can be compared on
-            // the exact input the pipeline uses.
-            if let Ok(dump_dir) = std::env::var("AQW_DUMP_RASTER_COMPONENT") {
-                if let Ok(png_bytes) = encode_rgba8(cropped.width, cropped.height, &cropped.pixels)
-                {
-                    let _ = std::fs::create_dir_all(&dump_dir);
-                    let _ = std::fs::write(
-                        std::path::Path::new(&dump_dir)
-                            .join(format!("task-{task_index:03}-raster.png")),
-                        png_bytes,
-                    );
-                }
-            }
-
             let mut output_image: Option<RgbaImage> = None;
             if component_raster_space == COMPONENT_RASTER_SPACE_OUTPUT
                 && output_canvas != raster_canvas
@@ -346,41 +331,6 @@ pub async fn run_raster_task(
                 );
                 timings.downsample_ms = elapsed_ms(downsample_started);
                 result.downsample_ms = crate::telemetry::rounded2(timings.downsample_ms);
-
-                // Debug aid (AQW_DUMP_BOTH_DOWNSAMPLES): also run the
-                // fast_image_resize path on the identical input and write both
-                // outputs side by side for visual comparison.
-                if let Ok(dump_dir) = std::env::var("AQW_DUMP_BOTH_DOWNSAMPLES") {
-                    if let Some((image, _x, _y)) = &scaled {
-                        if let Ok(png_bytes) =
-                            encode_rgba8(image.width, image.height, &image.pixels)
-                        {
-                            let _ = std::fs::create_dir_all(&dump_dir);
-                            let _ = std::fs::write(
-                                std::path::Path::new(&dump_dir)
-                                    .join(format!("task-{task_index:03}-exact.png")),
-                                png_bytes,
-                            );
-                        }
-                    }
-                    if let Some((fir_image, _fx, _fy)) = crate::raster::downsample_component_fir(
-                        &cropped,
-                        component_x,
-                        component_y,
-                        (raster_canvas[0], raster_canvas[1]),
-                        (output_canvas[0], output_canvas[1]),
-                    ) {
-                        if let Ok(png_bytes) =
-                            encode_rgba8(fir_image.width, fir_image.height, &fir_image.pixels)
-                        {
-                            let _ = std::fs::write(
-                                std::path::Path::new(&dump_dir)
-                                    .join(format!("task-{task_index:03}-fir.png")),
-                                png_bytes,
-                            );
-                        }
-                    }
-                }
 
                 if let Some((image, x, y)) = scaled {
                     output_image = Some(image);

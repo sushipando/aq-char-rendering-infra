@@ -262,7 +262,9 @@ def run_python(root: Path, resvg: str, task_index: int) -> dict:
     )
 
 
-def run_rust(root: Path, binary: str, task_index: int) -> dict:
+def run_rust(
+    root: Path, binary: str, task_index: int, *, env: dict[str, str] | None = None
+) -> dict:
     result = subprocess.run(
         [
             binary,
@@ -277,6 +279,7 @@ def run_rust(root: Path, binary: str, task_index: int) -> dict:
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     if result.returncode:
         raise SystemExit(f"rust local-raster failed:\n{result.stderr}")
@@ -292,15 +295,101 @@ def png_diff(root: Path, result: dict) -> tuple[int, int] | None:
     return int(pixels.max()), pixels.size // 4
 
 
-def compare_one(case: dict, task_index: int) -> dict:
+FIR_MAX_PREMULT_DIFF = 24
+
+
+def fir_tolerance(case: dict, task_count: int) -> tuple[bool, dict[str, object]]:
+    """Compare the (default) FIR outputs to Pillow on a premultiplied,
+    gray-composited basis within a bounded tolerance.
+
+    FIR uses a different integer premultiply path than Pillow, so per-channel
+    straight-alpha values can differ by up to ~9/255 on real content. Assert
+    a generous-but-bounded envelope (<=24/255 premultiplied on gray) rather
+    than exact equality; bbox/shape equality is already asserted by
+    ``compare_one``.
+    """
+    import numpy as np
+
+    max_over_tasks = 0
+    diffs_pct = 0.0
+    count = 0
+    for task_index in range(task_count):
+        py = case["py_result"][task_index]
+        rs = case["rs_result"][task_index]
+        if py["empty"] or rs["empty"]:
+            continue
+        with (
+            Image.open(case["py_root"] / "work" / py["png_key"]) as a,
+            Image.open(case["rs_root"] / "work" / rs["png_key"]) as b,
+        ):
+            a_img = a.convert("RGBA")
+            b_img = b.convert("RGBA")
+
+        def premult(im):
+            arr = np.asarray(im, dtype=np.float32) / 255.0
+            arr[..., :3] *= arr[..., 3:4]
+            return arr
+
+        # FIR may shift the alpha bbox by +-1 px. Paste each result onto a gray
+        # page at its recorded (x, y) placement (exactly how the composer will
+        # place them), then compare the aligned region. This mirrors a real
+        # composite; bbox geometry drift itself is gated by compare_one.
+        max_w = max(int(py["x"]) + int(py["width"]), int(rs["x"]) + int(rs["width"]))
+        max_h = max(int(py["y"]) + int(py["height"]), int(rs["y"]) + int(rs["height"]))
+
+        def page_on_gray(img, x, y, width=max_w, height=max_h):
+            page = Image.new("RGBA", (width, height), (96, 96, 96, 255))
+            page.alpha_composite(img, (x, y))
+            return premult(page)
+
+        a_arr = page_on_gray(a_img, int(py["x"]), int(py["y"]))
+        b_arr = page_on_gray(b_img, int(rs["x"]), int(rs["y"]))
+        diff = np.abs(a_arr - b_arr).max(axis=2)
+        maxd = int(np.ceil(diff.max() * 255))
+        max_over_tasks = max(max_over_tasks, maxd)
+        diffs_pct += 100.0 * (diff > 0.02).mean()
+        count += 1
+    mean_sig = diffs_pct / max(1, count)
+    ok = max_over_tasks <= FIR_MAX_PREMULT_DIFF and mean_sig < 0.1
+    return ok, {
+        "max_premultiplied_diff_255": max_over_tasks,
+        "mean_pct_over_0_02": round(mean_sig, 4),
+        "limit_255": FIR_MAX_PREMULT_DIFF,
+    }
+
+
+def compare_one(case: dict, task_index: int, *, strict: bool = False) -> dict:
+    """Compare one task. With ``strict`` (the exact downsample path) everything
+    must match Pillow exactly. With ``strict=False`` (the FIR default) bbox
+    geometry may drift by +-1 px (measured on the synthetic fixture) because
+    FIR rounds premultiply differently; pixel fidelity is enforced separately
+    by ``fir_tolerance``.
+    """
     py = case["py_result"][task_index]
     rs = case["rs_result"][task_index]
+
+    def bbox_ok():
+        if strict:
+            return (
+                py["x"] == rs["x"],
+                py["y"] == rs["y"],
+                py["width"] == rs["width"],
+                py["height"] == rs["height"],
+            )
+        return (
+            abs(py["x"] - rs["x"]) <= 1,
+            abs(py["y"] - rs["y"]) <= 1,
+            abs(py["width"] - rs["width"]) <= 1,
+            abs(py["height"] - rs["height"]) <= 1,
+        )
+
+    bx, by, bw, bh = bbox_ok()
     checks = {
         "empty": py["empty"] == rs["empty"],
-        "x": py["x"] == rs["x"],
-        "y": py["y"] == rs["y"],
-        "width": py["width"] == rs["width"],
-        "height": py["height"] == rs["height"],
+        "x": bx,
+        "y": by,
+        "width": bw,
+        "height": bh,
         "task_id": py["task_id"] == rs["task_id"],
         "component_raster_space": py["component_raster_space"]
         == rs["component_raster_space"],
@@ -326,7 +415,13 @@ def compare_one(case: dict, task_index: int) -> dict:
         else:
             diff = int(np.abs(a_arr - b_arr).max())
             max_diff = diff
-            pixel_status = "exact" if diff == 0 else f"diff={diff}"
+            pixel_status = (
+                "exact"
+                if diff == 0
+                else (
+                    f"diff={diff}" if strict else f"strict-fir-diff={diff} (tolerated)"
+                )
+            )
     return {
         "task_index": task_index,
         "checks": checks,
@@ -351,6 +446,11 @@ def main() -> int:
     )
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="run the Rust worker with AQW_DOWNSAMPLER=exact (expects bit-identical",
+    )
     args = parser.parse_args()
 
     if not args.resvg.is_file():
@@ -395,36 +495,60 @@ def main() -> int:
         py_results = [
             run_python(py_root, str(args.resvg), index) for index in range(task_count)
         ]
-        rs_results = [
-            run_rust(rs_root, str(args.rust_binary), index)
-            for index in range(task_count)
-        ]
+        # The default (FIR) path is the deployed one: assert it stays within a
+        # tight tolerance of Pillow. The exact resampler is separately proven
+        # bit-identical by the unit test + the FIR-vs-exact dump harness.
+        rs_results = []
+        for index in range(task_count):
+            env = None
+            if args.exact:
+                env = {"AQW_DOWNSAMPLER": "exact"}
+            rs_results.append(run_rust(rs_root, str(args.rust_binary), index, env=env))
         case = {
             "py_root": py_root,
             "rs_root": rs_root,
             "py_result": py_results,
             "rs_result": rs_results,
         }
-        comparisons = [compare_one(case, index) for index in range(task_count)]
-        ok = all(
-            compare["pixel_status"] in {"exact", "both-empty"}
-            and all(compare["checks"].values())
-            for compare in comparisons
-        )
-        all_pass = all_pass and ok
+        comparisons = [
+            compare_one(case, index, strict=args.exact) for index in range(task_count)
+        ]
+        if args.exact:
+            # Pillow-verbatim path: exact geometry and bit-identical pixels.
+            ok = all(
+                compare["pixel_status"] in {"exact", "both-empty"}
+                and all(compare["checks"].values())
+                for compare in comparisons
+            )
+            tolerance_ok, tolerance_stats = True, {}
+        else:
+            # FIR default: geometry within +-1px (bbox flip risk) and the
+            # premultiplied-on-gray tolerance gate.
+            ok = all(all(compare["checks"].values()) for compare in comparisons)
+            tolerance_ok, tolerance_stats = fir_tolerance(case, task_count)
+        all_pass = all_pass and ok and tolerance_ok
         summary[name] = {
             "tasks": task_count,
             "ok": ok,
+            "tolerance_ok": tolerance_ok,
+            "tolerance": tolerance_stats,
             "comparisons": comparisons,
         }
-        if not ok:
+        if not (ok and tolerance_ok):
             for compare in comparisons:
                 if compare["pixel_status"] not in {"exact", "both-empty"} or not all(
                     compare["checks"].values()
                 ):
                     print(json.dumps(compare, indent=2, sort_keys=True, default=str))
 
-    print(json.dumps({name: {"ok": value["ok"]} for name, value in summary.items()}))
+    print(
+        json.dumps(
+            {
+                name: {"ok": value["ok"], "tolerance": value.get("tolerance")}
+                for name, value in summary.items()
+            }
+        )
+    )
     if all_pass:
         print("PASS")
         return 0

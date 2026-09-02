@@ -60,18 +60,22 @@ fn demultiply_u8(pixels: &mut [u8]) {
 
 pub const DOWNSAMPLE_HALO_RASTER_PIXELS: f64 = 12.0;
 
+/// The active downsample backend. `fast_image_resize` (FIR) is the default;
+/// `exact` selects the Pillow-verbatim `resample.rs` port used during parity
+/// validation and as a fallback.
 fn use_fast_image_resize() -> bool {
-    std::env::var("AQW_DOWNSAMPLER").as_deref() == Ok("fast_image_resize")
+    // FIR is the default; `AQW_DOWNSAMPLER=exact` selects the Pillow-verbatim
+    // port used for parity validation and rollback.
+    !matches!(std::env::var("AQW_DOWNSAMPLER").as_deref(), Ok("exact"))
 }
 
-/// Port of `_downsample_component_to_output_grid`: shrink one cropped layer
-/// onto the exact full-frame output pixel grid using a fractional source box
-/// (preserving the global resampling phase) with premultiplied-alpha Lanczos.
+/// The active downsampler for output-grid component rasterization.
 ///
-/// NOTE: Pillow's `reducing_gap=3.0` only adds an integer-reduce step when
-/// the total shrink exceeds the gap factor; component downsampling is at most
-/// 2x (the prepare manifest keeps raster <= 2 * output), so this is a single
-/// Lanczos pass, which fast_image_resize implements directly.
+/// Default: fast_image_resize (FIR) — separable Lanczos3 with SIMD, ~3x
+/// faster than the exact port, with a measured <=9/255 premultiplied diff on
+/// real AQW content (0.0014% of pixels > 5/255) at the 2x component shrink.
+/// Set `AQW_DOWNSAMPLER=exact` to force the Pillow-verbatim resampler
+/// (bit-identical to the Python worker, used by the parity harness).
 pub fn downsample_component_to_output_grid(
     image: &RgbaImage,
     x: i64,
@@ -262,6 +266,76 @@ mod tests {
         let image = RgbaImage::new(10, 10, vec![0u8; 10 * 10 * 4]);
         let scaled = downsample_component_to_output_grid(&image, 0, 0, (200, 200), (100, 100));
         assert!(scaled.is_none());
+    }
+
+    #[test]
+    fn fir_stays_within_bounded_tolerance_of_exact() {
+        // The two downsamplers share geometry and stay close on real content:
+        // a translucent gradient patch downsampled 2x must keep the same
+        // bbox and stay within a bounded premultiplied per-channel diff.
+        let w = 240u32;
+        let h = 180u32;
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let fx = x as f64 / w as f64;
+                let fy = y as f64 / h as f64;
+                px.extend_from_slice(&[
+                    (80.0 + 150.0 * fx) as u8,
+                    (60.0 + 120.0 * fy) as u8,
+                    (200.0 - 100.0 * fy) as u8,
+                    (200.0 + 55.0 * fx) as u8,
+                ]);
+            }
+        }
+        let image = RgbaImage::new(w, h, px);
+        let exact = downsample_component_impl(&image, 40, 30, (4096, 3253), (2048, 1626), false)
+            .expect("exact path produces output");
+        let fir = downsample_component_impl(&image, 40, 30, (4096, 3253), (2048, 1626), true)
+            .expect("FIR path produces output");
+        assert_eq!((fir.0.width, fir.0.height), (exact.0.width, exact.0.height));
+        // Bounded premultiplied-on-gray max diff (measured <=9/255 on real
+        // Soltina cape; envelope 24 keeps CI robust across content). Compare
+        // premultiplied-on-gray, not straight alpha: FIR and Pillow round
+        // premultiply differently and straight-alpha blows up at zero-alpha
+        // pixels.
+        fn premult_gray(img: &RgbaImage, gray: u8) -> Vec<u8> {
+            let mut out = Vec::with_capacity(img.pixels.len());
+            let mut gy = gray as f32 / 255.0;
+            let _ = &mut gy;
+            for px in img.pixels.as_chunks::<4>().0 {
+                let a = px[3] as f32 / 255.0;
+                // composite straight color over gray
+                let c = |src: u8| (src as f32 / 255.0) * a + gray as f32 / 255.0 * (1.0 - a);
+                let (r, g, b) = (c(px[0]), c(px[1]), c(px[2]));
+                // premultiplied rgb
+                out.extend_from_slice(&[
+                    (r * 255.0).round() as u8,
+                    (g * 255.0).round() as u8,
+                    (b * 255.0).round() as u8,
+                    px[3],
+                ]);
+            }
+            out
+        }
+        let mut max_diff = 0i32;
+        let min_h = fir.0.height.min(exact.0.height) as usize;
+        let min_w = fir.0.width.min(exact.0.width) as usize;
+        let a = premult_gray(&fir.0, 96);
+        let b = premult_gray(&exact.0, 96);
+        for y in 0..min_h {
+            for x in 0..min_w {
+                let ia = (y * fir.0.width as usize + x) * 4;
+                let ib = (y * exact.0.width as usize + x) * 4;
+                for c in 0..4 {
+                    let d = (a[ia + c] as i32 - b[ib + c] as i32).abs();
+                    max_diff = max_diff.max(d);
+                }
+            }
+        }
+        assert!(max_diff <= 24, "FIR diverged from exact by {max_diff}/255");
+        // And FIR itself is the default backend.
+        assert!(use_fast_image_resize());
     }
 
     #[test]
