@@ -27,6 +27,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     componentRasterFrameCap: 120,
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
+    componentComposeBackend: 'rust',
     componentCompositor: 'pillow',
   });
 });
@@ -91,6 +92,18 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
   });
 });
 
+test('component composition uses Rust with 20-way per-job Map concurrency', () => {
+  const template = synthesize();
+  const stateMachines = template.findResources('AWS::StepFunctions::StateMachine');
+  const stateMachine = Object.values(stateMachines)[0];
+  const serializedDefinition = JSON.stringify(stateMachine.Properties.DefinitionString);
+
+  expect(serializedDefinition).toContain('ComponentComposeRustFunction');
+  expect(serializedDefinition).not.toContain('ComponentComposeFunction');
+  expect(serializedDefinition).toContain('ComposeComponentFrameChunks');
+  expect(serializedDefinition).toContain('MaxConcurrency\\\":20');
+});
+
 test('Lambda request defaults come from the centralized environment tuning', () => {
   const template = synthesize();
   template.hasResourceProperties('AWS::Lambda::Function', {
@@ -119,13 +132,7 @@ test('dev Lambda sizing stays within the new-account limits', () => {
   const functions = template.findResources('AWS::Lambda::Function');
   for (const resource of Object.values(functions)) {
     expect(resource.Properties.MemorySize).toBeLessThanOrEqual(3008);
-    // The isolated Rust component-compose candidate alone reserves one
-    // execution while the rest of the dev pipeline shares the account pool.
-    if (resource.Properties.FunctionName === 'aqw-char-dev-componentcompose-rust') {
-      expect(resource.Properties.ReservedConcurrentExecutions).toBe(1);
-    } else {
-      expect(resource.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
-    }
+    expect(resource.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
   }
 });
 

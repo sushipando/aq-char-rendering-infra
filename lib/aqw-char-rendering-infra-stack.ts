@@ -345,12 +345,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       });
     };
 
-    // Isolated Rust component-compose candidate (see
-    // docs/rust-component-compose-plan.md). Disconnected from SQS, Step
-    // Functions, and the budget shutdown list; reserved concurrency one for
-    // the direct-Lambda benchmark. The first production rollout points
-    // ComposeComponentFrameChunk at it only after local and deployed pixel
-    // comparisons pass.
+    // Rust component-compose implementation. The Python implementation stays
+    // deployed as a rollback backend selected through centralized tuning.
     const rustContext = path.join(__dirname, '..', 'services', 'component-compose-rust');
     const componentComposeRustName = `aqw-char-${stageName}-componentcompose-rust`;
     const componentComposeRustLogGroup = new logs.LogGroup(this, 'ComponentComposeRustLogGroup', {
@@ -365,7 +361,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         cmd: ['bootstrap'],
         platform: ecrAssets.Platform.LINUX_AMD64,
       }),
-      description: `AQW character renderer component compose candidate (Rust, isolated benchmark)`,
+      description: `AQW character renderer component compose stage (Rust)`,
       environment: {
         CHAR_RENDER_WORK_BUCKET: workBucket.bucketName,
         CHAR_RENDER_COMPONENT_COMPOSE_DOWNLOAD_CONCURRENCY: String(
@@ -378,7 +374,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       ),
       logGroup: componentComposeRustLogGroup,
       memorySize: tuning.functions.componentCompose.memoryMiB,
-      reservedConcurrentExecutions: 1,
       timeout: cdk.Duration.seconds(tuning.functions.componentCompose.timeoutSeconds),
       tracing: lambda.Tracing.ACTIVE,
     });
@@ -534,9 +529,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
       },
     });
+    const componentComposeFunction = tuning.render.componentComposeBackend === 'rust'
+      ? functions.componentComposeRust
+      : functions.componentCompose;
     componentComposeMap.itemProcessor(
       new tasks.LambdaInvoke(this, 'ComposeComponentFrameChunk', {
-        lambdaFunction: functions.componentCompose,
+        lambdaFunction: componentComposeFunction,
         payload: sfn.TaskInput.fromObject({
           job_id: sfn.JsonPath.stringAt('$.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
@@ -712,6 +710,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         functions.finalizer.functionName,
         functions.componentRaster.functionName,
         functions.componentCompose.functionName,
+        functions.componentComposeRust.functionName,
       ]),
     );
     functions.shutdown.addEnvironment(

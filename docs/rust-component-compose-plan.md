@@ -592,16 +592,16 @@ Implemented and validated in `services/component-compose-rust`:
   ran the full local-compose flow under al2023, and a local
   Runtime-Interface-Emulator invocation confirmed the runtime polls the API
   and returns the event contract / clean Lambda errors.
-- **CDK** — new isolated `aqw-char-dev-componentcompose-rust` candidate
-  (3008 MiB, 4096 MiB `/tmp`, 300s, reserved concurrency 1, work-bucket-only
-  IAM, log group + error alarm, no SQS/Step Functions wiring). `npm run
-  build`, `npm test`, and `npm run synth` pass; the dev diff adds only the
-  candidate function, log group, alarm, and S3 policy.
+- **CDK** — `componentComposeBackend` selects the Python rollback worker or
+  `aqw-char-dev-componentcompose-rust`. Development now selects Rust with the
+  same unreserved Lambda concurrency behavior as Python; the inline compose
+  Map limits each render job to 20 concurrent invocations. The Rust worker
+  retains work-bucket-only IAM, its dedicated log group, and its error alarm.
 - **Benchmark script** — `scripts/benchmark_deployed_component_compose.py`
   gained `--benchmark-output-prefix`; the Python worker ignores the extra
   event field, so the same harness drives both Pillow and Rust functions.
 
-Remaining (deployment-time) steps per this plan: re-login AWS SSO, review
-`npm run diff`, deploy, verify reserved concurrency 1, run the direct
-invocations (cold + 5 warm) with `--benchmark-output-prefix`, then the
-one-concurrency end-to-end rollout with `componentComposeBackend`.
+The Rust backend was deployed on 2026-09-02 after direct cold/warm parity
+benchmarks. An eight-frame, 256px Alina smoke job then completed through the
+full SQS and Step Functions workflow with byte-valid output from the Rust
+composer.

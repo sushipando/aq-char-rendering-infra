@@ -31,6 +31,7 @@ export interface RenderTuning {
   readonly componentRasterFrameCap: number;
   readonly componentComposeFramesPerLambda: number;
   readonly componentComposeConcurrency: number;
+  readonly componentComposeBackend: 'python' | 'rust';
   readonly componentCompositor: 'pillow' | 'pyvips';
 }
 
@@ -192,6 +193,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // wave while amortizing component downloads and Lambda cold starts.
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
+    componentComposeBackend: 'rust',
     componentCompositor: 'pillow',
   },
   retention: {
