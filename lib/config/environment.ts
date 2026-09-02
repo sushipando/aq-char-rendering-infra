@@ -29,6 +29,7 @@ export interface RenderTuning {
   readonly componentRasterEnabled: boolean;
   readonly componentRasterConcurrency: number;
   readonly componentRasterFrameCap: number;
+  readonly componentRasterBackend: 'python' | 'rust';
   readonly componentComposeFramesPerLambda: number;
   readonly componentComposeConcurrency: number;
   readonly componentComposeBackend: 'python' | 'rust';
@@ -189,6 +190,9 @@ const DEV_TUNING: InfrastructureTuning = {
     // Lambda's regional concurrency remains the account-wide safety ceiling.
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
+    // Rust resvg-library raster worker is the live helper-stage backend now (the
+    // compose stage is already Rust); Python remains deployed for rollback.
+    componentRasterBackend: 'rust',
     // Twelve 10-frame workers cover the current 120-frame maximum in one Map
     // wave while amortizing component downloads and Lambda cold starts.
     componentComposeFramesPerLambda: 10,

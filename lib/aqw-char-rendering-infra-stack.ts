@@ -31,6 +31,7 @@ interface RendererFunctions {
   readonly render: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
   readonly componentRaster: lambda.DockerImageFunction;
+  readonly componentRasterRust: lambda.DockerImageFunction;
   readonly componentCompose: lambda.DockerImageFunction;
   readonly componentComposeRust: lambda.DockerImageFunction;
   readonly complete: lambda.DockerImageFunction;
@@ -386,6 +387,43 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       componentRaster: make('ComponentRaster', 'aqw_char_renderer.handlers.component_raster.handler', tuning.functions.componentRaster),
       componentCompose: make('ComponentCompose', 'aqw_char_renderer.handlers.component_compose.handler', tuning.functions.componentCompose),
       componentComposeRust,
+
+      // Isolated Rust component-raster candidate (see
+      // docs/rust-component-compose-plan.md). resvg is linked in-process; the
+      // image ships only the static bootstrap. Reserved concurrency one keeps
+      // the candidate from consuming production raster concurrency until
+      // `componentRasterBackend = 'rust'` switches the Distributed Map over.
+      componentRasterRust: (() => {
+        const rasterRustContext = path.join(__dirname, '..', 'services', 'component-raster-rust');
+        const componentRasterRustName = `aqw-char-${stageName}-componentraster-rust`;
+        const componentRasterRustLogGroup = new logs.LogGroup(this, 'ComponentRasterRustLogGroup', {
+          logGroupName: `/aws/lambda/${componentRasterRustName}`,
+          retention: logs.RetentionDays.ONE_MONTH,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        });
+        const componentRasterRust = new lambda.DockerImageFunction(this, 'ComponentRasterRustFunction', {
+          functionName: componentRasterRustName,
+          architecture: lambda.Architecture.X86_64,
+          code: lambda.DockerImageCode.fromImageAsset(rasterRustContext, {
+            cmd: ['bootstrap'],
+            platform: ecrAssets.Platform.LINUX_AMD64,
+          }),
+          description: `AQW character renderer component raster stage (Rust, resvg in-process)`,
+          environment: {
+            CHAR_RENDER_WORK_BUCKET: workBucket.bucketName,
+          },
+          ephemeralStorageSize: cdk.Size.mebibytes(
+            tuning.functions.componentRaster.ephemeralStorageMiB,
+          ),
+          logGroup: componentRasterRustLogGroup,
+          memorySize: tuning.functions.componentRaster.memoryMiB,
+          reservedConcurrentExecutions:
+            tuning.render.componentRasterBackend === 'rust' ? undefined : 1,
+          timeout: cdk.Duration.seconds(tuning.functions.componentRaster.timeoutSeconds),
+          tracing: lambda.Tracing.ACTIVE,
+        });
+        return componentRasterRust;
+      })(),
       complete: make('Complete', 'aqw_char_renderer.handlers.complete.handler', tuning.functions.complete),
       cleanup: make('Cleanup', 'aqw_char_renderer.handlers.cleanup.handler', tuning.functions.cleanup),
       shutdown: make('Shutdown', 'aqw_char_renderer.handlers.shutdown.handler', tuning.functions.shutdown),
@@ -491,7 +529,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     }).addRetry(lambdaRetry);
 
     // The first Map is the synchronization barrier: frame composition starts
-    // only after every unique component task succeeds.
+    // only after every unique component task succeeds. `componentRasterBackend`
+    // selects the Python resvg-CLI worker or the Rust in-process resvg worker.
     const componentRasterMap = new sfn.DistributedMap(this, 'RasterComponentStates', {
       itemsPath: '$.prepare.component_task_indices',
       maxConcurrency: tuning.render.componentRasterConcurrency,
@@ -503,9 +542,13 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         task_index: sfn.JsonPath.numberAt('$$.Map.Item.Value'),
       },
     });
+    const componentRasterFunction =
+      tuning.render.componentRasterBackend === 'rust'
+        ? functions.componentRasterRust
+        : functions.componentRaster;
     componentRasterMap.itemProcessor(
       new tasks.LambdaInvoke(this, 'RasterComponentState', {
-        lambdaFunction: functions.componentRaster,
+        lambdaFunction: componentRasterFunction,
         payload: sfn.TaskInput.fromObject({
           job_id: sfn.JsonPath.stringAt('$.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
@@ -643,6 +686,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     workBucket.grantReadWrite(functions.render);
     workBucket.grantReadWrite(functions.finalizer);
     workBucket.grantReadWrite(functions.componentRaster);
+    workBucket.grantReadWrite(functions.componentRasterRust);
     workBucket.grantReadWrite(functions.componentCompose);
     // Least-privilege S3 policy for the isolated Rust candidate. No source
     // bucket, table, or queue access: it only reads the prepare manifest and
@@ -709,6 +753,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         functions.render.functionName,
         functions.finalizer.functionName,
         functions.componentRaster.functionName,
+        functions.componentRasterRust.functionName,
         functions.componentCompose.functionName,
         functions.componentComposeRust.functionName,
       ]),

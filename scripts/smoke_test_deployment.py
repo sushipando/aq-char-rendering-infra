@@ -244,7 +244,7 @@ def main() -> int:
     if not terminal.get("result_enqueued_at"):
         raise RuntimeError("Job completed without recording result-queue publication")
     if payload.get("status") != "SUCCEEDED":
-        raise RuntimeError(f"Render failed: {json.dumps(payload, sort_keys=True)}")
+        raise RuntimeError(f"Render failed: {json.dumps(payload, sort_keys=True, default=str)}")
     result = payload.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("url"), str):
         raise TypeError(f"Malformed success result: {json.dumps(payload, sort_keys=True)}")

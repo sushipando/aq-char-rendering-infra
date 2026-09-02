@@ -25,6 +25,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     componentRasterEnabled: true,
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
+    componentRasterBackend: 'rust',
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
     componentComposeBackend: 'rust',
@@ -52,7 +53,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 4);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 10);
+  template.resourceCountIs('AWS::Lambda::Function', 11);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
@@ -63,8 +64,8 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
   const template = synthesize();
   const stateMachines = template.findResources('AWS::StepFunctions::StateMachine');
   const stateMachine = Object.values(stateMachines)[0];
-  const definitionParts = stateMachine.Properties.DefinitionString['Fn::Join'][1] as unknown[];
-  const definition = definitionParts
+  const parts = stateMachine.Properties.DefinitionString['Fn::Join'][1] as unknown[];
+  const definition = parts
     .filter((part): part is string => typeof part === 'string')
     .join('');
 
@@ -75,6 +76,17 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
     '"ProcessorConfig":{"Mode":"DISTRIBUTED","ExecutionType":"EXPRESS"}',
   );
   expect(definition).toContain('"MaxConcurrency":200');
+  // Function references are objects inside the Fn::Join array. Dev backend is
+  // Python until the Rust candidate is validated, so the Distributed Map
+  // references the existing component-raster function only.
+  const referencedFunctions = parts
+    .filter((part): part is { 'Fn::GetAtt': string[] } =>
+      typeof part === 'object' && part !== null && 'Fn::GetAtt' in part,
+    )
+    .map((part) => part['Fn::GetAtt'][0]);
+  // The Rust resvg-library raster worker is the live backend.
+  expect(referencedFunctions.some((id) => id.startsWith('ComponentRasterRustFunction'))).toBe(true);
+  expect(referencedFunctions.some((id) => id.startsWith('ComponentRasterFunction'))).toBe(false);
 
   template.hasResourceProperties('AWS::IAM::Policy', {
     PolicyDocument: {
@@ -90,6 +102,23 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
       ]),
     },
   });
+});
+
+test('the Rust component-raster worker is the live backend with 3008 MiB and no reserve cap', () => {
+  const template = synthesize();
+  template.resourceCountIs('AWS::Lambda::Function', 11);
+  template.hasResourceProperties('AWS::Lambda::Function', {
+    FunctionName: 'aqw-char-dev-componentraster-rust',
+    MemorySize: 3008,
+    Timeout: 900,
+  });
+  // The active backend shares the account concurrency pool (no reserved cap).
+  const functions = template.findResources('AWS::Lambda::Function');
+  const rust = Object.values(functions).find((resource: any) =>
+    resource.Properties.FunctionName === 'aqw-char-dev-componentraster-rust',
+  );
+  expect(rust).toBeDefined();
+  expect(rust!.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
 });
 
 test('component composition uses Rust with 20-way per-job Map concurrency', () => {
@@ -132,6 +161,8 @@ test('dev Lambda sizing stays within the new-account limits', () => {
   const functions = template.findResources('AWS::Lambda::Function');
   for (const resource of Object.values(functions)) {
     expect(resource.Properties.MemorySize).toBeLessThanOrEqual(3008);
+    // Both Rust backends are live and share the dev account's raised
+    // concurrency pool with the rest of the pipeline (no per-function caps).
     expect(resource.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
   }
 });

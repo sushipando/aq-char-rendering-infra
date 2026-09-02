@@ -605,3 +605,53 @@ The Rust backend was deployed on 2026-09-02 after direct cold/warm parity
 benchmarks. An eight-frame, 256px Alina smoke job then completed through the
 full SQS and Step Functions workflow with byte-valid output from the Rust
 composer.
+
+## Future Rust component-raster worker — implemented (2026-09)
+
+`services/component-raster-rust` replaces `RasterComponentState` with a native
+Rust Lambda that links resvg/usvg 0.48.1 in-process (no resvg CLI, no Python,
+no Pillow, no FFDec in the image):
+
+- **SVG pipeline port** — `svg.rs` (namespace-preserving mutable DOM parsed
+  via roxmltree), `import.rs` (`import_ffdec_symbol`: zoom wrapper removal,
+  tint color rules, authored placement CXFORM feColorMatrix filters,
+  minimum-stroke preparation, font-zoom normalization, `part_`/`placed_`
+  reference rewriting), `component_svg.rs` (tight-page build, tint/darken
+  filters, viewport-scale stroke calibration).
+- **Rendering** — `raster.rs` renders with `usvg::Tree::from_data` +
+  `resvg::render` into `tiny_skia::Pixmap` and demultiplies exactly like the
+  CLI's PNG writer, then alpha-bboxes and crops.
+- **Downsampling** — `resample.rs` ports Pillow's `Resample.c` Lanczos
+  (float kernel, 2^22 fixed-point coefficients, 2^21 rounding bias,
+  horizontal-then-vertical passes) plus the `RGBa` premultiply
+  (`MULDIV255`) and unpremultiply (`CLIP8((255*c)/a)`) round trips, because
+  fast_image_resize's integer path can differ by 1/255 at AA edges and flip
+  the recorded output bbox by a row. `fast_image_resize` remains available
+  via `AQW_DOWNSAMPLER=fast_image_resize` for benchmarks.
+- **Parity** — `scripts/rust_raster_parity.py` seeds two filesystem stores
+  (manifest + FFDec bundle) and runs the Python worker (resvg 0.48.1 CLI +
+  Pillow) against the Rust `local-raster` worker, comparing result records
+  and decoded PNG pixels. Synthetic zoom-2 jobs (tint rules, CXFORMs, stroke
+  calibration, gradients, font groups; 2x and 1x downsampling; odd
+  dimensions) plus the real FFDec pet export all pass with
+  **exact RGBA equality** (0 pixel diffs, identical x/y/width/height).
+- **Worker** — `worker.rs` mirrors `rasterize_component_state`: manifest +
+  task validation, tar.gz member extraction, deterministic S3 keys, the full
+  result record, `component_raster_profile`/`component_raster_complete` logs,
+  and explicit failures (missing task, unknown part, missing member, bad
+  zoom wrapper). `benchmark_output_prefix` keeps candidate invocations off
+  production keys.
+- **AWS build** — Dockerfile builds in `provided:al2023` with
+  `RUSTFLAGS="-C target-cpu=x86-64-v2"` (etc.) and ships only the static
+  `/var/runtime/bootstrap` (resvg is linked in; no cwebp needed).
+- **CDK** — `componentRasterBackend: 'python' | 'rust'` mirrors the compose
+  rollout: `aqw-char-dev-componentraster-rust` stays isolated at reserved
+  concurrency 1 with work-bucket-only IAM until the switch is flipped; the
+  Distributed Map then references the Rust worker. 11 Lambda functions total;
+  `npm run build`/`test`/`synth` pass.
+
+Remaining (deployment-time): re-login AWS SSO, review `npm run diff`, deploy,
+run the direct raster invocation comparisons (Python vs Rust task sets) on a
+saved job artifact set, then flip `componentRasterBackend: 'rust'` and run
+the controlled one-concurrency end-to-end jobs from the compose rollout
+sequence.

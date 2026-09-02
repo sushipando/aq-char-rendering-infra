@@ -28,3 +28,4 @@ tmp/
 
 # Rust component-compose worker
 services/component-compose-rust/target/
+services/component-raster-rust/target/

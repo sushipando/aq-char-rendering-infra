@@ -176,9 +176,30 @@ aws://538522204887/us-west-2
 bin/                  CDK application entry point
 lib/                  stacks, constructs, and environment configuration
 services/renderer/    Python rendering and Lambda/container code
+services/component-compose-rust/  Rust component-compose Lambda (in production)
+services/component-raster-rust/   Rust component-raster Lambda candidate (resvg in-process)
 test/                 CDK unit tests
 docs/                 architecture and operating documentation
 ```
+
+### Rust component workers
+
+The component pipeline now runs two native Rust Lambdas alongside the Python
+renderer (see `docs/rust-component-compose-plan.md`):
+
+- `component-compose-rust` — composed components are decoded once, blended
+  with a Pillow-exact integer compositor, and encoded with the pinned cwebp;
+  selected through `componentComposeBackend`.
+- `component-raster-rust` — rasterizes each component with resvg/usvg linked
+  as a library and downsamples with a Pillow-exact Lanczos resampler
+  (fast_image_resize remains available via `AQW_DOWNSAMPLER`); selected
+  through `componentRasterBackend` (default `python` until deployed parity is
+  confirmed).
+
+Both use the same `provided:al2023` Dockerfile build with
+`RUSTFLAGS="-C target-cpu=x86-64-v2"` and pass the local parity harnesses
+(`scripts/rust_compose_parity.py`, `scripts/rust_raster_parity.py`) with
+pixel-exact RGBA against the Python workers.
 
 No AWS credentials, SSO cache files, downloaded SWFs, render frames, or final
 animations belong in Git.
