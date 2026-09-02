@@ -224,11 +224,11 @@ PrepareResolve
   -> FinalizeAnimation
 ```
 
-The component Map should expose a tuning value such as
-`componentRasterConcurrency`. If there are 100 component tasks and the value
-is 40, Step Functions runs up to 40 iterations at a time and completes the
-tasks in three waves. Forty is the Inline Map ceiling; higher concurrency
-requires changing this stage to a Distributed Map.
+The component Map exposes `componentRasterConcurrency`. It is a Distributed
+Map whose iterations are Express child workflows, so values above the Inline
+Map ceiling of 40 are effective. With the development value of 200, up to 200
+unique component states can rasterize in one wave. Lambda regional concurrency
+is still the account-wide safety ceiling.
 The component Lambda's reserved concurrency can provide a matching hard cap.
 
 Each iteration needs normal Lambda service/throttle retries. A failed
@@ -246,7 +246,7 @@ Add explicit development tuning for the experiment:
 
 ```text
 componentRasterEnabled = true
-componentRasterConcurrency = 40
+componentRasterConcurrency = 200
 componentRasterFrameCap = 120
 componentComposeFramesPerLambda = 10
 componentComposeConcurrency = 20
@@ -270,6 +270,31 @@ and after the tuning-only deployment:
 
 The raster Map was 3.1x faster. The complete workflow was 2.3x faster, though
 non-raster stages also had normal cold-start and service-latency variance.
+
+### Inline 40 -> Distributed 200 deployment benchmark (2026-09-02)
+
+The 30-frame, 256px Alina request still produced 134 component tasks and the
+same 338,472-byte animation after changing `RasterComponentStates` to a
+Distributed Map with Express children:
+
+- Inline concurrency 40: the raster Map took 3.852 seconds. Component Lambda
+  completions spanned 2.596 seconds as the work ran in four waves.
+- Distributed concurrency 200, warm run: the raster Map took 6.960 seconds.
+  All 134 children succeeded with no redrives, and component Lambda completions
+  spanned only 0.254 seconds.
+
+The higher concurrency dispatched the raster work as intended, but AWS spent
+about 5.7 seconds after the final Lambda completion closing and aggregating the
+Map Run. Consequently, Distributed Map is slower for this small-raster case
+despite much tighter compute fan-out. The warm complete workflow took 13.722
+seconds, but that is not an isolated raster comparison because the other stages
+also varied.
+
+A 30-frame Alina validation at the default 2048px output also succeeded with
+134/134 child executions and no redrives. `RasterComponentStates` took 6.840
+seconds; individual raster calls had a 1.119-second median and their completion
+times spanned 3.003 seconds. The complete workflow took 23.215 seconds and
+produced the expected 4,168,612-byte animation.
 
 ## Measurements
 

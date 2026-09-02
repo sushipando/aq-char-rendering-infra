@@ -23,7 +23,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     webpQuality: 85,
     allowOfficialAssetFallback: true,
     componentRasterEnabled: true,
-    componentRasterConcurrency: 40,
+    componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
@@ -56,6 +56,39 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
   template.resourceCountIs('AWS::Budgets::Budget', 1);
+});
+
+test('component rasterization uses a 200-way distributed Express Map', () => {
+  const template = synthesize();
+  const stateMachines = template.findResources('AWS::StepFunctions::StateMachine');
+  const stateMachine = Object.values(stateMachines)[0];
+  const definitionParts = stateMachine.Properties.DefinitionString['Fn::Join'][1] as unknown[];
+  const definition = definitionParts
+    .filter((part): part is string => typeof part === 'string')
+    .join('');
+
+  expect(definition).toContain(
+    '"RasterComponentStates":{"Type":"Map","ResultPath":"$.component_results"',
+  );
+  expect(definition).toContain(
+    '"ProcessorConfig":{"Mode":"DISTRIBUTED","ExecutionType":"EXPRESS"}',
+  );
+  expect(definition).toContain('"MaxConcurrency":200');
+
+  template.hasResourceProperties('AWS::IAM::Policy', {
+    PolicyDocument: {
+      Statement: Match.arrayWith([
+        Match.objectLike({
+          Action: 'states:StartExecution',
+          Effect: 'Allow',
+        }),
+        Match.objectLike({
+          Action: Match.arrayWith(['states:DescribeExecution', 'states:StopExecution']),
+          Effect: 'Allow',
+        }),
+      ]),
+    },
+  });
 });
 
 test('Lambda request defaults come from the centralized environment tuning', () => {

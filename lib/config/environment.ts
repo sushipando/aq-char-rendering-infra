@@ -183,10 +183,10 @@ const DEV_TUNING: InfrastructureTuning = {
     // `componentRasterFrameCap` frames in a second concurrency-capped Map.
     // See docs/component-raster-pipeline.md.
     componentRasterEnabled: true,
-    // This is an Inline Step Functions Map, whose effective concurrency ceiling
-    // is 40. Use the full ceiling so large unique-state sets rasterize in as few
-    // waves as possible; moving beyond 40 requires a Distributed Map.
-    componentRasterConcurrency: 40,
+    // Run one Express child workflow per unique component state. The
+    // Distributed Map can dispatch up to 200 component raster Lambdas at once;
+    // Lambda's regional concurrency remains the account-wide safety ceiling.
+    componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
     // Twelve 10-frame workers cover the current 120-frame maximum in one Map
     // wave while amortizing component downloads and Lambda cold starts.

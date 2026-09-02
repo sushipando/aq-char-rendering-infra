@@ -456,9 +456,10 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
 
     // The first Map is the synchronization barrier: frame composition starts
     // only after every unique component task succeeds.
-    const componentRasterMap = new sfn.Map(this, 'RasterComponentStates', {
+    const componentRasterMap = new sfn.DistributedMap(this, 'RasterComponentStates', {
       itemsPath: '$.prepare.component_task_indices',
       maxConcurrency: tuning.render.componentRasterConcurrency,
+      mapExecutionType: sfn.StateMachineType.EXPRESS,
       resultPath: '$.component_results',
       itemSelector: {
         job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
