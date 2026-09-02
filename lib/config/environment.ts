@@ -26,6 +26,12 @@ export interface RenderTuning {
   readonly officialAssetTimeoutSeconds: number;
   readonly maxActivePerUser: number;
   readonly renderCacheEnabled: boolean;
+  readonly componentRasterEnabled: boolean;
+  readonly componentRasterConcurrency: number;
+  readonly componentRasterFrameCap: number;
+  readonly componentComposeFramesPerLambda: number;
+  readonly componentComposeConcurrency: number;
+  readonly componentCompositor: 'pillow' | 'pyvips';
 }
 
 export interface RetentionTuning {
@@ -46,6 +52,8 @@ export interface InfrastructureTuning {
     prepare: FunctionTuning;
     render: FunctionTuning;
     finalizer: FunctionTuning;
+    componentRaster: FunctionTuning;
+    componentCompose: FunctionTuning;
     complete: FunctionTuning;
     cleanup: FunctionTuning;
     shutdown: FunctionTuning;
@@ -83,12 +91,23 @@ const DEV_TUNING: InfrastructureTuning = {
     prepare: mib(3008, 4096, 300),
     render: mib(3008, 4096, 900),
     finalizer: mib(3008, 4096, 300),
+    // Component workers rasterize one unique placed state each (tight page at
+    // the shared pixel scale); a 4096-raster benchmark needs the render-class
+    // memory/time profile.
+    componentRaster: mib(3008, 4096, 900),
+    // Each invocation composes output-size components, encodes, and uploads
+    // one bounded frame chunk. The finalizer downloads and muxes the chunks.
+    componentCompose: mib(3008, 4096, 300),
     complete: mib(512, 512, 60),
     cleanup: mib(512, 512, 60),
     shutdown: mib(512, 512, 300),
   },
   render: {
     schemaVersion: 1,
+    // v19: downsample each completed 2x component raster once, on the exact
+    // final pixel grid, before output-size frame composition.
+    // v18: apply scripted color filters directly to their SVG graphics
+    // elements so multiply-blended hair shading is not isolated and flattened.
     // v17: separate high-resolution rasterization from delivered image size;
     // optional premultiplied-alpha Lanczos downsampling happens before WebP.
     // v16: render workers upload individual WebP frames and the finalizer
@@ -116,7 +135,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v17',
+    rendererVersion: 'v19',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     // Raster at full resolution, then optionally downsample once before WebP
@@ -159,6 +178,21 @@ const DEV_TUNING: InfrastructureTuning = {
     // benchmarks always exercise the real pipeline. Enable in prod for
     // cost/latency deduplication of identical requests.
     renderCacheEnabled: false,
+    // Rasterize every unique placed component state once at the requested 2x
+    // raster size, downsample it to the output grid, then compose at most
+    // `componentRasterFrameCap` frames in a second concurrency-capped Map.
+    // See docs/component-raster-pipeline.md.
+    componentRasterEnabled: true,
+    // This is an Inline Step Functions Map, whose effective concurrency ceiling
+    // is 40. Use the full ceiling so large unique-state sets rasterize in as few
+    // waves as possible; moving beyond 40 requires a Distributed Map.
+    componentRasterConcurrency: 40,
+    componentRasterFrameCap: 120,
+    // Twelve 10-frame workers cover the current 120-frame maximum in one Map
+    // wave while amortizing component downloads and Lambda cold starts.
+    componentComposeFramesPerLambda: 10,
+    componentComposeConcurrency: 20,
+    componentCompositor: 'pillow',
   },
   retention: {
     workDays: 2,

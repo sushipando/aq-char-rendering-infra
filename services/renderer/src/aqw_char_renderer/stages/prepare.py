@@ -607,8 +607,7 @@ def _load_vector_cache(
             raw_symbol.get("class_name") != request.class_name
             or raw_symbol.get("character_id") != request.character_id
             or raw_symbol.get("root_frame") != request.frame
-            or raw_symbol.get("root_timeline_frames", 1)
-            != request.root_timeline_frames
+            or raw_symbol.get("root_timeline_frames", 1) != request.root_timeline_frames
         ):
             raise character_svg.CharacterSvgError(
                 f"Vector cache symbol metadata does not match {request.class_name}"
@@ -751,6 +750,130 @@ def _build_vector_cache(
         for source, cached_path in state_files:
             archive.add(source, arcname=cached_path)
     return archive_path, signatures, bounds
+
+
+def build_component_manifest(
+    *,
+    job_id: str,
+    layers: Sequence[character_svg.Layer],
+    symbol_signatures: Mapping[str, Sequence[str]],
+    part_manifest: Mapping[str, Any],
+    frame_count: int,
+    frame_durations: Sequence[int],
+    facing: str,
+    weapon_type: str,
+    viewbox: tuple[float, float, float, float],
+    raster_size: int,
+    output_size: int,
+    fields: Mapping[str, str],
+    static_keys: Sequence[str],
+    ground_animate: Mapping[str, int],
+    detected_blink_frames: int | None,
+    ignored_loop_keys: Sequence[str],
+    source_bundle_frame_count: int,
+    renderer_version: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build the unique placed-component raster tasks and per-frame layer IDs.
+
+    One task covers one unique **placed component state**: a raw SVG state
+    (identified by its content hash) plus one exact layer placement (name,
+    complete characterB matrix, darkening) and the job's shared viewbox/pixel
+    scale, user colors, weapon/facing behavior, and renderer version. Byte-
+    identical states reused across frames share one task. Task IDs are
+    deterministic, so retries and re-runs are idempotent.
+
+    Returns ``(tasks, frames)`` where ``frames`` lists every output frame with
+    its task IDs in exact back-to-front layer order.
+    """
+    direction = 1.0 if facing == "right" else -1.0
+    outer = (
+        direction * character_svg.CHARACTER_DISPLAY_SCALE,
+        0.0,
+        0.0,
+        character_svg.CHARACTER_DISPLAY_SCALE,
+        0.0,
+        0.0,
+    )
+    static_set = set(static_keys)
+    ignored_set = set(ignored_loop_keys)
+    colors = {key: value for key, value in sorted(fields.items()) if key.startswith("intColor")}
+    tasks_by_id: dict[str, dict[str, Any]] = {}
+    frames: list[dict[str, Any]] = []
+    for frame_number in range(1, frame_count + 1):
+        layer_ids: list[str] = []
+        for layer_index, layer in enumerate(layers):
+            key = layer.symbol_key
+            signatures = symbol_signatures.get(key)
+            part = part_manifest.get(key)
+            if signatures is None or part is None:
+                continue
+            source_idx = int(part["source_idx"])
+            span = ground_animate.get(key, 0)
+            if span >= 2:
+                # Random-pose ground cosmetics bob inside their leading pose
+                # span; ping-pong it (mirrors the render stage).
+                source_frame = character_svg.pingpong_source_frame_index(
+                    frame_number - 1,
+                    span=span,
+                )
+            elif key in static_set:
+                source_frame = 1
+            elif detected_blink_frames and key in ignored_set and detected_blink_frames > 0:
+                zero_based = character_svg.one_shot_source_frame_index(
+                    frame_number - 1,
+                    one_shot_frames=detected_blink_frames,
+                )
+                source_frame = zero_based + 1
+            else:
+                source_frame = frame_number
+            if source_frame < 1 or source_frame > len(signatures):
+                continue
+            state_signature = signatures[source_frame - 1]
+            matrix = item_renderer.compose_transforms(outer, layer.transform)
+            identity = canonical_sha256(
+                {
+                    "renderer_version": renderer_version,
+                    "raster_size": raster_size,
+                    "output_size": output_size,
+                    "viewbox": [float(value) for value in viewbox],
+                    "facing": facing,
+                    "weapon_type": weapon_type,
+                    "colors": colors,
+                    "symbol_key": key,
+                    "layer_name": layer.name,
+                    "layer_index": layer_index,
+                    "matrix": list(matrix),
+                    "darken": bool(layer.darken),
+                    "state_signature": state_signature,
+                    "part": canonical_sha256(part),
+                }
+            )
+            existing = tasks_by_id.get(identity)
+            if existing is None:
+                ordinal = (source_frame - 1) // source_bundle_frame_count
+                tasks_by_id[identity] = {
+                    "task_id": identity,
+                    "symbol_key": key,
+                    "layer_name": layer.name,
+                    "layer_index": layer_index,
+                    "matrix": [float(value) for value in matrix],
+                    "darken": bool(layer.darken),
+                    "bundle_key": (
+                        f"jobs/{job_id}/prepare/source-bundles/{source_idx}.{ordinal}.tar.gz"
+                    ),
+                    "member": f"{key}/{source_frame:06d}.svg",
+                    "source_frame": source_frame,
+                    "state_signature": state_signature,
+                }
+            layer_ids.append(identity)
+        frames.append(
+            {
+                "number": frame_number,
+                "duration_ms": int(frame_durations[frame_number - 1]),
+                "layers": layer_ids,
+            }
+        )
+    return list(tasks_by_id.values()), frames
 
 
 def prepare_resolve(
@@ -1282,9 +1405,7 @@ def prepare_export_source(
             frames = exported.get(symbol.key) or []
             if not frames:
                 continue
-            settled = character_svg.settled_timeline(
-                symbol, frames[0], terminal_stops
-            )
+            settled = character_svg.settled_timeline(symbol, frames[0], terminal_stops)
             if settled is not None:
                 settled_timelines[symbol.key] = settled
         if settled_timelines:
@@ -1360,9 +1481,7 @@ def prepare_export_source(
         for symbol in sorted(requests, key=lambda item: item.key):
             frames = exported[symbol.key]
             effective_symbol = (
-                settled_timelines[symbol.key].request
-                if symbol.key in settled_timelines
-                else symbol
+                settled_timelines[symbol.key].request if symbol.key in settled_timelines else symbol
             )
             meta_key = f"jobs/{job_id}/prepare/meta/{symbol.key}.json"
             # Ground/misc cosmetics (and pets) may be authored as random poses
@@ -1545,17 +1664,13 @@ def prepare_finish(
                 mirror_flip_frames[part["key"]] = int(meta.get("mirror_flip_frame") or 0)
                 random_pose_as3[part["key"]] = bool(meta.get("random_pose_as3") or False)
                 animated_span = meta.get("animated_span")
-                ground_animate[part["key"]] = (
-                    int(animated_span) if animated_span is not None else 0
-                )
+                ground_animate[part["key"]] = int(animated_span) if animated_span is not None else 0
                 part_record = {
                     "source_idx": int(result["source_idx"]),
                     "root_class": part["root_class"],
                     "character_id": part["character_id"],
                     "frame_count": part["frame_count"],
-                    "root_timeline_frames": int(
-                        part.get("root_timeline_frames", 1)
-                    ),
+                    "root_timeline_frames": int(part.get("root_timeline_frames", 1)),
                     "color_rules": {key: list(value) for key, value in sorted(rules.items())},
                     "placement_colors": {
                         f"{parent_id},{child_id}": {
@@ -1632,9 +1747,7 @@ def prepare_finish(
             static_keys = tuple(dict.fromkeys(static_keys + precomputed_static))
             precomputed_animate = precomputed.get("ground_animate") or {}
             ground_animate = {
-                key: int(span)
-                for key, span in precomputed_animate.items()
-                if int(span) >= 2
+                key: int(span) for key, span in precomputed_animate.items() if int(span) >= 2
             }
             detected_loop = (
                 character_svg.aligned_animation_frame_count(
@@ -1646,9 +1759,7 @@ def prepare_finish(
             ignored_loop_keys = ("armor_head",)
         elif request.render.complete_loop:
             loop_sigs, ignored_loop_keys = character_svg.loop_driver_from_signatures(detection_sigs)
-            loop_sigs = {
-                key: sigs for key, sigs in loop_sigs.items() if key not in static_keys
-            }
+            loop_sigs = {key: sigs for key, sigs in loop_sigs.items() if key not in static_keys}
             detected_item_loop = character_svg.detect_loop_from_signatures(
                 loop_sigs, max_frames=request.render.max_frames
             )
@@ -1681,6 +1792,21 @@ def prepare_finish(
         mark("loop_detection_ms", phase)
 
         phase = time.perf_counter()
+        component_mode = bool(config.component_raster_enabled)
+        if component_mode:
+            # Component-raster safety cap (docs/component-raster-pipeline.md):
+            # rasterize each unique placed component state once, then compose
+            # at most this many output frames across parallel frame chunks.
+            capped_frame_count = min(frame_count, config.component_raster_frame_cap)
+            if capped_frame_count < frame_count:
+                warnings.append(
+                    f"The component-raster experiment caps this job at "
+                    f"{config.component_raster_frame_cap} output frame(s)"
+                )
+            frame_count = capped_frame_count
+        mark("component_cap_ms", phase)
+
+        phase = time.perf_counter()
         layers = character_svg.build_layers(
             prepared["aliases"], weapon_type=prepared["weapon_type"]
         )
@@ -1703,10 +1829,51 @@ def prepare_finish(
             expected_sha256=prepared["character_renderer"]["sha256"],
         )
         frame_rate = character_svg.swf_frame_rate(character_renderer)
+        frame_durations = character_svg.frame_durations_for_rate(frame_count, frame_rate)
         batches = [
             batch.to_dict()
             for batch in partition_frames(frame_count, config.frames_per_render_lambda)
         ]
+        component_batches = [
+            batch.to_dict()
+            for batch in partition_frames(
+                frame_count,
+                config.component_compose_frames_per_lambda,
+            )
+        ]
+        component_tasks: list[dict[str, Any]] = []
+        component_frames: list[dict[str, Any]] = []
+        if component_mode:
+            phase = time.perf_counter()
+            component_tasks, component_frames = build_component_manifest(
+                job_id=request.job_id,
+                layers=layers,
+                symbol_signatures=symbol_signatures,
+                part_manifest=part_manifest,
+                frame_count=frame_count,
+                frame_durations=frame_durations,
+                facing=request.render.facing,
+                weapon_type=prepared["weapon_type"],
+                viewbox=viewbox,
+                raster_size=int(prepared["settings"]["raster_size"]),
+                output_size=int(prepared["settings"]["output_size"]),
+                fields=prepared["fields"],
+                static_keys=static_keys,
+                ground_animate=ground_animate,
+                detected_blink_frames=detected_blink_frames,
+                ignored_loop_keys=ignored_loop_keys,
+                source_bundle_frame_count=config.source_bundle_frame_count,
+                renderer_version=config.renderer_version,
+            )
+            mark("component_manifest_ms", phase)
+        component_raster_space: str | None = None
+        if component_mode:
+            raster_size = int(prepared["settings"]["raster_size"])
+            output_size = int(prepared["settings"]["output_size"])
+            # Pillow's reducing-gap prepass changes sampling behavior above a
+            # 2x shrink. Keep the legacy full-frame path for uncommon larger
+            # ratios; every exposed Discord output preset currently uses 2x.
+            component_raster_space = "output" if raster_size <= output_size * 2 else "raster"
         manifest_key = f"jobs/{request.job_id}/prepare/manifest.json"
         manifest = {
             "schema_version": 1,
@@ -1716,7 +1883,7 @@ def prepare_finish(
             "frame_count": frame_count,
             "frame_rate": frame_rate,
             "viewbox": list(viewbox),
-            "frame_durations": character_svg.frame_durations_for_rate(frame_count, frame_rate),
+            "frame_durations": frame_durations,
             "fields": dict(sorted(prepared["fields"].items())),
             "aliases": dict(sorted(prepared["aliases"].items())),
             "weapon_type": prepared["weapon_type"],
@@ -1732,11 +1899,7 @@ def prepare_finish(
                         f"{int(result['source_idx'])}.{ordinal}.tar.gz"
                     )
                     for ordinal in range(
-                        (
-                            int(prepared["export_frame_count"])
-                            + config.source_bundle_frame_count
-                            - 1
-                        )
+                        (int(prepared["export_frame_count"]) + config.source_bundle_frame_count - 1)
                         // config.source_bundle_frame_count
                     )
                 }
@@ -1745,6 +1908,15 @@ def prepare_finish(
             "all_color_rules": sorted(all_color_rules),
             "settings": request.render.to_dict(),
             "batches": batches,
+            "component_batches": component_batches,
+            "component_pipeline": component_mode,
+            # New jobs downsample each already-rasterized 2x component onto
+            # the final output pixel grid before the compose Map. Compositors
+            # retain a raster-grid fallback for manifests created by an older
+            # deployment during a rolling update.
+            "component_raster_space": component_raster_space,
+            "component_tasks": component_tasks,
+            "component_frames": component_frames,
             "warnings": warnings,
             "detected_loop": detected_loop,
             "detected_blink_frames": detected_blink_frames,
@@ -1803,5 +1975,11 @@ def prepare_finish(
             "final_key": prepared["final_key"],
             "manifest_key": manifest_key,
             "batches": batches,
+            "component_batches": component_batches,
+            "component_pipeline": component_mode,
+            # The full task records live in the S3 manifest. The workflow Map
+            # only needs compact indexes because each component Lambda already
+            # reads that manifest before rasterizing its selected task.
+            "component_task_indices": list(range(len(component_tasks))),
             "frame_count": frame_count,
         }

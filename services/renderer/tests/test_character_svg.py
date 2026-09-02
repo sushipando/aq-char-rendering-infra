@@ -1141,6 +1141,22 @@ class RenderSwfCharacterSvgTests(unittest.TestCase):
         self.assertEqual(character_svg.tint_rgb(0x123456, "Dark"), (0, 2, 36))
         self.assertEqual(character_svg.tint_rgb(0x123456, "Darker"), (0, 0, 0))
 
+    def test_tint_filter_does_not_isolate_multiply_blend_layer(self):
+        root = ET.fromstring(
+            '<g xmlns="http://www.w3.org/2000/svg" '
+            'xmlns:ffdec="https://www.free-decompiler.com/flash">'
+            '<use ffdec:characterName="HairColor" '
+            'style="mix-blend-mode: multiply" href="#color"/>'
+            '</g>'
+        )
+
+        character_svg._apply_color_rules(root, {"haircolor": ("Hair", "None")})
+
+        tinted = next(iter(root))
+        self.assertEqual(tinted.tag.rsplit("}", 1)[-1], "use")
+        self.assertEqual(tinted.get("filter"), "url(#aqw_tint_hair_none)")
+        self.assertEqual(tinted.get("style"), "mix-blend-mode: multiply")
+
     def test_filters_use_exact_character_hair_eye_and_skin_colors(self):
         defs = ET.Element(f"{{{character_svg.SVG_NS}}}defs")
         warnings = character_svg.add_color_filters(

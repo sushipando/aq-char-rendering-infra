@@ -83,6 +83,14 @@ class RuntimeConfig:
     # check so every job re-renders. Dev disables this to exercise the real
     # pipeline; prod enables it for cost/latency deduplication.
     render_cache_enabled: bool = True
+    # Component-raster pipeline (see docs/component-raster-pipeline.md). When
+    # enabled, PrepareFinish caps the output, builds unique placed-component
+    # raster tasks, and partitions final composition into bounded frame chunks.
+    component_raster_enabled: bool = False
+    component_raster_concurrency: int = 5
+    component_raster_frame_cap: int = 25
+    component_compose_frames_per_lambda: int = 10
+    component_compositor: str = "pillow"
     ffdec_path: Path = Path("/opt/ffdec/ffdec-cli.jar")
     rsvg_convert: str = "/usr/bin/rsvg-convert"
     cwebp: str = "/usr/bin/cwebp"
@@ -162,6 +170,25 @@ class RuntimeConfig:
                 values, "CHAR_RENDER_OFFICIAL_ASSET_TIMEOUT_SECONDS", 15, 1, 60
             ),
             render_cache_enabled=_boolean(values, "CHAR_RENDER_CACHE_ENABLED", True),
+            component_raster_enabled=_boolean(
+                values, "CHAR_RENDER_COMPONENT_RASTER_ENABLED", False
+            ),
+            component_raster_concurrency=_integer(
+                values, "CHAR_RENDER_COMPONENT_RASTER_CONCURRENCY", 5, 1, 300
+            ),
+            component_raster_frame_cap=_integer(
+                values, "CHAR_RENDER_COMPONENT_RASTER_FRAME_CAP", 25, 1, 2000
+            ),
+            component_compose_frames_per_lambda=_integer(
+                values,
+                "CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA",
+                10,
+                1,
+                60,
+            ),
+            component_compositor=values.get(
+                "CHAR_RENDER_COMPONENT_COMPOSITOR", "pillow"
+            ).strip().casefold(),
             ffdec_path=Path(values.get("CHAR_RENDER_FFDEC_PATH", "/opt/ffdec/ffdec-cli.jar")),
             rsvg_convert=values.get("CHAR_RENDER_RSVG_CONVERT", "/usr/bin/rsvg-convert"),
             cwebp=values.get("CHAR_RENDER_CWEBP", "/usr/bin/cwebp"),
@@ -171,6 +198,10 @@ class RuntimeConfig:
             raise ConfigurationError(
                 "CHAR_RENDER_DEFAULT_OUTPUT_SIZE must not exceed "
                 "CHAR_RENDER_DEFAULT_RASTER_SIZE"
+            )
+        if config.component_compositor not in {"pillow", "pyvips"}:
+            raise ConfigurationError(
+                "CHAR_RENDER_COMPONENT_COMPOSITOR must be pillow or pyvips"
             )
         if config.default_padding * 2 >= config.default_output_size:
             raise ConfigurationError(

@@ -2063,9 +2063,18 @@ def _apply_color_rules(
             rule = rules.get(class_name)
             if rule is None:
                 continue
+            tint_filter = f"url(#{_tint_filter_key(*rule)})"
+            # Keep the tint and mix-blend-mode on the same graphics element.
+            # Wrapping a multiply-blended color layer in a filtered group
+            # isolates it from its preceding authored shade layers, replacing
+            # the complete item with one flat color. Abaddon Locks is authored
+            # this way for both its front and back hair.
+            if child.get("filter") is None:
+                child.set("filter", tint_filter)
+                continue
             wrapper = ET.Element(
                 f"{{{SVG_NS}}}g",
-                {"filter": f"url(#{_tint_filter_key(*rule)})"},
+                {"filter": tint_filter},
             )
             parent.remove(child)
             wrapper.append(child)

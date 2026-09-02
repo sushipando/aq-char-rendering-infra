@@ -30,6 +30,8 @@ interface RendererFunctions {
   readonly prepare: lambda.DockerImageFunction;
   readonly render: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
+  readonly componentRaster: lambda.DockerImageFunction;
+  readonly componentCompose: lambda.DockerImageFunction;
   readonly complete: lambda.DockerImageFunction;
   readonly cleanup: lambda.DockerImageFunction;
   readonly shutdown: lambda.DockerImageFunction;
@@ -295,6 +297,19 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         tuning.render.officialAssetTimeoutSeconds,
       ),
       CHAR_RENDER_CACHE_ENABLED: String(tuning.render.renderCacheEnabled),
+      CHAR_RENDER_COMPONENT_RASTER_ENABLED: String(
+        tuning.render.componentRasterEnabled,
+      ),
+      CHAR_RENDER_COMPONENT_RASTER_CONCURRENCY: String(
+        tuning.render.componentRasterConcurrency,
+      ),
+      CHAR_RENDER_COMPONENT_RASTER_FRAME_CAP: String(
+        tuning.render.componentRasterFrameCap,
+      ),
+      CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: String(
+        tuning.render.componentComposeFramesPerLambda,
+      ),
+      CHAR_RENDER_COMPONENT_COMPOSITOR: tuning.render.componentCompositor,
       CHAR_RENDER_FFDEC_PATH: '/opt/ffdec/ffdec-cli.jar',
       CHAR_RENDER_RSVG_CONVERT: '/opt/resvg/resvg',
       CHAR_RENDER_CWEBP: '/opt/libwebp/bin/cwebp',
@@ -333,6 +348,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       prepare: make('Prepare', 'aqw_char_renderer.handlers.prepare.handler', tuning.functions.prepare),
       render: make('Render', 'aqw_char_renderer.handlers.render.handler', tuning.functions.render),
       finalizer: make('Finalizer', 'aqw_char_renderer.handlers.finalize.handler', tuning.functions.finalizer),
+      componentRaster: make('ComponentRaster', 'aqw_char_renderer.handlers.component_raster.handler', tuning.functions.componentRaster),
+      componentCompose: make('ComponentCompose', 'aqw_char_renderer.handlers.component_compose.handler', tuning.functions.componentCompose),
       complete: make('Complete', 'aqw_char_renderer.handlers.complete.handler', tuning.functions.complete),
       cleanup: make('Cleanup', 'aqw_char_renderer.handlers.cleanup.handler', tuning.functions.cleanup),
       shutdown: make('Shutdown', 'aqw_char_renderer.handlers.shutdown.handler', tuning.functions.shutdown),
@@ -437,6 +454,68 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       payloadResponseOnly: true,
     }).addRetry(lambdaRetry);
 
+    // The first Map is the synchronization barrier: frame composition starts
+    // only after every unique component task succeeds.
+    const componentRasterMap = new sfn.Map(this, 'RasterComponentStates', {
+      itemsPath: '$.prepare.component_task_indices',
+      maxConcurrency: tuning.render.componentRasterConcurrency,
+      resultPath: '$.component_results',
+      itemSelector: {
+        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+        manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
+        task_index: sfn.JsonPath.numberAt('$$.Map.Item.Value'),
+      },
+    });
+    componentRasterMap.itemProcessor(
+      new tasks.LambdaInvoke(this, 'RasterComponentState', {
+        lambdaFunction: functions.componentRaster,
+        payload: sfn.TaskInput.fromObject({
+          job_id: sfn.JsonPath.stringAt('$.job_id'),
+          manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
+          task_index: sfn.JsonPath.numberAt('$.task_index'),
+        }),
+        payloadResponseOnly: true,
+      }).addRetry(lambdaRetry),
+    );
+
+    // Split composition, downsampling, and frame encoding into configurable
+    // chunks. The existing finalizer then concurrently downloads the encoded
+    // frames and performs only the lightweight mux/publish step.
+    const componentComposeMap = new sfn.Map(this, 'ComposeComponentFrameChunks', {
+      itemsPath: '$.prepare.component_batches',
+      maxConcurrency: tuning.render.componentComposeConcurrency,
+      resultPath: '$.render_results',
+      itemSelector: {
+        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+        manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
+        component_results: sfn.JsonPath.listAt('$.component_results'),
+        batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
+      },
+    });
+    componentComposeMap.itemProcessor(
+      new tasks.LambdaInvoke(this, 'ComposeComponentFrameChunk', {
+        lambdaFunction: functions.componentCompose,
+        payload: sfn.TaskInput.fromObject({
+          job_id: sfn.JsonPath.stringAt('$.job_id'),
+          manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
+          component_results: sfn.JsonPath.listAt('$.component_results'),
+          batch: sfn.JsonPath.objectAt('$.batch'),
+        }),
+        payloadResponseOnly: true,
+      }).addRetry(lambdaRetry),
+    );
+
+    const componentRenderMiss = componentRasterMap
+      .next(componentComposeMap)
+      .next(finalize);
+    const legacyRenderMiss = renderMap.next(finalize);
+    const renderBranch = new sfn.Choice(this, 'RenderingPipeline')
+      .when(
+        sfn.Condition.booleanEquals('$.prepare.component_pipeline', true),
+        componentRenderMiss,
+      )
+      .otherwise(legacyRenderMiss);
+
     const completeCached = new tasks.LambdaInvoke(this, 'CompleteCachedJob', {
       lambdaFunction: functions.complete,
       payload: sfn.TaskInput.fromObject({
@@ -447,7 +526,19 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       payloadResponseOnly: true,
     }).addRetry(lambdaRetry);
 
-    const renderMiss = exportMap.next(prepareFinish).next(renderMap).next(finalize);
+    // Export results may contain many per-source records and are no longer
+    // needed after PrepareFinish has persisted the complete manifest. Prune
+    // them before either render Map to stay well below the 256 KiB state cap.
+    const discardExportResults = new sfn.Pass(this, 'DiscardExportResults', {
+      parameters: {
+        request: sfn.JsonPath.objectAt('$.request'),
+        prepare: sfn.JsonPath.objectAt('$.prepare'),
+      },
+    });
+    const renderMiss = exportMap
+      .next(prepareFinish)
+      .next(discardExportResults)
+      .next(renderBranch);
     const cacheChoice = new sfn.Choice(this, 'CachedResultExists')
       .when(sfn.Condition.booleanEquals('$.prepare.cache_hit', true), completeCached)
       .otherwise(renderMiss);
@@ -511,6 +602,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     workBucket.grantReadWrite(functions.prepare);
     workBucket.grantReadWrite(functions.render);
     workBucket.grantReadWrite(functions.finalizer);
+    workBucket.grantReadWrite(functions.componentRaster);
+    workBucket.grantReadWrite(functions.componentCompose);
     for (const fn of [
       functions.prepare,
       functions.finalizer,
@@ -527,6 +620,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       [functions.prepare.functionName]: tuning.functions.prepare.reservedConcurrency,
       [functions.render.functionName]: tuning.functions.render.reservedConcurrency,
       [functions.finalizer.functionName]: tuning.functions.finalizer.reservedConcurrency,
+      [functions.componentRaster.functionName]: tuning.functions.componentRaster.reservedConcurrency,
+      [functions.componentCompose.functionName]: tuning.functions.componentCompose.reservedConcurrency,
     };
     functions.shutdown.addEnvironment('CHAR_RENDER_WORKER_CONCURRENCY', JSON.stringify(concurrency));
   }
@@ -569,6 +664,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         functions.prepare.functionName,
         functions.render.functionName,
         functions.finalizer.functionName,
+        functions.componentRaster.functionName,
+        functions.componentCompose.functionName,
       ]),
     );
     functions.shutdown.addEnvironment(

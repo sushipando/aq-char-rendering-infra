@@ -233,33 +233,35 @@ def main() -> int:
     else:
         raise TimeoutError(f"Timed out waiting for terminal job state for {job_id}")
 
-    payload, receipt_handle = receive_result(
-        sqs, outputs["ResultQueueUrl"], job_id, deadline
-    )
-    try:
-        if payload.get("status") != "SUCCEEDED":
-            raise RuntimeError(f"Render failed: {json.dumps(payload, sort_keys=True)}")
-        result = payload.get("result")
-        if not isinstance(result, dict) or not isinstance(result.get("url"), str):
-            raise TypeError(f"Malformed success result: {json.dumps(payload, sort_keys=True)}")
-        dimensions = (int(result.get("width", 0)), int(result.get("height", 0)))
-        if max(dimensions) != args.output_size:
-            raise RuntimeError(
-                f"Expected {args.output_size}px output, got {dimensions[0]}x{dimensions[1]}"
-            )
-        verified = verify_webp(result["url"], outputs["CloudFrontBaseUrl"])
-        summary = {
-            "event": "verified",
-            "job_id": job_id,
-            "username": request.render.username,
-            **result,
-            **verified,
-        }
-        print(json.dumps(summary, indent=2, sort_keys=True))
-    finally:
-        sqs.delete_message(
-            QueueUrl=outputs["ResultQueueUrl"], ReceiptHandle=receipt_handle
+    # The Discord bot is a competing consumer on the shared result queue, so
+    # a smoke process cannot reliably receive its own message. Completion
+    # atomically persists the exact payload in the job record before enqueueing
+    # it; use that durable copy and verify that queue publication was recorded.
+    terminal = jobs.get(job_id) or {}
+    payload = terminal.get("result_payload")
+    if not isinstance(payload, dict):
+        raise TypeError(f"Job has no persisted result payload: {json.dumps(terminal, default=str)}")
+    if not terminal.get("result_enqueued_at"):
+        raise RuntimeError("Job completed without recording result-queue publication")
+    if payload.get("status") != "SUCCEEDED":
+        raise RuntimeError(f"Render failed: {json.dumps(payload, sort_keys=True)}")
+    result = payload.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("url"), str):
+        raise TypeError(f"Malformed success result: {json.dumps(payload, sort_keys=True)}")
+    dimensions = (int(result.get("width", 0)), int(result.get("height", 0)))
+    if max(dimensions) != args.output_size:
+        raise RuntimeError(
+            f"Expected {args.output_size}px output, got {dimensions[0]}x{dimensions[1]}"
         )
+    verified = verify_webp(result["url"], outputs["CloudFrontBaseUrl"])
+    summary = {
+        "event": "verified",
+        "job_id": job_id,
+        "username": request.render.username,
+        **result,
+        **verified,
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True, default=str))
     return 0
 
 

@@ -10,7 +10,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
   expect(environment.stage).toBe('dev');
   expect(environment.tuning.prepareExportConcurrency).toBe(8);
   expect(environment.tuning.render).toMatchObject({
-    rendererVersion: 'v17',
+    rendererVersion: 'v19',
     rasterSize: 2048,
     outputSize: 2048,
     zoom: 1,
@@ -22,6 +22,12 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     mapConcurrency: 300,
     webpQuality: 85,
     allowOfficialAssetFallback: true,
+    componentRasterEnabled: true,
+    componentRasterConcurrency: 40,
+    componentRasterFrameCap: 120,
+    componentComposeFramesPerLambda: 10,
+    componentComposeConcurrency: 20,
+    componentCompositor: 'pillow',
   });
 });
 
@@ -45,7 +51,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 4);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 7);
+  template.resourceCountIs('AWS::Lambda::Function', 9);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
@@ -67,6 +73,8 @@ test('Lambda request defaults come from the centralized environment tuning', () 
         CHAR_RENDER_FRAMES_PER_LAMBDA: '1',
         CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT: '4',
         CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY: '32',
+        CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: '10',
+        CHAR_RENDER_COMPONENT_COMPOSITOR: 'pillow',
         CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK: 'true',
       }),
     },
