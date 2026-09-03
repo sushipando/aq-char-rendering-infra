@@ -654,36 +654,34 @@ fn apply_blur(
             None => return Ok(input),
         };
 
+    // Take the premultiplied pixmap once (regardless of backend) so a libblur
+    // memory failure can fall back to the original blur without re-consuming
+    // `input`.
+    let mut pixmap = input.into_color_space(cs)?.take()?;
+
     // Optional SIMD Gaussian via libblur (feature "simd-blur"); runtime
     // switch RESVG_BLUR_BACKEND=libblur|original, default libblur.
+    // libblur copies the whole (possibly huge) premultiplied region into two
+    // full-size buffers; if that allocation would exhaust Lambda memory we
+    // fall back to resvg's original in-place blur instead of aborting.
     #[cfg(feature = "simd-blur")]
     {
         let backend = std::env::var("RESVG_BLUR_BACKEND").unwrap_or_else(|_| "libblur".into());
         if backend != "original" {
-            let mut pixmap = input.into_color_space(cs)?.take()?;
             let (w, h) = (pixmap.width() as u32, pixmap.height() as u32);
-            let mut src = vec![0u8; (w * h * 4) as usize];
-            for (i, px) in pixmap.pixels().iter().enumerate() {
-                src[i * 4] = px.red();
-                src[i * 4 + 1] = px.green();
-                src[i * 4 + 2] = px.blue();
-                src[i * 4 + 3] = px.alpha();
+            if blur_via_libblur(
+                &mut pixmap,
+                w,
+                h,
+                std_dx as f32,
+                std_dy as f32,
+            )
+            .is_some()
+            {
+                return Ok(Image::from_image(pixmap, cs));
             }
-            gaussian_blur_libblur(w, h, std_dx as f32, std_dy as f32, &mut src);
-            for (i, px) in pixmap.pixels_mut().iter_mut().enumerate() {
-                *px = tiny_skia::PremultipliedColorU8::from_rgba(
-                    src[i * 4],
-                    src[i * 4 + 1],
-                    src[i * 4 + 2],
-                    src[i * 4 + 3],
-                )
-                .unwrap();
-            }
-            return Ok(Image::from_image(pixmap, cs));
         }
     }
-
-    let mut pixmap = input.into_color_space(cs)?.take()?;
 
     if use_box_blur {
         box_blur::apply(std_dx, std_dy, pixmap.as_image_ref_mut());
@@ -698,15 +696,36 @@ fn apply_blur(
 /// convolution + Reflect edge (best parity), or RESVG_BLUR_MODE=fixed and
 /// RESVG_BLUR_EDGE=clamp|wrap.
 #[cfg(feature = "simd-blur")]
-fn gaussian_blur_libblur(width: u32, height: u32, std_dx: f32, std_dy: f32, data: &mut [u8]) {
+fn blur_via_libblur(
+    pixmap: &mut tiny_skia::Pixmap,
+    width: u32,
+    height: u32,
+    std_dx: f32,
+    std_dy: f32,
+) -> Option<()> {
     use libblur::{
         BlurImage, BlurImageMut, ConvolutionMode, EdgeMode, EdgeMode2D,
         FastBlurChannels, GaussianBlurParams, ThreadingPolicy,
     };
-    // libblur needs distinct src/dst buffers; copy into a scratch dst too.
-    let mut scratch = data.to_vec();
+    // Guard against gigantic filter regions: try_reserve so OOM aborts
+    // (SIGABRT on Lambda) become a graceful fallback to resvg's blur.
+    let elem = (width as usize) * (height as usize) * 4;
+    let mut src: Vec<u8> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
+    if src.try_reserve_exact(elem).is_err() || scratch.try_reserve_exact(elem).is_err() {
+        log::warn!("libblur blur of {width}x{height} too large; falling back to resvg blur");
+        return None;
+    }
+    src.resize(elem, 0);
+    scratch.resize(elem, 0);
+    for (i, px) in pixmap.pixels().iter().enumerate() {
+        src[i * 4] = px.red();
+        src[i * 4 + 1] = px.green();
+        src[i * 4 + 2] = px.blue();
+        src[i * 4 + 3] = px.alpha();
+    }
     {
-        let src = BlurImage::borrow(&*data, width, height, FastBlurChannels::Channels4);
+        let src = BlurImage::borrow(&src, width, height, FastBlurChannels::Channels4);
         let mut dst = BlurImageMut::borrow(&mut scratch, width, height, FastBlurChannels::Channels4);
         let params =
             GaussianBlurParams::new_asymmetric_from_sigma(std_dx as f64, std_dy as f64);
@@ -719,16 +738,30 @@ fn gaussian_blur_libblur(width: u32, height: u32, std_dx: f32, std_dy: f32, data
             Ok("wrap") => EdgeMode::Wrap,
             _ => EdgeMode::Reflect,
         };
-        let _ = libblur::gaussian_blur(
+        if libblur::gaussian_blur(
             &src,
             &mut dst,
             params,
             EdgeMode2D::new(edge),
             ThreadingPolicy::Single,
             mode,
-        );
+        )
+        .is_err()
+        {
+            log::warn!("libblur gaussian_blur failed; falling back to resvg blur");
+            return None;
+        }
     }
-    data.copy_from_slice(&scratch);
+    for (i, px) in pixmap.pixels_mut().iter_mut().enumerate() {
+        *px = tiny_skia::PremultipliedColorU8::from_rgba(
+            scratch[i * 4],
+            scratch[i * 4 + 1],
+            scratch[i * 4 + 2],
+            scratch[i * 4 + 3],
+        )
+        .unwrap();
+    }
+    Some(())
 }
 
 fn apply_offset(
