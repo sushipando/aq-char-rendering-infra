@@ -1,0 +1,19 @@
+--- a/crates/resvg/Cargo.toml
++++ b/crates/resvg/Cargo.toml
+@@ -25,6 +25,7 @@
+ tiny-skia = "0.12.0"
+ usvg = { path = "../usvg", version = "0.48.1", default-features = false }
+ zune-jpeg = { version = "0.5.9", optional = true }
++libblur = { version = "0.24", optional = true }
+ 
+ [dev-dependencies]
+ once_cell = "1.21"
+@@ -32,6 +33,8 @@
+ 
+ [features]
+ default = ["svgz", "text", "system-fonts", "memmap-fonts", "raster-images"]
++# libblur SIMD Gaussian blur (recommended first version).
++simd-blur = ["dep:libblur"]
+ # Enables SVGZ decoding
+ svgz = ["usvg/svgz"]
+ # Enables SVG Text support.

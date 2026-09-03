@@ -1,0 +1,82 @@
+--- a/crates/resvg/src/filter/mod.rs
++++ b/crates/resvg/src/filter/mod.rs
+@@ -654,6 +654,35 @@
+             None => return Ok(input),
+         };
+ 
++    // Optional SIMD Gaussian via libblur (feature "simd-blur"); runtime
++    // switch RESVG_BLUR_BACKEND=libblur|original, default libblur.
++    #[cfg(feature = "simd-blur")]
++    {
++        let backend = std::env::var("RESVG_BLUR_BACKEND").unwrap_or_else(|_| "libblur".into());
++        if backend != "original" {
++            let mut pixmap = input.into_color_space(cs)?.take()?;
++            let (w, h) = (pixmap.width() as u32, pixmap.height() as u32);
++            let mut src = vec![0u8; (w * h * 4) as usize];
++            for (i, px) in pixmap.pixels().iter().enumerate() {
++                src[i * 4] = px.red();
++                src[i * 4 + 1] = px.green();
++                src[i * 4 + 2] = px.blue();
++                src[i * 4 + 3] = px.alpha();
++            }
++            gaussian_blur_libblur(w, h, std_dx as f32, std_dy as f32, &mut src);
++            for (i, px) in pixmap.pixels_mut().iter_mut().enumerate() {
++                *px = tiny_skia::PremultipliedColorU8::from_rgba(
++                    src[i * 4],
++                    src[i * 4 + 1],
++                    src[i * 4 + 2],
++                    src[i * 4 + 3],
++                )
++                .unwrap();
++            }
++            return Ok(Image::from_image(pixmap, cs));
++        }
++    }
++
+     let mut pixmap = input.into_color_space(cs)?.take()?;
+ 
+     if use_box_blur {
+@@ -663,6 +692,43 @@
+     }
+ 
+     Ok(Image::from_image(pixmap, cs))
++}
++
++/// libblur Gaussian on premultiplied RGBA. Runtime: default exact
++/// convolution + Reflect edge (best parity), or RESVG_BLUR_MODE=fixed and
++/// RESVG_BLUR_EDGE=clamp|wrap.
++#[cfg(feature = "simd-blur")]
++fn gaussian_blur_libblur(width: u32, height: u32, std_dx: f32, std_dy: f32, data: &mut [u8]) {
++    use libblur::{
++        BlurImage, BlurImageMut, ConvolutionMode, EdgeMode, EdgeMode2D,
++        FastBlurChannels, GaussianBlurParams, ThreadingPolicy,
++    };
++    // libblur needs distinct src/dst buffers; copy into a scratch dst too.
++    let mut scratch = data.to_vec();
++    {
++        let src = BlurImage::borrow(&*data, width, height, FastBlurChannels::Channels4);
++        let mut dst = BlurImageMut::borrow(&mut scratch, width, height, FastBlurChannels::Channels4);
++        let params =
++            GaussianBlurParams::new_asymmetric_from_sigma(std_dx as f64, std_dy as f64);
++        let mode = match std::env::var("RESVG_BLUR_MODE").as_deref() {
++            Ok("fixed") => ConvolutionMode::FixedPoint,
++            _ => ConvolutionMode::Exact,
++        };
++        let edge = match std::env::var("RESVG_BLUR_EDGE").as_deref() {
++            Ok("clamp") => EdgeMode::Clamp,
++            Ok("wrap") => EdgeMode::Wrap,
++            _ => EdgeMode::Reflect,
++        };
++        let _ = libblur::gaussian_blur(
++            &src,
++            &mut dst,
++            params,
++            EdgeMode2D::new(edge),
++            ThreadingPolicy::Single,
++            mode,
++        );
++    }
++    data.copy_from_slice(&scratch);
+ }
+ 
+ fn apply_offset(
