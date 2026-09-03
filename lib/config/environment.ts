@@ -30,6 +30,7 @@ export interface RenderTuning {
   readonly componentRasterConcurrency: number;
   readonly componentRasterFrameCap: number;
   readonly componentRasterBackend: 'python' | 'rust';
+  readonly componentRasterRustArch: 'x86_64' | 'arm64';
   readonly componentComposeFramesPerLambda: number;
   readonly componentComposeConcurrency: number;
   readonly componentComposeBackend: 'python' | 'rust';
@@ -193,6 +194,8 @@ const DEV_TUNING: InfrastructureTuning = {
     // Rust resvg-library raster worker is the live helper-stage backend now (the
     // compose stage is already Rust); Python remains deployed for rollback.
     componentRasterBackend: 'rust',
+    // Test the resvg worker on Graviton (ARM/Neon) below; keep x86_64 as default.
+    componentRasterRustArch: 'arm64',
     // Twelve 10-frame workers cover the current 120-frame maximum in one Map
     // wave while amortizing component downloads and Lambda cold starts.
     componentComposeFramesPerLambda: 10,

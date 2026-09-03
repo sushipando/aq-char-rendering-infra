@@ -401,12 +401,19 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           retention: logs.RetentionDays.ONE_MONTH,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         });
+        const rasterRustArch =
+          tuning.render.componentRasterRustArch === 'arm64'
+            ? lambda.Architecture.ARM_64
+            : lambda.Architecture.X86_64;
         const componentRasterRust = new lambda.DockerImageFunction(this, 'ComponentRasterRustFunction', {
           functionName: componentRasterRustName,
-          architecture: lambda.Architecture.X86_64,
+          architecture: rasterRustArch,
           code: lambda.DockerImageCode.fromImageAsset(rasterRustContext, {
             cmd: ['bootstrap'],
-            platform: ecrAssets.Platform.LINUX_AMD64,
+            platform:
+              tuning.render.componentRasterRustArch === 'arm64'
+                ? ecrAssets.Platform.LINUX_ARM64
+                : ecrAssets.Platform.LINUX_AMD64,
           }),
           description: `AQW character renderer component raster stage (Rust, resvg in-process)`,
           environment: {

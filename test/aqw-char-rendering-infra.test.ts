@@ -26,6 +26,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
     componentRasterBackend: 'rust',
+    componentRasterRustArch: 'arm64',
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
     componentComposeBackend: 'rust',

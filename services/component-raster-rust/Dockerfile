@@ -6,6 +6,8 @@
 
 FROM public.ecr.aws/lambda/provided:al2023 AS build
 
+ARG TARGETARCH
+
 # curl-minimal with /usr/bin/curl is already present in the al2023 base.
 RUN dnf install -y \
       clang \
@@ -30,14 +32,25 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# AWS Lambda x86_64 compiler flags plus a thin-LTO, single-CGU, stripped
-# release profile for a fast cold start.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v2" \
-    CARGO_PROFILE_RELEASE_LTO="thin" \
+# Thin-LTO, single-CGU, stripped release profile for a fast cold start.
+# CPU flags are arch-conditional. The x86 branch stays on x86-64-v2 (baseline
+# SSE4.2): a v3-vs-v2 A/B on the same deployed job showed v3 slightly slower,
+# and AVX does not help the scalar blur that dominates wing tasks. ARM is the
+# reference architecture here - Graviton showed ~2.2x faster rasterize (7.7s
+# vs 3.5s mean on Soltina) - and needs +neon for both tiny-skia SIMD and the
+# ring crate's compile-time NEON assertion.
+
+ENV CARGO_PROFILE_RELEASE_LTO="thin" \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS="1" \
     CARGO_PROFILE_RELEASE_STRIP="symbols" \
     CARGO_PROFILE_RELEASE_PANIC="abort"
-RUN . "$HOME/.cargo/env" && cargo build --release --locked --bin aqw-component-raster
+RUN . "$HOME/.cargo/env" && \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+      rustflags="-C target-cpu=x86-64-v2"; \
+    else \
+      rustflags="-C target-feature=+neon"; \
+    fi && \
+    RUSTFLAGS="$rustflags" cargo build --release --locked --bin aqw-component-raster
 
 # ---- runtime image ---------------------------------------------------------
 # resvg is linked statically into the bootstrap; only the binary ships.
