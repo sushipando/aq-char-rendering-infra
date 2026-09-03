@@ -31,6 +31,7 @@ RUN curl --fail --location --retry 3 https://sh.rustup.rs -sSf | \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY vendor ./vendor
 
 # Thin-LTO, single-CGU, stripped release profile for a fast cold start.
 # CPU flags are arch-conditional. The x86 branch stays on x86-64-v2 (baseline
