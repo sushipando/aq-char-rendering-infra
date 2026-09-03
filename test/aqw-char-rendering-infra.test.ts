@@ -25,12 +25,8 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     componentRasterEnabled: true,
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
-    componentRasterBackend: 'rust',
-    componentRasterRustArch: 'arm64',
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
-    componentComposeBackend: 'rust',
-    componentCompositor: 'pillow',
   });
 });
 
@@ -54,7 +50,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 4);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 11);
+  template.resourceCountIs('AWS::Lambda::Function', 9);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
@@ -85,9 +81,8 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
       typeof part === 'object' && part !== null && 'Fn::GetAtt' in part,
     )
     .map((part) => part['Fn::GetAtt'][0]);
-  // The Rust resvg-library raster worker is the live backend.
+  // The Rust resvg-library raster worker (arm64) is the only raster backend.
   expect(referencedFunctions.some((id) => id.startsWith('ComponentRasterRustFunction'))).toBe(true);
-  expect(referencedFunctions.some((id) => id.startsWith('ComponentRasterFunction'))).toBe(false);
 
   template.hasResourceProperties('AWS::IAM::Policy', {
     PolicyDocument: {
@@ -107,12 +102,7 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
 
 test('the Rust component-raster worker is the live backend with 3008 MiB and no reserve cap', () => {
   const template = synthesize();
-  template.resourceCountIs('AWS::Lambda::Function', 11);
-  template.hasResourceProperties('AWS::Lambda::Function', {
-    FunctionName: 'aqw-char-dev-componentraster-rust',
-    MemorySize: 3008,
-    Timeout: 900,
-  });
+  template.resourceCountIs('AWS::Lambda::Function', 9);
   // The active backend shares the account concurrency pool (no reserved cap).
   const functions = template.findResources('AWS::Lambda::Function');
   const rust = Object.values(functions).find((resource: any) =>
@@ -150,7 +140,6 @@ test('Lambda request defaults come from the centralized environment tuning', () 
         CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT: '4',
         CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY: '32',
         CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: '10',
-        CHAR_RENDER_COMPONENT_COMPOSITOR: 'pillow',
         CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK: 'true',
       }),
     },

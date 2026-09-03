@@ -90,7 +90,6 @@ class RuntimeConfig:
     component_raster_concurrency: int = 5
     component_raster_frame_cap: int = 25
     component_compose_frames_per_lambda: int = 10
-    component_compositor: str = "pillow"
     ffdec_path: Path = Path("/opt/ffdec/ffdec-cli.jar")
     rsvg_convert: str = "/usr/bin/rsvg-convert"
     cwebp: str = "/usr/bin/cwebp"
@@ -186,9 +185,6 @@ class RuntimeConfig:
                 1,
                 60,
             ),
-            component_compositor=values.get(
-                "CHAR_RENDER_COMPONENT_COMPOSITOR", "pillow"
-            ).strip().casefold(),
             ffdec_path=Path(values.get("CHAR_RENDER_FFDEC_PATH", "/opt/ffdec/ffdec-cli.jar")),
             rsvg_convert=values.get("CHAR_RENDER_RSVG_CONVERT", "/usr/bin/rsvg-convert"),
             cwebp=values.get("CHAR_RENDER_CWEBP", "/usr/bin/cwebp"),
@@ -198,10 +194,6 @@ class RuntimeConfig:
             raise ConfigurationError(
                 "CHAR_RENDER_DEFAULT_OUTPUT_SIZE must not exceed "
                 "CHAR_RENDER_DEFAULT_RASTER_SIZE"
-            )
-        if config.component_compositor not in {"pillow", "pyvips"}:
-            raise ConfigurationError(
-                "CHAR_RENDER_COMPONENT_COMPOSITOR must be pillow or pyvips"
             )
         if config.default_padding * 2 >= config.default_output_size:
             raise ConfigurationError(

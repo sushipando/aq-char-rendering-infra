@@ -29,12 +29,8 @@ export interface RenderTuning {
   readonly componentRasterEnabled: boolean;
   readonly componentRasterConcurrency: number;
   readonly componentRasterFrameCap: number;
-  readonly componentRasterBackend: 'python' | 'rust';
-  readonly componentRasterRustArch: 'x86_64' | 'arm64';
   readonly componentComposeFramesPerLambda: number;
   readonly componentComposeConcurrency: number;
-  readonly componentComposeBackend: 'python' | 'rust';
-  readonly componentCompositor: 'pillow' | 'pyvips';
 }
 
 export interface RetentionTuning {
@@ -191,17 +187,10 @@ const DEV_TUNING: InfrastructureTuning = {
     // Lambda's regional concurrency remains the account-wide safety ceiling.
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
-    // Rust resvg-library raster worker is the live helper-stage backend now (the
-    // compose stage is already Rust); Python remains deployed for rollback.
-    componentRasterBackend: 'rust',
-    // Test the resvg worker on Graviton (ARM/Neon) below; keep x86_64 as default.
-    componentRasterRustArch: 'arm64',
     // Twelve 10-frame workers cover the current 120-frame maximum in one Map
     // wave while amortizing component downloads and Lambda cold starts.
     componentComposeFramesPerLambda: 10,
     componentComposeConcurrency: 20,
-    componentComposeBackend: 'rust',
-    componentCompositor: 'pillow',
   },
   retention: {
     workDays: 2,

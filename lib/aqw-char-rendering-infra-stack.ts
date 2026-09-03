@@ -30,9 +30,7 @@ interface RendererFunctions {
   readonly prepare: lambda.DockerImageFunction;
   readonly render: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
-  readonly componentRaster: lambda.DockerImageFunction;
   readonly componentRasterRust: lambda.DockerImageFunction;
-  readonly componentCompose: lambda.DockerImageFunction;
   readonly componentComposeRust: lambda.DockerImageFunction;
   readonly complete: lambda.DockerImageFunction;
   readonly cleanup: lambda.DockerImageFunction;
@@ -311,7 +309,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: String(
         tuning.render.componentComposeFramesPerLambda,
       ),
-      CHAR_RENDER_COMPONENT_COMPOSITOR: tuning.render.componentCompositor,
       CHAR_RENDER_FFDEC_PATH: '/opt/ffdec/ffdec-cli.jar',
       CHAR_RENDER_RSVG_CONVERT: '/opt/resvg/resvg',
       CHAR_RENDER_CWEBP: '/opt/libwebp/bin/cwebp',
@@ -357,10 +354,10 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     });
     const componentComposeRust = new lambda.DockerImageFunction(this, 'ComponentComposeRustFunction', {
       functionName: componentComposeRustName,
-      architecture: lambda.Architecture.X86_64,
+      architecture: lambda.Architecture.ARM_64,
       code: lambda.DockerImageCode.fromImageAsset(rustContext, {
         cmd: ['bootstrap'],
-        platform: ecrAssets.Platform.LINUX_AMD64,
+        platform: ecrAssets.Platform.LINUX_ARM64,
       }),
       description: `AQW character renderer component compose stage (Rust)`,
       environment: {
@@ -384,15 +381,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       prepare: make('Prepare', 'aqw_char_renderer.handlers.prepare.handler', tuning.functions.prepare),
       render: make('Render', 'aqw_char_renderer.handlers.render.handler', tuning.functions.render),
       finalizer: make('Finalizer', 'aqw_char_renderer.handlers.finalize.handler', tuning.functions.finalizer),
-      componentRaster: make('ComponentRaster', 'aqw_char_renderer.handlers.component_raster.handler', tuning.functions.componentRaster),
-      componentCompose: make('ComponentCompose', 'aqw_char_renderer.handlers.component_compose.handler', tuning.functions.componentCompose),
       componentComposeRust,
 
       // Isolated Rust component-raster candidate (see
       // docs/rust-component-compose-plan.md). resvg is linked in-process; the
       // image ships only the static bootstrap. Reserved concurrency one keeps
       // the candidate from consuming production raster concurrency until
-      // `componentRasterBackend = 'rust'` switches the Distributed Map over.
       componentRasterRust: (() => {
         const rasterRustContext = path.join(__dirname, '..', 'services', 'component-raster-rust');
         const componentRasterRustName = `aqw-char-${stageName}-componentraster-rust`;
@@ -401,19 +395,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           retention: logs.RetentionDays.ONE_MONTH,
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         });
-        const rasterRustArch =
-          tuning.render.componentRasterRustArch === 'arm64'
-            ? lambda.Architecture.ARM_64
-            : lambda.Architecture.X86_64;
         const componentRasterRust = new lambda.DockerImageFunction(this, 'ComponentRasterRustFunction', {
           functionName: componentRasterRustName,
-          architecture: rasterRustArch,
+          architecture: lambda.Architecture.ARM_64,
           code: lambda.DockerImageCode.fromImageAsset(rasterRustContext, {
             cmd: ['bootstrap'],
-            platform:
-              tuning.render.componentRasterRustArch === 'arm64'
-                ? ecrAssets.Platform.LINUX_ARM64
-                : ecrAssets.Platform.LINUX_AMD64,
+            platform: ecrAssets.Platform.LINUX_ARM64,
           }),
           description: `AQW character renderer component raster stage (Rust, resvg in-process)`,
           environment: {
@@ -424,8 +411,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           ),
           logGroup: componentRasterRustLogGroup,
           memorySize: tuning.functions.componentRaster.memoryMiB,
-          reservedConcurrentExecutions:
-            tuning.render.componentRasterBackend === 'rust' ? undefined : 1,
           timeout: cdk.Duration.seconds(tuning.functions.componentRaster.timeoutSeconds),
           tracing: lambda.Tracing.ACTIVE,
         });
@@ -536,8 +521,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     }).addRetry(lambdaRetry);
 
     // The first Map is the synchronization barrier: frame composition starts
-    // only after every unique component task succeeds. `componentRasterBackend`
-    // selects the Python resvg-CLI worker or the Rust in-process resvg worker.
+    // only after every unique component task succeeds. The worker is the Rust
+    // in-process resvg rasterizer (arm64).
     const componentRasterMap = new sfn.DistributedMap(this, 'RasterComponentStates', {
       itemsPath: '$.prepare.component_task_indices',
       maxConcurrency: tuning.render.componentRasterConcurrency,
@@ -549,13 +534,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         task_index: sfn.JsonPath.numberAt('$$.Map.Item.Value'),
       },
     });
-    const componentRasterFunction =
-      tuning.render.componentRasterBackend === 'rust'
-        ? functions.componentRasterRust
-        : functions.componentRaster;
     componentRasterMap.itemProcessor(
       new tasks.LambdaInvoke(this, 'RasterComponentState', {
-        lambdaFunction: componentRasterFunction,
+        lambdaFunction: functions.componentRasterRust,
         payload: sfn.TaskInput.fromObject({
           job_id: sfn.JsonPath.stringAt('$.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
@@ -579,12 +560,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
       },
     });
-    const componentComposeFunction = tuning.render.componentComposeBackend === 'rust'
-      ? functions.componentComposeRust
-      : functions.componentCompose;
     componentComposeMap.itemProcessor(
       new tasks.LambdaInvoke(this, 'ComposeComponentFrameChunk', {
-        lambdaFunction: componentComposeFunction,
+        lambdaFunction: functions.componentComposeRust,
         payload: sfn.TaskInput.fromObject({
           job_id: sfn.JsonPath.stringAt('$.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
@@ -692,12 +670,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     workBucket.grantReadWrite(functions.prepare);
     workBucket.grantReadWrite(functions.render);
     workBucket.grantReadWrite(functions.finalizer);
-    workBucket.grantReadWrite(functions.componentRaster);
     workBucket.grantReadWrite(functions.componentRasterRust);
-    workBucket.grantReadWrite(functions.componentCompose);
-    // Least-privilege S3 policy for the isolated Rust candidate. No source
-    // bucket, table, or queue access: it only reads the prepare manifest and
-    // component rasters and writes frames plus the compose-batch manifest.
+    // Least-privilege S3: the Rust workers only read the prepare manifest and
+    // component rasters and write frames plus the batch/result manifests.
     workBucket.grantReadWrite(functions.componentComposeRust);
     for (const fn of [
       functions.prepare,
@@ -715,8 +690,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       [functions.prepare.functionName]: tuning.functions.prepare.reservedConcurrency,
       [functions.render.functionName]: tuning.functions.render.reservedConcurrency,
       [functions.finalizer.functionName]: tuning.functions.finalizer.reservedConcurrency,
-      [functions.componentRaster.functionName]: tuning.functions.componentRaster.reservedConcurrency,
-      [functions.componentCompose.functionName]: tuning.functions.componentCompose.reservedConcurrency,
+      [functions.componentRasterRust.functionName]: tuning.functions.componentRaster.reservedConcurrency,
+      [functions.componentComposeRust.functionName]: tuning.functions.componentCompose.reservedConcurrency,
     };
     functions.shutdown.addEnvironment('CHAR_RENDER_WORKER_CONCURRENCY', JSON.stringify(concurrency));
   }
@@ -759,9 +734,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         functions.prepare.functionName,
         functions.render.functionName,
         functions.finalizer.functionName,
-        functions.componentRaster.functionName,
         functions.componentRasterRust.functionName,
-        functions.componentCompose.functionName,
         functions.componentComposeRust.functionName,
       ]),
     );

@@ -224,7 +224,7 @@ def run_component_job(
     return results
 
 
-@pytest.mark.parametrize("compositor", ["pillow", "pyvips"])
+@pytest.mark.parametrize("compositor", ["pillow"])
 def test_component_raster_then_compose_deduplicates_states(compositor: str) -> None:
     frame_count = 3
     job_id = "job-component"

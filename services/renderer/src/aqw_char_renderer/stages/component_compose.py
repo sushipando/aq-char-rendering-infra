@@ -16,7 +16,6 @@ from aqw_char_renderer.hashing import file_sha256
 from aqw_char_renderer.stages.compose_frames import (
     _downsample_image,
     _encode_frame,
-    _encode_png_frame,
     _frame_canvas_sizes,
 )
 from aqw_char_renderer.structured_logging import log_event
@@ -45,10 +44,9 @@ def compose_frame_batch(
     The raster-grid downsample branch remains for older saved manifests.
     """
     started = perf_counter()
-    selected_compositor = (compositor or config.component_compositor).strip().casefold()
-    if selected_compositor not in {"pillow", "pyvips"}:
+    if compositor not in {None, "pillow"}:
         raise character_svg.CharacterSvgError(
-            f"Unsupported component compositor {selected_compositor!r}"
+            f"Unsupported component compositor {compositor!r}"
         )
     timings: dict[str, float] = {
         "manifest_ms": 0.0,
@@ -173,24 +171,11 @@ def compose_frame_batch(
             png_bytes += path.stat().st_size
 
         phase = perf_counter()
-        if selected_compositor == "pillow":
-            for task_id, path in fetched:
-                with Image.open(path) as source:
-                    image = source.convert("RGBA")
-                    image.load()
-                images[task_id] = image
-        else:
-            import pyvips
-
-            # Component images are explicitly retained in memory for the
-            # chunk. Disable libvips' global operation cache so completed
-            # 4096px frame graphs cannot accumulate across warm invocations.
-            pyvips.cache_set_max(0)
-            for task_id, path in fetched:
-                images[task_id] = pyvips.Image.new_from_file(
-                    str(path),
-                    access="sequential",
-                ).copy_memory()
+        for task_id, path in fetched:
+            with Image.open(path) as source:
+                image = source.convert("RGBA")
+                image.load()
+            images[task_id] = image
         timings["decode_ms"] = (perf_counter() - phase) * 1000
 
         records: list[dict[str, Any]] = []
@@ -200,112 +185,43 @@ def compose_frame_batch(
                 frame_number = int(frame["number"])
                 encoded = root / "webp" / f"{frame_number:06d}.webp"
                 encoded.parent.mkdir(parents=True, exist_ok=True)
-                if selected_compositor == "pillow":
-                    canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-                    phase = perf_counter()
-                    for raw_task_id in frame["layers"]:
-                        task_id = str(raw_task_id)
-                        result = results_by_task[task_id]
-                        if result.get("empty") is True:
-                            continue
-                        layer = images.get(task_id)
-                        if layer is None:
-                            raise character_svg.CharacterSvgError(
-                                f"Component PNG for task {task_id} was not decoded"
-                            )
-                        canvas.alpha_composite(
-                            layer,
-                            dest=(int(result["x"]), int(result["y"])),
+                canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+                phase = perf_counter()
+                for raw_task_id in frame["layers"]:
+                    task_id = str(raw_task_id)
+                    result = results_by_task[task_id]
+                    if result.get("empty") is True:
+                        continue
+                    layer = images.get(task_id)
+                    if layer is None:
+                        raise character_svg.CharacterSvgError(
+                            f"Component PNG for task {task_id} was not decoded"
                         )
-                    timings["composite_ms"] += (perf_counter() - phase) * 1000
-
-                    if component_raster_space == "raster" and output_size < raster_size:
-                        phase = perf_counter()
-                        downsampled = _downsample_image(canvas, output_size=output_size)
-                        timings["downsample_ms"] += (perf_counter() - phase) * 1000
-                        if downsampled is not canvas:
-                            canvas.close()
-                        canvas = downsampled
-
-                    frame_canvas = canvas.size
-                    phase = perf_counter()
-                    _encode_frame(
-                        canvas,
-                        encoded,
-                        quality=float(settings["webp_quality"]),
-                        method=int(settings["webp_method"]),
-                        cwebp=config.cwebp,
+                    canvas.alpha_composite(
+                        layer,
+                        dest=(int(result["x"]), int(result["y"])),
                     )
-                    timings["encode_ms"] += (perf_counter() - phase) * 1000
-                    canvas.close()
-                else:
-                    import pyvips
+                timings["composite_ms"] += (perf_counter() - phase) * 1000
 
+                if component_raster_space == "raster" and output_size < raster_size:
                     phase = perf_counter()
-                    layers = []
-                    x_positions = []
-                    y_positions = []
-                    for raw_task_id in frame["layers"]:
-                        task_id = str(raw_task_id)
-                        result = results_by_task[task_id]
-                        if result.get("empty") is True:
-                            continue
-                        layer = images.get(task_id)
-                        if layer is None:
-                            raise character_svg.CharacterSvgError(
-                                f"Component PNG for task {task_id} was not decoded"
-                            )
-                        layers.append(layer)
-                        x_positions.append(int(result["x"]))
-                        y_positions.append(int(result["y"]))
-                    base = (
-                        pyvips.Image.black(canvas_size[0], canvas_size[1], bands=4)
-                        .cast("uchar")
-                        .copy(interpretation="srgb")
-                    )
-                    canvas = base.composite(
-                        layers,
-                        ["over"] * len(layers),
-                        x=x_positions,
-                        y=y_positions,
-                        premultiplied=False,
-                    ).copy_memory()
-                    timings["composite_ms"] += (perf_counter() - phase) * 1000
+                    downsampled = _downsample_image(canvas, output_size=output_size)
+                    timings["downsample_ms"] += (perf_counter() - phase) * 1000
+                    if downsampled is not canvas:
+                        canvas.close()
+                    canvas = downsampled
 
-                    if component_raster_space == "raster" and output_size < raster_size:
-                        phase = perf_counter()
-                        scale = output_size / max(canvas.width, canvas.height)
-                        target = (
-                            max(1, round(canvas.width * scale)),
-                            max(1, round(canvas.height * scale)),
-                        )
-                        canvas = (
-                            canvas.premultiply(max_alpha=255)
-                            .resize(
-                                target[0] / canvas.width,
-                                vscale=target[1] / canvas.height,
-                                kernel="lanczos3",
-                                gap=3.0,
-                            )
-                            .unpremultiply(max_alpha=255)
-                            .cast("uchar")
-                            .copy_memory()
-                        )
-                        timings["downsample_ms"] += (perf_counter() - phase) * 1000
-
-                    frame_canvas = (canvas.width, canvas.height)
-                    png = encoded.with_suffix(".png")
-                    phase = perf_counter()
-                    canvas.pngsave(str(png), compression=6, strip=True)
-                    _encode_png_frame(
-                        png,
-                        encoded,
-                        quality=float(settings["webp_quality"]),
-                        method=int(settings["webp_method"]),
-                        cwebp=config.cwebp,
-                    )
-                    timings["encode_ms"] += (perf_counter() - phase) * 1000
-                    png.unlink(missing_ok=True)
+                frame_canvas = canvas.size
+                phase = perf_counter()
+                _encode_frame(
+                    canvas,
+                    encoded,
+                    quality=float(settings["webp_quality"]),
+                    method=int(settings["webp_method"]),
+                    cwebp=config.cwebp,
+                )
+                timings["encode_ms"] += (perf_counter() - phase) * 1000
+                canvas.close()
 
                 frame_canvases.add(frame_canvas)
 
@@ -334,9 +250,8 @@ def compose_frame_batch(
                     }
                 )
         finally:
-            if selected_compositor == "pillow":
-                for image in images.values():
-                    image.close()
+            for image in images.values():
+                image.close()
 
         if len(frame_canvases) != 1:
             raise character_svg.CharacterSvgError("Composed frames do not share one canvas")
@@ -374,7 +289,7 @@ def compose_frame_batch(
         output_size=output_size,
         component_raster_space=component_raster_space,
         downsampled_in_compose=(component_raster_space == "raster" and output_size < raster_size),
-        compositor=selected_compositor,
+        compositor="pillow",
         download_concurrency=workers,
         total_ms=round(total_ms, 1),
         unaccounted_ms=round(total_ms - accounted_ms, 1),

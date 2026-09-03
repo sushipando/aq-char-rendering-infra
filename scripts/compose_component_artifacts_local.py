@@ -31,7 +31,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--frames-per-worker", type=int, default=10)
     result.add_argument("--workers", type=int, default=12)
-    result.add_argument("--compositor", choices=("pillow", "pyvips"), default="pillow")
+    result.add_argument("--compositor", choices=("pillow",), default="pillow")
     result.add_argument("--compare-webp", type=Path)
     result.add_argument("--compare-frames", type=int, default=8)
     return result

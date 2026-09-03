@@ -22,7 +22,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--function-name", default="aqw-char-dev-componentcompose")
     result.add_argument("--runs", type=int, default=2)
     result.add_argument("--batch-index", type=int, default=9000)
-    result.add_argument("--compositor", choices=("pillow", "pyvips"), default="pillow")
+    result.add_argument("--compositor", choices=("pillow",), default="pillow")
     result.add_argument("--frame-start", type=int, default=1)
     result.add_argument("--frame-end", type=int)
     result.add_argument(

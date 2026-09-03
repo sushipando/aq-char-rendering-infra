@@ -2,10 +2,8 @@
 
 # Build stage uses Amazon Linux 2023 (the same glibc 2.34 as the
 # provided:al2023 runtime image), so the release binary is ABI-identical to
-# the Lambda runtime and needs no musl cross-compilation. RUSTFLAGS pins the
-# conservative AWS x86_64 CPU baseline (x86-64-v2: SSE3/SSSE3/SSE4.1/SSE4.2/
-# POPCNT/AVX) used for Lambda's Firecracker x86_64 microVMs; this is the same
-# instruction baseline cargo-lambda targets for x86_64.
+# the Lambda runtime and needs no musl cross-compilation. This worker runs
+# only on Graviton (arm64); +neon enables tiny-skia SIMD.
 FROM public.ecr.aws/lambda/provided:al2023 AS build
 
 # curl-minimal with /usr/bin/curl is already present in the al2023 base.
@@ -32,28 +30,28 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# AWS Lambda x86_64 compiler flags plus a thin-LTO, single-CGU, stripped
-# release profile for a fast cold start.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v2" \
-    CARGO_PROFILE_RELEASE_LTO="thin" \
+# Thin-LTO, single-CGU, stripped release profile for a fast cold start. arm64
+# (Graviton) only: +neon for tiny-skia SIMD and the ring crate's NEON assert.
+ENV CARGO_PROFILE_RELEASE_LTO="thin" \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS="1" \
     CARGO_PROFILE_RELEASE_STRIP="symbols" \
     CARGO_PROFILE_RELEASE_PANIC="abort"
-RUN . "$HOME/.cargo/env" && cargo build --release --locked --bin aqw-component-compose
+RUN . "$HOME/.cargo/env" && RUSTFLAGS="-C target-feature=+neon" \
+    cargo build --release --locked --bin aqw-component-compose
 
 # ---- runtime image ---------------------------------------------------------
 FROM public.ecr.aws/lambda/provided:al2023
 
 ARG LIBWEBP_VERSION=1.5.0
-ARG LIBWEBP_SHA256=f4bf49f85991f50e86a5404d16f15b72a053bb66768ed5cc0f6d042277cc2bb8
+ARG LIBWEBP_SHA256=ec874dd2e52097f11dd4999176ae6b6fb0ecb165bc1e05d3ecc9b29014fb003e
 
-# The pinned cwebp binary only (identical build and flags to the Python
-# renderer image so the compositor comparison isolates codec behavior).
+# The pinned cwebp binary only (aarch64 build for the Graviton worker),
+# identical codec/flags to the Python renderer's x86-64 cwebp.
 # curl (curl-minimal) ships with the al2023 base image; tar and gzip are
 # added and removed here like the Python renderer image does.
 RUN dnf install -y tar gzip \
     && curl --fail --location --retry 3 \
-      "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}-linux-x86-64.tar.gz" \
+      "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}-linux-aarch64.tar.gz" \
       --output /tmp/libwebp.tar.gz \
     && echo "${LIBWEBP_SHA256}  /tmp/libwebp.tar.gz" | sha256sum --check --strict \
     && mkdir -p /opt/libwebp \
