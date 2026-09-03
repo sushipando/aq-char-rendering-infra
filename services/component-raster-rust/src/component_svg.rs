@@ -142,10 +142,34 @@ pub fn build_component_svg(
     let [viewbox_x, viewbox_y, viewbox_width, viewbox_height] = viewbox;
     let pixel_scale = raster_size as f64 / viewbox_width.max(viewbox_height);
     let margin = PAGE_MARGIN_PIXELS;
-    let left = (((x - viewbox_x) * pixel_scale).floor() - margin) as i64;
-    let top = (((y - viewbox_y) * pixel_scale).floor() - margin) as i64;
-    let right = (((x + width - viewbox_x) * pixel_scale).ceil() + margin) as i64;
-    let bottom = (((y + height - viewbox_y) * pixel_scale).ceil() + margin) as i64;
+    let mut left = (((x - viewbox_x) * pixel_scale).floor() - margin) as i64;
+    let mut top = (((y - viewbox_y) * pixel_scale).floor() - margin) as i64;
+    let mut right = (((x + width - viewbox_x) * pixel_scale).ceil() + margin) as i64;
+    let mut bottom = (((y + height - viewbox_y) * pixel_scale).ceil() + margin) as i64;
+
+    // Clamp the tight page to the shared raster canvas. A component can be far
+    // larger than the shared viewbox (e.g. CosmiQ's pet is ~7x the character
+    // viewbox), which would otherwise rasterize an off-canvas page several
+    // times the canvas size and exhaust Lambda memory (~3.6GB for a 26k x 34k
+    // page). Only the on-canvas part is ever visible (the composer clips the
+    // same rectangle), so clipping here changes nothing for normal components
+    // (pages are already within the canvas) and bounds pathological ones.
+    let canvas_w = ((viewbox_width * pixel_scale).round() as i64).max(1);
+    let canvas_h = ((viewbox_height * pixel_scale).round() as i64).max(1);
+    left = left.clamp(0, canvas_w);
+    top = top.clamp(0, canvas_h);
+    right = right.clamp(0, canvas_w);
+    bottom = bottom.clamp(0, canvas_h);
+    if right <= left || bottom <= top {
+        return ComponentSvg {
+            root,
+            page: [0, 0, 0, 0],
+            visible: false,
+            warnings: Vec::new(),
+            namespaces: imported.namespaces.clone(),
+        };
+    }
+
     let page_width = (right - left).max(1);
     let page_height = (bottom - top).max(1);
     let page_x = viewbox_x + left as f64 / pixel_scale;
@@ -228,19 +252,22 @@ mod tests {
             &[],
         );
         assert!(result.visible);
-        // left = floor(-6) - 24 = -30; right = ceil(14) + 24 = 38;
-        // top = floor(-8) - 24 = -32; bottom = ceil(2) + 24 = 26.
-        assert_eq!(result.page, [-30, -32, 38, 26]);
+        // Unclipped page would be left = floor(-6)-24 = -30; right = ceil(14)+24 = 38;
+        // top = floor(-8)-24 = -32; bottom = ceil(2)+24 = 26. The page is now
+        // clamped to the shared raster canvas [0..512], so negatives clip to 0.
+        assert_eq!(result.page, [0, 0, 38, 26]);
         let root = result.root;
         let viewbox = root.get("viewBox").unwrap();
         let values: Vec<f64> = viewbox
             .split_whitespace()
             .map(|value| value.parse().unwrap())
             .collect();
-        assert!((values[0] - (-30.0)).abs() < 1e-9);
-        assert!((values[1] - (-32.0)).abs() < 1e-9);
-        assert_eq!(root.get("width"), Some("68px"));
-        assert_eq!(root.get("height"), Some("58px"));
+        // Page clamped to canvas origin: viewBox starts at the shared canvas
+        // origin (0,0) and the page is 38x26 px.
+        assert!((values[0] - 0.0).abs() < 1e-9);
+        assert!((values[1] - 0.0).abs() < 1e-9);
+        assert_eq!(root.get("width"), Some("38px"));
+        assert_eq!(root.get("height"), Some("26px"));
         // Darkened use carries the back-part filter; no color rules so only
         // the dark filter exists.
         let use_element = root
