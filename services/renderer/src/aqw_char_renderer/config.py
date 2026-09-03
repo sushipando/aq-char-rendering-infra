@@ -225,4 +225,5 @@ class RuntimeConfig:
             "padding": self.default_padding,
             "webp_quality": self.default_webp_quality,
             "webp_method": self.default_webp_method,
+            "webp_lossless": False,
         }
