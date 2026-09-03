@@ -22,11 +22,16 @@ pub async fn encode_webp(
     cwebp: &Path,
     quality: f64,
     method: i64,
+    lossless: bool,
     input_png: &Path,
     output_webp: &Path,
 ) -> Result<(), ComposeError> {
-    let output = Command::new(cwebp)
-        .arg("-quiet")
+    let mut command = Command::new(cwebp);
+    command.arg("-quiet");
+    if lossless {
+        command.arg("-lossless").arg("1");
+    }
+    command
         .arg("-q")
         .arg(format_quality(quality))
         .arg("-alpha_q")
@@ -35,7 +40,8 @@ pub async fn encode_webp(
         .arg(method.to_string())
         .arg(input_png)
         .arg("-o")
-        .arg(output_webp)
+        .arg(output_webp);
+    let output = command
         .output()
         .await
         .map_err(|error| ComposeError::Encode(format!("cannot launch {cwebp:?}: {error}")))?;

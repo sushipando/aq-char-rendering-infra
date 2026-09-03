@@ -166,6 +166,7 @@ class RenderSettings:
     padding: int = 0
     webp_quality: float = 85.0
     webp_method: int = 4
+    webp_lossless: bool | None = None
 
     @classmethod
     def from_dict(cls, value: Any) -> RenderSettings:
@@ -187,6 +188,7 @@ class RenderSettings:
             "padding",
             "webp_quality",
             "webp_method",
+            "webp_lossless",
         }
         _only_keys(payload, allowed, "render")
         facing = str(payload.get("facing", "right")).casefold()
@@ -237,6 +239,11 @@ class RenderSettings:
             padding=padding,
             webp_quality=_number(payload.get("webp_quality", 85), "render.webp_quality", 0, 100),
             webp_method=_integer(payload.get("webp_method", 4), "render.webp_method", 0, 6),
+            webp_lossless=(
+                _boolean(payload["webp_lossless"], "render.webp_lossless")
+                if payload.get("webp_lossless") is not None
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

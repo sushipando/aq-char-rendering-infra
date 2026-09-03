@@ -78,6 +78,8 @@ pub struct ManifestSettings {
     pub output_size: i64,
     pub webp_quality: f64,
     pub webp_method: i64,
+    #[serde(default)]
+    pub webp_lossless: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

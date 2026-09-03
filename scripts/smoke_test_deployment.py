@@ -44,6 +44,23 @@ def parser() -> argparse.ArgumentParser:
         default=256,
         help="Final longest dimension; frames rasterize at twice this size",
     )
+    result.add_argument(
+        "--webp-quality",
+        type=float,
+        default=85.0,
+        help="cwebp quality factor 0..100 (default 85)",
+    )
+    result.add_argument(
+        "--webp-method",
+        type=int,
+        default=4,
+        help="cwebp method 0..6 (default 4)",
+    )
+    result.add_argument(
+        "--webp-lossless",
+        action="store_true",
+        help="Encode frames with cwebp -lossless 1 instead of lossy",
+    )
     result.add_argument("--timeout-seconds", type=int, default=1_200)
     result.add_argument("--poll-seconds", type=float, default=5)
     return result
@@ -191,6 +208,9 @@ def main() -> int:
             max_frames=args.max_frames,
             raster_size=args.output_size * 2,
             output_size=args.output_size,
+            webp_quality=args.webp_quality,
+            webp_method=args.webp_method,
+            webp_lossless=args.webp_lossless or None,
         ),
         appearance=appearance,
     )
@@ -203,6 +223,9 @@ def main() -> int:
         "max_frames": request.render.max_frames,
         "raster_size": request.render.raster_size,
         "output_size": request.render.output_size,
+        "webp_quality": request.render.webp_quality,
+        "webp_method": request.render.webp_method,
+        "webp_lossless": request.render.webp_lossless,
     }
     sqs = boto3.client("sqs")
     try:

@@ -260,7 +260,11 @@ pub async fn run_chunk(
     let decode_started = Instant::now();
     let mut images: HashMap<String, RgbaImage> = HashMap::new();
     for (task_id, bytes, _) in fetched {
-        images.insert(task_id, png::decode_rgba8(&bytes)?);
+        let mut image = png::decode_rgba8(&bytes)?;
+        // Premultiply each decoded layer once; the SIMD compositor blends
+        // premultiplied RGBA and the same pixels serve every frame.
+        crate::compositor::premultiply_rgba(&mut image.pixels);
+        images.insert(task_id, image);
     }
     let decode_ms = elapsed_ms(decode_started);
 
@@ -291,6 +295,11 @@ pub async fn run_chunk(
                 }
             }
         }
+        // One unpremultiply per frame (never per layer): the canvas is
+        // premultiplied during compositing and converted back to straight
+        // alpha once, before the legacy downsample (FIR expects straight
+        // alpha) or the PNG encoder (PNG stores straight alpha).
+        crate::compositor::unpremultiply_rgba(&mut canvas.pixels);
         composite_total += elapsed_ms(composite_started);
 
         if downsampled_in_compose {
@@ -316,6 +325,7 @@ pub async fn run_chunk(
             &opts.cwebp,
             settings.webp_quality,
             settings.webp_method,
+            settings.webp_lossless.unwrap_or(false),
             &png_path,
             &webp_path,
         )
