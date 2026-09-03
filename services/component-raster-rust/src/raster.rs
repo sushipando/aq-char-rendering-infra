@@ -11,12 +11,12 @@ use crate::error::RasterError;
 /// so `tree.size()` equals the expected page exactly (like the resvg CLI with
 /// `--width`/`--height` at scale 1).
 pub fn render_svg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaImage, RasterError> {
-    let mut options = usvg::Options {
+    let mut options = resvg::usvg::Options {
         resources_dir: None,
-        ..usvg::Options::default()
+        ..resvg::usvg::Options::default()
     };
     options.fontdb_mut().load_system_fonts();
-    let tree = usvg::Tree::from_data(svg_bytes, &options)
+    let tree = resvg::usvg::Tree::from_data(svg_bytes, &options)
         .map_err(|error| RasterError::Raster(format!("usvg parse failed: {error}")))?;
     let size = tree.size().to_int_size();
     if (size.width(), size.height()) != expected {
@@ -30,7 +30,11 @@ pub fn render_svg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaImage, R
     }
     let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
         .ok_or_else(|| RasterError::Raster("cannot allocate pixmap".to_string()))?;
-    resvg::render(&tree, usvg::Transform::default(), &mut pixmap.as_mut());
+    resvg::render(
+        &tree,
+        resvg::usvg::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
     let mut pixels = pixmap.data().to_vec();
     // tiny_skia Pixmap stores premultiplied RGBA. The resvg CLI demultiplies
     // through `PremultipliedColorU8::demultiply` before writing PNG; replicate

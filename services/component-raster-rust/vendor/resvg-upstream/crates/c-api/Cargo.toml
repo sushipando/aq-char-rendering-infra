@@ -1,0 +1,37 @@
+[package]
+name = "resvg-capi"
+version = "0.48.1"
+keywords = ["svg", "render", "raster", "c-api"]
+license.workspace = true
+edition = "2024"
+rust-version = "1.85.0"
+workspace = "../.."
+
+[lib]
+name = "resvg"
+path = "lib.rs"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+log = "0.4"
+resvg = { path = "../resvg", default-features = false }
+
+[features]
+default = ["svgz", "text", "system-fonts", "memmap-fonts", "raster-images"]
+# Enables SVGZ decoding
+svgz = ["resvg/svgz"]
+# enables SVG Text support
+# adds around 500KiB to your binary
+text = ["resvg/text"]
+# enables system fonts loading (only for `text`)
+system-fonts = ["resvg/system-fonts"]
+# enables font files memmaping for faster loading (only for `text`)
+memmap-fonts = ["resvg/memmap-fonts"]
+raster-images = ["resvg/raster-images"]
+capi = []
+
+[package.metadata.capi.header]
+generation = false
+
+[package.metadata.capi.install.include]
+asset = [{ from="resvg.h" }]

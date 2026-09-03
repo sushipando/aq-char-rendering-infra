@@ -28,7 +28,7 @@ async-trait = "0.1"
 # `/opt/resvg/resvg` (built from the same source). A "text" build keeps
 # FFDec font group rendering behavior identical to the CLI, and
 # "raster-images" supports embedded bitmaps exactly like the CLI defaults.
-resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images", "svgz"] }
+resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images", "svgz", "simd-blur"] }
 usvg = "0.48.1"
 tiny-skia = "0.11"
 fast_image_resize = "6"
@@ -42,3 +42,6 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+resvg = { path = "vendor/resvg-upstream/crates/resvg" }

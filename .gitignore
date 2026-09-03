@@ -29,3 +29,4 @@ tmp/
 # Rust component-compose worker
 services/component-compose-rust/target/
 services/component-raster-rust/target/
+services/component-raster-rust/vendor/resvg-upstream/.git/
