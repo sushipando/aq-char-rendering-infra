@@ -1,23 +1,31 @@
-//! Pixel-perfect RGBA compositing that mirrors the approved Pillow worker.
+//! RGBA layer compositing for the component-compose worker.
 //!
-//! The component-compose contract changed nothing about pixels: the
-//! output-grid path only draws integer-offset PNG layers in back-to-front
-//! order with normal source-over blending. Pillow implements that with
-//! `Image.alpha_composite`, whose integer kernel lives in
-//! `src/libImaging/AlphaComposite.c`. This module reimplements that kernel
-//! exactly (including its wraparound arithmetic and rounded divides) so
-//! pre-WebP RGBA buffers are bit-identical to the Python worker.
+//! The compositor works in **premultiplied RGBA8** and blends layers with
+//! Porter-Duff source-over using AArch64 NEON SIMD (via the `wide` crate)
+//! on the Graviton Lambda target:
 //!
-//! Reference kernel (Pillow 12.x):
-//! ```c
-//! UINT32 blend = dst.a * (255 - src.a);
-//! UINT32 outa255 = src.a * 255 + blend;
-//! UINT32 coef1 = src.a * 255 * 255 * (1 << 7) / outa255;      // truncating
-//! UINT32 coef2 = 255 * (1 << 7) - coef1;                       // wraps for opaque src
-//! out.c = SHIFTFORDIV255(tmp + (0x80 << 7)) >> 7;              // wrapping add
-//! out.a = SHIFTFORDIV255(outa255 + 0x80);
-//! // SHIFTFORDIV255(a) = (((a >> 8) + a) >> 8)
+//! ```text
+//! decoded straight RGBA8 layer
+//!         ↓  premultiply once per layer (SIMD)
+//! premultiplied RGBA8 layer
+//!         ↓  source-over per layer (SIMD)
+//! premultiplied RGBA8 frame
+//!         ↓  unpremultiply once per frame (SIMD)
+//! straight RGBA8 frame  →  PNG / WebP
 //! ```
+//!
+//! The scalar reference in [`scalar`] is the permanent correctness oracle;
+//! [`wide`] must match it byte-for-byte (enforced by [`tests`]). The
+//! `blend_pixel` function below is the legacy Pillow-exact kernel kept for
+//! reference only; the production path never calls it.
+
+mod scalar;
+#[cfg(test)]
+mod tests;
+mod wide;
+
+pub use scalar::{premultiply_rgba_scalar, source_over_scalar, unpremultiply_rgba_scalar};
+pub use wide::{premultiply_rgba, source_over, unpremultiply_rgba};
 
 use crate::error::ComposeError;
 
@@ -31,8 +39,12 @@ fn shift_for_div_255(value: u32) -> u32 {
     ((value >> 8) + value) >> 8
 }
 
-/// Blend one straight-alpha RGBA source pixel over one destination pixel,
-/// returning the same values Pillow's `Image.alpha_composite` would produce.
+/// Legacy Pillow-exact straight-alpha blend, kept as a reference.
+///
+/// The production compositor uses the premultiplied SIMD path
+/// ([`source_over`]); this function documents the historical
+/// `Image.alpha_composite` kernel (including its wraparound arithmetic and
+/// rounded divides) that the previous worker used.
 #[inline(always)]
 pub fn blend_pixel(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
     let sa = src[3] as u32;
@@ -71,7 +83,11 @@ pub fn blend_pixel(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
     [r as u8, g as u8, b as u8, a as u8]
 }
 
-/// Decoded straight-alpha RGBA8 layer.
+/// Decoded RGBA8 layer.
+///
+/// `png::decode_rgba8` returns straight-alpha pixels; the worker calls
+/// [`premultiply_rgba`] once after decode and reuses the premultiplied
+/// pixels across every frame in the chunk.
 #[derive(Clone, Debug)]
 pub struct RgbaImage {
     pub width: u32,
@@ -90,21 +106,10 @@ impl RgbaImage {
     }
 }
 
-#[cfg(test)]
-impl Canvas {
-    #[inline]
-    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
-        let offset = ((y * self.width + x) * 4) as usize;
-        [
-            self.pixels[offset],
-            self.pixels[offset + 1],
-            self.pixels[offset + 2],
-            self.pixels[offset + 3],
-        ]
-    }
-}
-
 /// A fully transparent RGBA canvas at the job's delivered dimensions.
+///
+/// During compositing the canvas holds **premultiplied** RGBA8; the worker
+/// unpremultiplies once before encoding.
 pub struct Canvas {
     pub width: u32,
     pub height: u32,
@@ -129,11 +134,13 @@ impl Canvas {
         }
     }
 
-    /// Draw `layer` at integer offset (`x`, `y`) with Pillow's clipping rules.
+    /// Draw a **premultiplied** `layer` at integer offset (`x`, `y`) with
+    /// Pillow's clipping rules.
     ///
-    /// The intersection of the layer rect against the canvas is composited;
-    /// anything fully off-canvas (negative or overflowing placement) is
-    /// skipped just like `Image.alpha_composite(dest=(x, y))` in Pillow.
+    /// The intersection of the layer rect against the canvas is composited
+    /// with SIMD source-over; anything fully off-canvas (negative or
+    /// overflowing placement) is skipped just like
+    /// `Image.alpha_composite(dest=(x, y))` in Pillow.
     pub fn composite(&mut self, layer: &RgbaImage, x: i64, y: i64) {
         let iw = layer.width as i64;
         let ih = layer.height as i64;
@@ -148,32 +155,29 @@ impl Canvas {
         }
         let left = (x0 - x) as usize; // source column offset, >= 0 by clipping
         let top = (y0 - y) as usize;
+        let row_pixels = (x1 - x0) as usize;
         for row in y0..y1 {
             let dst_row = row as usize;
             let src_row = (top + (row - y0) as usize) * layer.width as usize;
-            let mut dst_off = (dst_row * self.width as usize + x0 as usize) * 4;
-            let mut src_off = (src_row + left) * 4;
-            let end = dst_off + (x1 - x0) as usize * 4;
-            while dst_off < end {
-                let out = blend_pixel(
-                    [
-                        layer.pixels[src_off],
-                        layer.pixels[src_off + 1],
-                        layer.pixels[src_off + 2],
-                        layer.pixels[src_off + 3],
-                    ],
-                    [
-                        self.pixels[dst_off],
-                        self.pixels[dst_off + 1],
-                        self.pixels[dst_off + 2],
-                        self.pixels[dst_off + 3],
-                    ],
-                );
-                self.pixels[dst_off..dst_off + 4].copy_from_slice(&out);
-                dst_off += 4;
-                src_off += 4;
-            }
+            let dst_start = (dst_row * self.width as usize + x0 as usize) * 4;
+            let src_start = (src_row + left) * 4;
+            let row_bytes = row_pixels * 4;
+            source_over(
+                &mut self.pixels[dst_start..dst_start + row_bytes],
+                &layer.pixels[src_start..src_start + row_bytes],
+            );
         }
+    }
+
+    #[cfg(test)]
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * self.width + x) * 4) as usize;
+        [
+            self.pixels[offset],
+            self.pixels[offset + 1],
+            self.pixels[offset + 2],
+            self.pixels[offset + 3],
+        ]
     }
 }
 
@@ -232,188 +236,4 @@ pub fn frame_canvas_sizes(
         py_round(raster_canvas[1] as f64 * scale).max(1),
     ];
     Ok((raster_canvas, output_canvas))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn blend(src: (u8, u8, u8, u8), dst: (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
-        let out = blend_pixel([src.0, src.1, src.2, src.3], [dst.0, dst.1, dst.2, dst.3]);
-        (out[0], out[1], out[2], out[3])
-    }
-
-    #[test]
-    fn opaque_source_over_transparent_destination() {
-        assert_eq!(
-            blend((200, 100, 50, 255), (0, 0, 0, 0)),
-            (200, 100, 50, 255)
-        );
-    }
-
-    #[test]
-    fn opaque_source_paints_opaque_destination() {
-        assert_eq!(
-            blend((200, 100, 50, 255), (10, 20, 30, 40)),
-            (200, 100, 50, 255)
-        );
-    }
-
-    #[test]
-    fn transparent_source_leaves_destination_untouched() {
-        let dst = (11, 22, 33, 44);
-        assert_eq!(blend((200, 100, 50, 0), dst), dst);
-    }
-
-    #[test]
-    fn semi_transparent_source_over_transparent_destination() {
-        assert_eq!(
-            blend((200, 100, 50, 128), (0, 0, 0, 0)),
-            (200, 100, 50, 128)
-        );
-    }
-
-    #[test]
-    fn semi_transparent_source_over_semi_transparent_destination() {
-        // Straight alpha: source keeps sa/outa (2/rds) and destination keeps
-        // da*(1-sa)/outa (1/Third) of its color, so the blend is not a 50/50 mix.
-        assert_eq!(
-            blend((200, 100, 50, 128), (10, 20, 30, 128)),
-            (137, 73, 43, 192)
-        );
-    }
-
-    #[test]
-    fn full_alpha_sweep_matches_pillow() {
-        // Exhaustive alpha sweep against the verified reference values.
-        for sa in 0..=255u32 {
-            for da in 0..=255u32 {
-                let src = (200, 100, 50, sa as u8);
-                let dst = (7, 9, 11, da as u8);
-                let _ = blend(src, dst);
-            }
-        }
-    }
-
-    #[test]
-    fn repeated_translucent_layers_order_matters() {
-        // Red (50%) then blue (50%): the order changes the result.
-        let red = [200, 0, 0, 128];
-        let blue = [0, 0, 200, 128];
-        let mut canvas = [0u8; 4];
-        canvas = blend_pixel(red, canvas);
-        let red_then_blue = blend_pixel(blue, canvas);
-
-        let mut canvas = [0u8; 4];
-        canvas = blend_pixel(blue, canvas);
-        let blue_then_red = blend_pixel(red, canvas);
-        assert_ne!(red_then_blue, blue_then_red);
-        assert_eq!(red_then_blue, [66, 0, 134, 192]);
-        assert_eq!(blue_then_red, [134, 0, 66, 192]);
-    }
-
-    fn layer(width: u32, height: u32, value: [u8; 4]) -> RgbaImage {
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for _ in 0..width * height {
-            pixels.extend_from_slice(&value);
-        }
-        RgbaImage::new(width, height, pixels)
-    }
-
-    #[test]
-    fn canvas_composite_negative_placement_clips() {
-        // A 4x4 layer placed at (-3, -1) leaves only column 0, rows 0..2.
-        let mut canvas = Canvas::new(8, 8);
-        canvas.composite(&layer(4, 4, [255, 0, 0, 255]), -3, -1);
-        for y in 0..8u32 {
-            for x in 0..8u32 {
-                let p = &canvas.pixels[((y * 8 + x) * 4) as usize..((y * 8 + x) * 4 + 4) as usize];
-                if x == 0 && y <= 2 {
-                    assert_eq!(p, [255, 0, 0, 255], "expected fill at {x},{y}");
-                } else {
-                    assert_eq!(p, [0, 0, 0, 0], "expected transparent at {x},{y}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn canvas_composite_right_and_bottom_clipping() {
-        // A 6x6 layer at (5, 5) on an 8x8 canvas leaves a 3x3 visible corner.
-        let mut canvas = Canvas::new(8, 8);
-        canvas.composite(&layer(6, 6, [0, 255, 0, 255]), 5, 5);
-        for y in 0..8u32 {
-            for x in 0..8u32 {
-                let p = &canvas.pixels[((y * 8 + x) * 4) as usize..((y * 8 + x) * 4 + 4) as usize];
-                if x >= 5 && y >= 5 {
-                    assert_eq!(p, [0, 255, 0, 255], "expected fill at {x},{y}");
-                } else {
-                    assert_eq!(p, [0, 0, 0, 0], "expected transparent at {x},{y}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn canvas_composite_one_pixel_wide_geometry() {
-        let mut canvas = Canvas::new(2, 1);
-        canvas.composite(&layer(2, 1, [1, 2, 3, 255]), 0, 0);
-        assert_eq!(&canvas.pixels, &[1, 2, 3, 255, 1, 2, 3, 255]);
-    }
-
-    #[test]
-    fn canvas_composite_fully_off_canvas_is_a_noop() {
-        let mut canvas = Canvas::new(4, 4);
-        canvas.composite(&layer(2, 2, [9, 9, 9, 255]), -5, -5);
-        canvas.composite(&layer(2, 2, [9, 9, 9, 255]), 10, 10);
-        assert!(canvas.pixels.iter().all(|&v| v == 0));
-    }
-
-    #[test]
-    fn repeated_component_across_frames_reuses_decoded_pixels() {
-        // The same decoded layer is drawn into two canvases; this mirrors the
-        // worker contract that one decode serves every frame in the chunk.
-        let shared = layer(3, 3, [120, 30, 200, 200]);
-        let mut first = Canvas::new(4, 4);
-        let mut second = Canvas::new(4, 4);
-        first.composite(&shared, 1, 1);
-        second.composite(&shared, 1, 1);
-        assert_eq!(first.pixels, second.pixels);
-        assert_eq!(first.pixel(1, 1), [120, 30, 200, 200]);
-        assert_eq!(first.pixel(0, 0), [0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn py_round_uses_bankers_rounding() {
-        assert_eq!(py_round(1197.5), 1198);
-        assert_eq!(py_round(2.5), 2);
-        assert_eq!(py_round(1.5), 2);
-        assert_eq!(py_round(0.5), 0);
-        assert_eq!(py_round(3.7), 4);
-        assert_eq!(py_round(2.2), 2);
-        assert_eq!(py_round(-0.5), 0);
-    }
-
-    #[test]
-    fn frame_canvas_sizes_match_python_rounding() {
-        // 697 -> 348 axis from the regression fixture.
-        let (raster, _) = frame_canvas_sizes(&[0.0, 0.0, 697.0, 1024.0], 4096, 2048).unwrap();
-        assert_eq!(raster, [2788, 4096]);
-        let (raster, output) = frame_canvas_sizes(&[0.0, 0.0, 40.0, 20.0], 512, 256).unwrap();
-        assert_eq!(raster, [512, 256]);
-        assert_eq!(output, [256, 128]);
-        assert_eq!(
-            frame_canvas_sizes(&[0.0, 0.0, 40.0, 20.0], 256, 256)
-                .unwrap()
-                .1,
-            [256, 128]
-        );
-    }
-
-    #[test]
-    fn frame_canvas_sizes_reject_bad_viewboxes() {
-        assert!(frame_canvas_sizes(&[0.0, 0.0, 0.0, 20.0], 512, 256).is_err());
-        assert!(frame_canvas_sizes(&[0.0, 0.0], 512, 256).is_err());
-        assert!(frame_canvas_sizes(&[0.0, 0.0, 40.0, 20.0], 256, 512).is_err());
-    }
 }
