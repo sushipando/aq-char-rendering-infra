@@ -694,8 +694,9 @@ fn apply_blur(
     Ok(Image::from_image(pixmap, cs))
 }
 
-/// libblur fixed-point Gaussian on premultiplied RGBA (the recommended first
-/// version: exact sigma, fixed-point convolution, single thread, Clamp edge).
+/// libblur Gaussian on premultiplied RGBA. Runtime: default exact
+/// convolution + Reflect edge (best parity), or RESVG_BLUR_MODE=fixed and
+/// RESVG_BLUR_EDGE=clamp|wrap.
 #[cfg(feature = "simd-blur")]
 fn gaussian_blur_libblur(width: u32, height: u32, std_dx: f32, std_dy: f32, data: &mut [u8]) {
     use libblur::{
@@ -709,13 +710,22 @@ fn gaussian_blur_libblur(width: u32, height: u32, std_dx: f32, std_dy: f32, data
         let mut dst = BlurImageMut::borrow(&mut scratch, width, height, FastBlurChannels::Channels4);
         let params =
             GaussianBlurParams::new_asymmetric_from_sigma(std_dx as f64, std_dy as f64);
+        let mode = match std::env::var("RESVG_BLUR_MODE").as_deref() {
+            Ok("fixed") => ConvolutionMode::FixedPoint,
+            _ => ConvolutionMode::Exact,
+        };
+        let edge = match std::env::var("RESVG_BLUR_EDGE").as_deref() {
+            Ok("clamp") => EdgeMode::Clamp,
+            Ok("wrap") => EdgeMode::Wrap,
+            _ => EdgeMode::Reflect,
+        };
         let _ = libblur::gaussian_blur(
             &src,
             &mut dst,
             params,
-            EdgeMode2D::new(EdgeMode::Clamp),
+            EdgeMode2D::new(edge),
             ThreadingPolicy::Single,
-            ConvolutionMode::FixedPoint,
+            mode,
         );
     }
     data.copy_from_slice(&scratch);
