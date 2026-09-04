@@ -235,17 +235,18 @@ Each iteration needs normal Lambda service/throttle retries. A failed
 component must fail the Map and enter the existing protected workflow failure
 handler; the compositor must never silently omit a failed layer.
 
-`ComposeComponentFrameChunks` replaces the existing `RenderFrameBatches` Map
-for component-raster jobs. `FinalizeAnimation` remains the lightweight mux and
-publish barrier. Keeping composition distinct from component rasterization
-makes timings, memory use, and concurrency independently tunable.
+`ComposeComponentFrameChunks` replaced the legacy `RenderFrameBatches` Map;
+the full-frame legacy renderer has since been removed and every job now runs
+`RasterComponentStates -> ComposeComponentFrameChunks -> FinalizeAnimation`.
+`FinalizeAnimation` remains the lightweight mux and publish barrier. Keeping
+composition distinct from component rasterization makes timings, memory use,
+and concurrency independently tunable.
 
 ## Benchmark configuration
 
 Add explicit development tuning for the experiment:
 
 ```text
-componentRasterEnabled = true
 componentRasterConcurrency = 200
 componentRasterFrameCap = 120
 componentComposeFramesPerLambda = 10
@@ -255,8 +256,7 @@ componentComposeConcurrency = 20
 The existing request's raster size, output size, zoom, padding, WebP quality,
 and WebP method remain authoritative.
 
-The old pipeline should remain selectable with a feature flag until visual
-and performance comparisons pass.
+The component path is mandatory; there is no legacy fallback renderer.
 
 ### Concurrency 5 -> 40 deployment benchmark (2026-09-02)
 

@@ -101,7 +101,6 @@ def pipeline_config() -> RuntimeConfig:
         asset_manifest_key="datasets/dev-v1/manifest.json",
         character_renderer_key="character-renderer/dev-v1/characterB.swf",
         finalizer_download_concurrency=4,
-        component_raster_enabled=True,
         component_raster_concurrency=4,
         component_raster_frame_cap=25,
         render_cache_enabled=False,

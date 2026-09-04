@@ -26,7 +26,6 @@ export interface RenderTuning {
   readonly officialAssetTimeoutSeconds: number;
   readonly maxActivePerUser: number;
   readonly renderCacheEnabled: boolean;
-  readonly componentRasterEnabled: boolean;
   readonly componentRasterConcurrency: number;
   readonly componentRasterFrameCap: number;
   readonly componentComposeFramesPerLambda: number;
@@ -49,7 +48,6 @@ export interface InfrastructureTuning {
   readonly functions: Readonly<{
     launcher: FunctionTuning;
     prepare: FunctionTuning;
-    render: FunctionTuning;
     finalizer: FunctionTuning;
     componentRaster: FunctionTuning;
     componentCompose: FunctionTuning;
@@ -88,7 +86,6 @@ const DEV_TUNING: InfrastructureTuning = {
     // 120-frame jobs must produce fast (<300s) and each source SWF spawns its
     // own FFDec JVM, so prepare runs are capped at 300s.
     prepare: mib(3008, 4096, 300),
-    render: mib(3008, 4096, 900),
     finalizer: mib(3008, 4096, 300),
     // Component workers rasterize one unique placed state each (tight page at
     // the shared pixel scale); a 4096-raster benchmark needs the render-class
@@ -181,10 +178,6 @@ const DEV_TUNING: InfrastructureTuning = {
     // raster size, downsample it to the output grid, then compose at most
     // `componentRasterFrameCap` frames in a second concurrency-capped Map.
     // See docs/component-raster-pipeline.md.
-    componentRasterEnabled: true,
-    // Run one Express child workflow per unique component state. The
-    // Distributed Map can dispatch up to 200 component raster Lambdas at once;
-    // Lambda's regional concurrency remains the account-wide safety ceiling.
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
     // Twelve 10-frame workers cover the current 120-frame maximum in one Map

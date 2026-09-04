@@ -1792,7 +1792,10 @@ def prepare_finish(
         mark("loop_detection_ms", phase)
 
         phase = time.perf_counter()
-        component_mode = bool(config.component_raster_enabled)
+        # Every job now runs the component-raster path (the legacy full-frame
+        # RenderFrameBatches Map was removed from the workflow), so the
+        # component manifest is always required.
+        component_mode = True
         if component_mode:
             # Component-raster safety cap (docs/component-raster-pipeline.md):
             # rasterize each unique placed component state once, then compose

@@ -28,7 +28,6 @@ export interface AqwCharRenderingInfraStackProps extends cdk.StackProps {
 interface RendererFunctions {
   readonly launcher: lambda.DockerImageFunction;
   readonly prepare: lambda.DockerImageFunction;
-  readonly render: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
   readonly componentRasterRust: lambda.DockerImageFunction;
   readonly componentComposeRust: lambda.DockerImageFunction;
@@ -297,9 +296,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         tuning.render.officialAssetTimeoutSeconds,
       ),
       CHAR_RENDER_CACHE_ENABLED: String(tuning.render.renderCacheEnabled),
-      CHAR_RENDER_COMPONENT_RASTER_ENABLED: String(
-        tuning.render.componentRasterEnabled,
-      ),
       CHAR_RENDER_COMPONENT_RASTER_CONCURRENCY: String(
         tuning.render.componentRasterConcurrency,
       ),
@@ -379,7 +375,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     return {
       launcher: make('Launcher', 'aqw_char_renderer.handlers.launcher.handler', tuning.functions.launcher),
       prepare: make('Prepare', 'aqw_char_renderer.handlers.prepare.handler', tuning.functions.prepare),
-      render: make('Render', 'aqw_char_renderer.handlers.render.handler', tuning.functions.render),
       finalizer: make('Finalizer', 'aqw_char_renderer.handlers.finalize.handler', tuning.functions.finalizer),
       componentComposeRust,
 
@@ -483,30 +478,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       resultPath: '$.prepare',
     }).addRetry(lambdaRetry);
 
-    // The shared canvas is computed in prepare_finish from each unique
-    // state's alpha-probed bounds, so there is no probe Map or Fit Lambda.
-    const renderMap = new sfn.Map(this, 'RenderFrameBatches', {
-      itemsPath: '$.prepare.batches',
-      maxConcurrency: tuning.render.mapConcurrency,
-      resultPath: '$.render_results',
-      itemSelector: {
-        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
-        manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
-        batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
-      },
-    });
-    renderMap.itemProcessor(
-      new tasks.LambdaInvoke(this, 'RenderFrameBatch', {
-        lambdaFunction: functions.render,
-        payload: sfn.TaskInput.fromObject({
-          job_id: sfn.JsonPath.stringAt('$.job_id'),
-          manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
-          batch: sfn.JsonPath.objectAt('$.batch'),
-        }),
-        payloadResponseOnly: true,
-      }).addRetry(lambdaRetry),
-    );
-
     // Finalize muxes the animation and completes the job inline, so a
     // rendered job costs no trailing completion state transition.
     const finalize = new tasks.LambdaInvoke(this, 'FinalizeAnimation', {
@@ -576,13 +547,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     const componentRenderMiss = componentRasterMap
       .next(componentComposeMap)
       .next(finalize);
-    const legacyRenderMiss = renderMap.next(finalize);
-    const renderBranch = new sfn.Choice(this, 'RenderingPipeline')
-      .when(
-        sfn.Condition.booleanEquals('$.prepare.component_pipeline', true),
-        componentRenderMiss,
-      )
-      .otherwise(legacyRenderMiss);
 
     const completeCached = new tasks.LambdaInvoke(this, 'CompleteCachedJob', {
       lambdaFunction: functions.complete,
@@ -603,10 +567,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         prepare: sfn.JsonPath.objectAt('$.prepare'),
       },
     });
+    // All jobs now run only the component-raster path: unique states are
+    // rasterized by the Rust worker, then composed/encoded in chunks.
     const renderMiss = exportMap
       .next(prepareFinish)
       .next(discardExportResults)
-      .next(renderBranch);
+      .next(componentRenderMiss);
     const cacheChoice = new sfn.Choice(this, 'CachedResultExists')
       .when(sfn.Condition.booleanEquals('$.prepare.cache_hit', true), completeCached)
       .otherwise(renderMiss);
@@ -668,7 +634,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       }),
     );
     workBucket.grantReadWrite(functions.prepare);
-    workBucket.grantReadWrite(functions.render);
     workBucket.grantReadWrite(functions.finalizer);
     workBucket.grantReadWrite(functions.componentRasterRust);
     // Least-privilege S3: the Rust workers only read the prepare manifest and
@@ -688,7 +653,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     const concurrency = {
       [functions.launcher.functionName]: tuning.functions.launcher.reservedConcurrency,
       [functions.prepare.functionName]: tuning.functions.prepare.reservedConcurrency,
-      [functions.render.functionName]: tuning.functions.render.reservedConcurrency,
       [functions.finalizer.functionName]: tuning.functions.finalizer.reservedConcurrency,
       [functions.componentRasterRust.functionName]: tuning.functions.componentRaster.reservedConcurrency,
       [functions.componentComposeRust.functionName]: tuning.functions.componentCompose.reservedConcurrency,
@@ -732,7 +696,6 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       JSON.stringify([
         functions.launcher.functionName,
         functions.prepare.functionName,
-        functions.render.functionName,
         functions.finalizer.functionName,
         functions.componentRasterRust.functionName,
         functions.componentComposeRust.functionName,

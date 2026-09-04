@@ -22,7 +22,6 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     mapConcurrency: 300,
     webpQuality: 85,
     allowOfficialAssetFallback: true,
-    componentRasterEnabled: true,
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
     componentComposeFramesPerLambda: 10,
@@ -50,7 +49,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 4);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 9);
+  template.resourceCountIs('AWS::Lambda::Function', 8);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
@@ -102,7 +101,7 @@ test('component rasterization uses a 200-way distributed Express Map', () => {
 
 test('the Rust component-raster worker is the live backend with 3008 MiB and no reserve cap', () => {
   const template = synthesize();
-  template.resourceCountIs('AWS::Lambda::Function', 9);
+  template.resourceCountIs('AWS::Lambda::Function', 8);
   // The active backend shares the account concurrency pool (no reserved cap).
   const functions = template.findResources('AWS::Lambda::Function');
   const rust = Object.values(functions).find((resource: any) =>

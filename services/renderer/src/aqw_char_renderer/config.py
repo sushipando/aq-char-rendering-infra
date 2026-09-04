@@ -83,10 +83,10 @@ class RuntimeConfig:
     # check so every job re-renders. Dev disables this to exercise the real
     # pipeline; prod enables it for cost/latency deduplication.
     render_cache_enabled: bool = True
-    # Component-raster pipeline (see docs/component-raster-pipeline.md). When
-    # enabled, PrepareFinish caps the output, builds unique placed-component
-    # raster tasks, and partitions final composition into bounded frame chunks.
-    component_raster_enabled: bool = False
+    # Component-raster pipeline (see docs/component-raster-pipeline.md). The
+    # legacy full-frame renderer was removed from the workflow, so the
+    # component pipeline is always enabled: prepare builds unique placed-
+    # component raster tasks and partitions composition into bounded chunks.
     component_raster_concurrency: int = 5
     component_raster_frame_cap: int = 25
     component_compose_frames_per_lambda: int = 10
@@ -169,9 +169,6 @@ class RuntimeConfig:
                 values, "CHAR_RENDER_OFFICIAL_ASSET_TIMEOUT_SECONDS", 15, 1, 60
             ),
             render_cache_enabled=_boolean(values, "CHAR_RENDER_CACHE_ENABLED", True),
-            component_raster_enabled=_boolean(
-                values, "CHAR_RENDER_COMPONENT_RASTER_ENABLED", False
-            ),
             component_raster_concurrency=_integer(
                 values, "CHAR_RENDER_COMPONENT_RASTER_CONCURRENCY", 5, 1, 300
             ),
