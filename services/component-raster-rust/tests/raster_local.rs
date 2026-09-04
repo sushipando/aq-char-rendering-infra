@@ -3,6 +3,7 @@
 //! and assert the result record and PNG geometry. Failure modes (missing
 //! task, unknown part, malformed zoom matrix) fail explicitly.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +64,51 @@ fn make_bundle() -> Vec<u8> {
 }
 
 fn manifest(tasks: Vec<Value>, raster_size: i64, output_size: i64) -> Value {
-    json!({
+    manifest_with_parts(
+        tasks,
+        raster_size,
+        output_size,
+        json!({
+            "armor": {
+                "source_idx": 0,
+                "root_class": "Armor",
+                "character_id": 286,
+                "color_rules": {"chest": ["Base", "dark"]},
+                "placement_colors": {"286,11": {"red_mult": 128, "green_mult": 256, "blue_mult": 256, "alpha_mult": 256, "red_add": 0, "green_add": 0, "blue_add": 0, "alpha_add": 0}},
+            }
+        }),
+        Some(json!([["Base", "dark"]])),
+    )
+}
+
+/// A manifest whose single part has no color/placement customization, so the
+/// worker treats it as appearance-independent and can cache its raster.
+fn no_cc_manifest(tasks: Vec<Value>, raster_size: i64, output_size: i64) -> Value {
+    manifest_with_parts(
+        tasks,
+        raster_size,
+        output_size,
+        json!({
+            "armor": {
+                "source_idx": 0,
+                "root_class": "Armor",
+                "character_id": 286,
+                "color_rules": {},
+                "placement_colors": {},
+            }
+        }),
+        None,
+    )
+}
+
+fn manifest_with_parts(
+    tasks: Vec<Value>,
+    raster_size: i64,
+    output_size: i64,
+    parts: Value,
+    all_color_rules: Option<Value>,
+) -> Value {
+    let m = json!({
         "schema_version": 1,
         "job_id": JOB,
         "render_hash": "integration",
@@ -73,16 +118,8 @@ fn manifest(tasks: Vec<Value>, raster_size: i64, output_size: i64) -> Value {
         "viewbox": [0.0, 0.0, 512.0, 512.0],
         "frame_durations": [42],
         "fields": {"intColorBase": "16711680"},
-        "parts": {
-            "armor": {
-                "source_idx": 0,
-                "root_class": "Armor",
-                "character_id": 286,
-                "color_rules": {"chest": ["Base", "dark"]},
-                "placement_colors": {"286,11": {"red_mult": 128, "green_mult": 256, "blue_mult": 256, "alpha_mult": 256, "red_add": 0, "green_add": 0, "blue_add": 0, "alpha_add": 0}},
-            }
-        },
-        "all_color_rules": [["Base", "dark"]],
+        "parts": parts,
+        "all_color_rules": all_color_rules.unwrap_or_else(|| json!([])),
         "settings": {
             "facing": "right",
             "zoom": 2.0,
@@ -96,7 +133,8 @@ fn manifest(tasks: Vec<Value>, raster_size: i64, output_size: i64) -> Value {
         "component_tasks": tasks,
         "component_frames": [],
         "component_raster_space": "output",
-    })
+    });
+    m
 }
 
 fn populate(root: &Path, manifest: &Value) {
@@ -366,5 +404,81 @@ fn raster_output_is_deterministic_across_runs() {
     )
     .unwrap();
     assert_eq!(png, png_again);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn local_raster_reuses_no_cc_cache_on_second_run() {
+    // An appearance-independent part (no color/placement rules) must populate
+    // the content-addressed cache on the first run and serve the identical
+    // PNG from that cache on the second, without re-rendering.
+    let root = unique_dir("cache");
+    let manifest = no_cc_manifest(vec![default_task()], 512, 256);
+    populate(&root, &manifest);
+
+    let first = run(&root, 0);
+    assert!(
+        first.status.success(),
+        "{} pending",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_record: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_record["empty"], false);
+    let first_png = std::fs::read(
+        root.join("work")
+            .join(first_record["png_key"].as_str().unwrap()),
+    )
+    .unwrap();
+
+    // The worker wrote a cache entry under component-rasters/{schema}/{key}.
+    let cache_dir = root.join("work").join("component-rasters");
+    assert!(cache_dir.is_dir());
+    let entries: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected one cache schema dir");
+    let schema_dir = &entries[0];
+    let cache_files = fs::read_dir(schema_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(cache_files.len(), 2, "expected meta + png cache objects");
+
+    // Re-run the same task in the same store: the cache entry is read and the
+    // same PNG is served (byte-identical to the freshly rendered one).
+    let second = run(&root, 0);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_record: Value = serde_json::from_slice(&second.stdout).unwrap();
+    let second_png = std::fs::read(
+        root.join("work")
+            .join(second_record["png_key"].as_str().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(second_png, first_png);
+    assert_eq!(second_record["sha256"], first_record["sha256"]);
+    assert_eq!(second_record["x"], first_record["x"]);
+    assert_eq!(second_record["y"], first_record["y"]);
+    assert_eq!(second_record["width"], first_record["width"]);
+    assert_eq!(second_record["height"], first_record["height"]);
+
+    // Mutating a cache entry must not corrupt future renders: a corrupt
+    // meta falls through to a fresh render.
+    for file in cache_files {
+        std::fs::write(&file, b"corrupt").unwrap();
+    }
+    let third = run(&root, 0);
+    assert!(
+        third.status.success(),
+        "corrupt cache must fall back to render: {}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let third_record: Value = serde_json::from_slice(&third.stdout).unwrap();
+    assert_eq!(third_record["empty"], false);
+    assert!(third_record["width"].as_i64().unwrap() > 0);
     std::fs::remove_dir_all(&root).ok();
 }

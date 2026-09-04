@@ -193,6 +193,117 @@ pub async fn run_raster_task(
     let member = task.member.clone();
     let task_id = task.task_id.clone();
 
+    // ---- content-addressed cache --------------------------------------------
+    // Appearance-independent parts (no color/placement customization) can be
+    // reused verbatim across jobs and characters: the key is computed from
+    // manifest + task fields only, so a hit skips bundle download, import,
+    // SVG build, resvg, downsample, and encode.
+    let cache_key = if crate::cache::is_no_cc(&part) {
+        match &task.state_signature {
+            Some(signature) => Some(crate::cache::cache_key(
+                signature,
+                matrix,
+                darken,
+                task.layer_index,
+                &task.layer_name,
+                viewbox,
+                raster_size,
+                output_size,
+                &component_raster_space,
+                zoom,
+                &part,
+            )?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut cache_hit = false;
+    if let Some(key) = &cache_key {
+        if let Some((cached_meta, cached_png)) = crate::cache::read_cache(source, key).await? {
+            let mut result = RasterResult {
+                task_id: task_id.clone(),
+                empty: cached_meta.empty,
+                x: cached_meta.x,
+                y: cached_meta.y,
+                width: cached_meta.width,
+                height: cached_meta.height,
+                sha256: cached_meta.sha256.clone(),
+                bytes: cached_meta.bytes,
+                png_key: None,
+                input_bytes: cached_meta.input_bytes,
+                svg_bytes: cached_meta.svg_bytes,
+                filter_count: cached_meta.filter_count,
+                component_raster_space: component_raster_space.clone(),
+                canvas_width: if component_raster_space == COMPONENT_RASTER_SPACE_OUTPUT {
+                    output_canvas[0]
+                } else {
+                    raster_canvas[0]
+                },
+                canvas_height: if component_raster_space == COMPONENT_RASTER_SPACE_OUTPUT {
+                    output_canvas[1]
+                } else {
+                    raster_canvas[1]
+                },
+                state_signature: task.state_signature.clone(),
+                symbol_key: symbol_key.clone(),
+                layer_name: task.layer_name.clone(),
+                result_key: String::new(),
+                rasterize_ms: 0.0,
+                crop_ms: 0.0,
+                downsample_ms: 0.0,
+            };
+            let png_key = match &event.benchmark_output_prefix {
+                Some(prefix) => format!("{prefix}/rasters/{task_id}.png"),
+                None => format!("jobs/{}/component/rasters/{task_id}.png", event.job_id),
+            };
+            if let Some(png) = cached_png {
+                sink.put(&png_key, "image/png", &png).await?;
+                result.png_key = Some(png_key);
+            }
+            let result_key = match &event.benchmark_output_prefix {
+                Some(prefix) => format!("{prefix}/results/{task_id}.json"),
+                None => format!("jobs/{}/component/results/{task_id}.json", event.job_id),
+            };
+            result.result_key = result_key.clone();
+            sink.put(
+                &result_key,
+                "application/json",
+                &serde_json::to_vec(&result)?,
+            )
+            .await?;
+            cache_hit = true;
+
+            let total_ms = elapsed_ms(started);
+            let stats = RasterStats {
+                job_id: event.job_id.clone(),
+                task_id,
+                symbol_key,
+                layer_name: result.layer_name.clone(),
+                empty: result.empty,
+                svg_bytes: cached_meta.svg_bytes,
+                input_bytes: cached_meta.input_bytes,
+                filter_count: cached_meta.filter_count,
+                raster_pixel_count: if result.empty {
+                    0
+                } else {
+                    (result.width * result.height) as u64
+                },
+                component_raster_space,
+                raster_canvas: (raster_canvas[0], raster_canvas[1]),
+                output_canvas: (output_canvas[0], output_canvas[1]),
+                cache_hit,
+                timings: RasterTimings {
+                    manifest_ms,
+                    ..RasterTimings::default()
+                },
+                total_ms,
+            };
+            log_raster_profile(&stats);
+            return Ok(result);
+        }
+    }
+
     // ---- bundle -------------------------------------------------------------
     let bundle_started = Instant::now();
     let bundle_bytes = source.fetch(&bundle_key).await?;
@@ -300,6 +411,10 @@ pub async fn run_raster_task(
         ..RasterTimings::default()
     };
 
+    // The final PNG bytes are kept so the content-addressed cache can be
+    // populated after a miss (only for appearance-independent parts).
+    let mut cached_png_bytes: Option<Vec<u8>> = None;
+
     if component.visible {
         let rasterize_started = Instant::now();
         let rendered = render_svg(&svg_bytes, (page_width, page_height))?;
@@ -351,6 +466,9 @@ pub async fn run_raster_task(
                 result.height = image.height as i64;
                 result.sha256 = Some(sha);
                 result.bytes = Some(png_bytes.len() as u64);
+                if cache_key.is_some() {
+                    cached_png_bytes = Some(png_bytes.clone());
+                }
 
                 let png_key = match &event.benchmark_output_prefix {
                     Some(prefix) => format!("{prefix}/rasters/{task_id}.png"),
@@ -361,6 +479,28 @@ pub async fn run_raster_task(
                 timings.upload_ms = elapsed_ms(upload_started);
                 result.png_key = Some(png_key);
             }
+        }
+    }
+
+    // ---- populate the cache on a miss ---------------------------------------
+    if let Some(key) = &cache_key {
+        let meta = crate::cache::CacheMeta {
+            empty: result.empty,
+            x: result.x,
+            y: result.y,
+            width: result.width,
+            height: result.height,
+            sha256: result.sha256.clone(),
+            bytes: result.bytes,
+            input_bytes,
+            svg_bytes: svg_byte_count,
+            filter_count: filter_count_value,
+        };
+        // Best-effort: a failed cache write must never fail or change a render.
+        if let Err(error) =
+            crate::cache::write_cache(sink, key, &meta, cached_png_bytes.as_deref()).await
+        {
+            eprintln!("component raster cache write failed: {error}");
         }
     }
 
@@ -396,6 +536,7 @@ pub async fn run_raster_task(
         component_raster_space,
         raster_canvas: (raster_canvas[0], raster_canvas[1]),
         output_canvas: (output_canvas[0], output_canvas[1]),
+        cache_hit,
         timings,
         total_ms,
     };

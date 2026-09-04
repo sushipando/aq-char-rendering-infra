@@ -12,6 +12,9 @@ use crate::error::RasterError;
 pub trait Source: Send + Sync {
     async fn read_json(&self, key: &str) -> Result<serde_json::Value, RasterError>;
     async fn fetch(&self, key: &str) -> Result<Vec<u8>, RasterError>;
+    /// `true` if the object exists. Best-effort: any error is reported as a
+    /// miss, which is safe for an optional content-addressed cache.
+    async fn exists(&self, key: &str) -> Result<bool, RasterError>;
 }
 
 #[async_trait::async_trait]
@@ -61,6 +64,22 @@ impl Source for S3Store {
             .await
             .map_err(|error| self.error("get", key, error.to_string()))
             .map(|aggregate| aggregate.into_bytes().to_vec())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, RasterError> {
+        // Any S3 error (most commonly a 404) is treated as a cache miss;
+        // recomputing the raster is always safe.
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -120,6 +139,11 @@ impl Source for FsStore {
         tokio::fs::read(&path).await.map_err(|error| {
             RasterError::invalid(format!("cannot read {}: {error}", path.display()))
         })
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, RasterError> {
+        let path = self.path(key)?;
+        Ok(tokio::fs::try_exists(&path).await.unwrap_or(false))
     }
 }
 
