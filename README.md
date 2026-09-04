@@ -182,6 +182,23 @@ test/                 CDK unit tests
 docs/                 architecture and operating documentation
 ```
 
+### Submitting renders
+
+`scripts/submit_render.py` queues real character renders through the deployed
+workflow (same SQS + DynamoDB admission as the Discord bot) and waits for the
+delivered CloudFront WebP:
+
+```bash
+AWS_PROFILE=aqw-char-dev AWS_DEFAULT_REGION=us-west-2 \
+  uv run --package aqw-char-renderer python scripts/submit_render.py alina \
+    --output-size 2048 --webp-quality 70 --webp-method 2
+```
+
+Multiple characters queue one job each; `--webp-lossless` selects lossless
+encoding; `--max-frames` controls the animation length; `--no-watch` queues
+without waiting; `--no-verify` skips the CloudFront fetch (`--help` for all
+options).
+
 ### Rust component workers
 
 The component pipeline now runs two native Rust Lambdas alongside the Python
