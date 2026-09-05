@@ -84,6 +84,7 @@ enum struct SvgNodeType : uint16_t
     Symbol,
     Filter,
     GaussianBlur,
+    ColorMatrix,
     Pattern,
     Unknown
 };
@@ -420,6 +421,12 @@ struct SvgGaussianBlurNode
     bool edgeModeWrap;
 };
 
+struct SvgColorMatrixNode
+{
+    float values[20];      // feColorMatrix type="matrix" row-major 4x5
+    bool valid;            // false -> the filter primitive is unsupported/ignored
+};
+
 struct SvgFilterNode
 {
     Box box;
@@ -618,6 +625,7 @@ struct SvgNode
         SvgTextNode text;
         SvgFilterNode filter;
         SvgGaussianBlurNode gaussianBlur;
+        SvgColorMatrixNode colorMatrix;
         SvgPatternNode pattern;
     } node;
     SvgXmlSpace xmlSpace = SvgXmlSpace::None;

@@ -658,3 +658,100 @@ bool effectTritone(SwCompositor* cmp, const RenderEffectTritone* params, bool di
 
     return true;
 }
+/************************************************************************/
+/* Color Matrix Implementation (SVG feColorMatrix type="matrix")       */
+/************************************************************************/
+
+/* feColorMatrix is a per-pixel affine transform over *straight* (alpha
+   unpremultiplied) sRGB RGBA channels:
+
+       | a b c d e |   | R |   | R' |
+       | f g h i j | . | G | = | G' |
+       | k l m n o |   | B |   | B' |
+       | p q r s t |   | A |   | A' |
+                       | 1 |
+
+   SwSurface buffers are premultiplied ARGB, so each pixel is first
+   unpremultiplied, the 4x5 row-major coefficients are applied, clamped to
+   [0, 255], and the result is handled like the Tint/Tritone effects in the
+   compositor's direct/indirect branches. The AQW pipeline authors matrix
+   coefficients in straight sRGB
+   (color-interpolation-filters="sRGB"), which is the space used here. */
+
+static inline uint32_t _colorMatrixPixel(const RenderEffectColorMatrix* params, uint32_t src)
+{
+    // SVG feColorMatrix coefficients are normalized to [0, 1] (e.g. the offset
+    // column entry 1.0 == 255), so channels are converted to [0, 1], the 4x5
+    // row-major affine per-pixel transform is applied, and the result is
+    // scaled back to [0, 255]. See tvgSvgBuilder.cpp::_applyFilter.
+    auto straight = rasterUnpremultiply(src);
+    auto r = float((straight >> 16) & 0xff) / 255.0f;
+    auto g = float((straight >> 8) & 0xff) / 255.0f;
+    auto b = float(straight & 0xff) / 255.0f;
+    auto a = float((straight >> 24) & 0xff) / 255.0f;
+
+    uint8_t out[4];
+    auto m = params->matrix;
+    for (int row = 0; row < 4; ++row) {
+        float v = m[row * 5] * r + m[row * 5 + 1] * g + m[row * 5 + 2] * b + m[row * 5 + 3] * a + m[row * 5 + 4];
+        out[row] = uint8_t(std::min(std::max(v, 0.0f), 1.0f) * 255.0f + 0.5f);
+    }
+
+    return (uint32_t(out[3]) << 24) | (uint32_t(out[0]) << 16) | (uint32_t(out[1]) << 8) | uint32_t(out[2]);
+}
+
+
+void effectColorMatrixUpdate(RenderEffectColorMatrix* params)
+{
+    // A (possibly identity) matrix is always applicable; whether the filter
+    // is worth keeping is the filter-application layer's concern.
+    params->valid = true;
+}
+
+
+bool effectColorMatrix(SwCompositor* cmp, const RenderEffectColorMatrix* params, bool direct)
+{
+    auto& bbox = cmp->bbox;
+    auto w = size_t(bbox.max.x - bbox.min.x);
+    auto h = size_t(bbox.max.y - bbox.min.y);
+    auto opacity = cmp->opacity;
+    auto sfc = cmp->recoverSfc;
+    if (direct) {
+        // Direct: the effect result replaces the paint where it drew and is
+        // blended over what is beneath, mirroring effectTint. The coverage
+        // uses the TRANSFORMED alpha so alpha-multiplying matrices (authored
+        // CXFORM alpha rows) composite correctly.
+        auto dbuffer = sfc->buf32 + (bbox.min.y * sfc->stride + bbox.min.x);
+        auto sbuffer = cmp->image.buf32 + (bbox.min.y * cmp->image.stride + bbox.min.x);
+        for (size_t y = 0; y < h; ++y) {
+            auto dst = dbuffer;
+            auto src = sbuffer;
+            for (size_t x = 0; x < w; ++x, ++dst, ++src) {
+                if (A(*src) == 0) continue;
+                auto straight = _colorMatrixPixel(params, *src);
+                auto val = (straight & 0x00ffffff) | (255 << 24);
+                auto cov = MULTIPLY(opacity, A(straight));
+                *dst = INTERPOLATE(val, *dst, cov);
+            }
+            dbuffer += sfc->stride;
+            sbuffer += cmp->image.stride;
+        }
+        cmp->valid = true;  //no need the subsequent composition
+    } else {
+        // Indirect: replace the compositor content with the premultiplied
+        // result; the later composition against the recovered surface uses
+        // the content's (transformed) alpha.
+        auto dbuffer = cmp->image.buf32 + (bbox.min.y * cmp->image.stride + bbox.min.x);
+        for (size_t y = 0; y < h; ++y) {
+            auto dst = dbuffer;
+            for (size_t x = 0; x < w; ++x, ++dst) {
+                if (A(*dst) == 0) continue;
+                auto straight = _colorMatrixPixel(params, *dst);
+                *dst = PREMULTIPLY(straight, A(straight));
+            }
+            dbuffer += cmp->image.stride;
+        }
+    }
+
+    return true;
+}

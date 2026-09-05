@@ -594,6 +594,19 @@ struct RenderEffectTritone : RenderEffect
     }
 };
 
+struct RenderEffectColorMatrix : RenderEffect
+{
+    float matrix[20];   //feColorMatrix type="matrix", row-major 4x5
+
+    static RenderEffectColorMatrix* gen(va_list& args)
+    {
+        auto inst = new RenderEffectColorMatrix;
+        for (int i = 0; i < 20; ++i) inst->matrix[i] = (float)va_arg(args, double);
+        inst->type = SceneEffect::ColorMatrix;
+        return inst;
+    }
+};
+
 struct RenderMethod
 {
 private:

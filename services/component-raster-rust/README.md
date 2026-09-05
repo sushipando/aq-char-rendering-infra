@@ -67,6 +67,18 @@ uv run --package aqw-char-renderer python scripts/rust_raster_parity.py \
   --raster-backend thorvg
 ```
 
+**CC support.** Character colors (tints) and authored placement CXFORMs are
+applied through SVG `feColorMatrix type="matrix"` filters, which ThorVG
+upstream does not implement (only `feGaussianBlur`). The vendored engine
+adds a minimal feColorMatrix: a new SVG loader node type plus a
+`SceneEffect::ColorMatrix` raster pass in `tvgSwPostEffect.cpp` that applies
+row-major coefficients to straight sRGB channels per the spec. Only
+`type="matrix"` is supported; other kinds degrade to the filter being
+ignored (upstream's silent-skip behavior). Verified on real shrp data: the
+cape's tinted cloth rendered the untinted base color before the patch and
+the resvg-matching tint after, while CC-free parts stay pixel-identical to
+resvg.
+
 ## Layout
 
 ```text

@@ -1671,6 +1671,44 @@ static SvgNode* _createFilterNode(SvgParserContext* ctx, SvgNode* parent, const 
     return ctx->parser->node;
 }
 
+static bool _attrParseColorMatrixNode(void* data, const char* key, const char* value)
+{
+    auto ctx = (SvgParserContext*)data;
+    auto node = ctx->parser->node;
+    auto& cm = node->node.colorMatrix;
+
+    if (STR_AS(key, "type")) {
+        // Only feColorMatrix type="matrix" is implemented; unsupported kinds
+        // (saturate/hueRotate/luminanceToAlpha) are marked invalid and the
+        // filter application is skipped, matching a graceful no-op.
+        if (!STR_AS(value, "matrix")) cm.valid = false;
+    } else if (STR_AS(key, "values")) {
+        unsigned i = 0;
+        while (i < 20 && _parseNumber(&value, nullptr, &cm.values[i])) ++i;
+        // The pipeline always authors all 20 coefficients; anything shorter
+        // is treated as malformed and the filter is skipped.
+        if (i != 20) cm.valid = false;
+    }
+    return true;
+}
+
+static SvgNode* _createColorMatrixNode(SvgParserContext* ctx, SvgNode* parent, const char* buf, unsigned bufLength, parseAttributes func)
+{
+    ctx->parser->node = _createNode(parent, SvgNodeType::ColorMatrix);
+    if (!ctx->parser->node) return nullptr;
+
+    auto& cm = ctx->parser->node->node.colorMatrix;
+    // feColorMatrix defaults to an identity matrix (type="matrix").
+    for (int i = 0; i < 20; ++i) cm.values[i] = (i % 6 == 0) ? 1.0f : 0.0f;
+    cm.valid = true;
+
+    ctx->parser->node->style->display = false;
+
+    func(buf, bufLength, _attrParseColorMatrixNode, ctx);
+
+    return ctx->parser->node;
+}
+
 static bool _attrParsePatternNode(void* data, const char* key, const char* value)
 {
     auto ctx = (SvgParserContext*)data;
@@ -2359,7 +2397,8 @@ static constexpr struct
     {"line", sizeof("line"), _createLineNode},
     {"image", sizeof("image"), _createImageNode},
     {"text", sizeof("text"), _createTextNode},
-    {"feGaussianBlur", sizeof("feGaussianBlur"), _createGaussianBlurNode}};
+    {"feGaussianBlur", sizeof("feGaussianBlur"), _createGaussianBlurNode},
+    {"feColorMatrix", sizeof("feColorMatrix"), _createColorMatrixNode}};
 
 static constexpr struct
 {

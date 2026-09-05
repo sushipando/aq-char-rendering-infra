@@ -543,6 +543,8 @@ void effectTintUpdate(RenderEffectTint* effect);
 bool effectTint(SwCompositor* cmp, const RenderEffectTint* params, bool direct);
 void effectTritoneUpdate(RenderEffectTritone* effect);
 bool effectTritone(SwCompositor* cmp, const RenderEffectTritone* params, bool direct);
+void effectColorMatrixUpdate(RenderEffectColorMatrix* effect);
+bool effectColorMatrix(SwCompositor* cmp, const RenderEffectColorMatrix* params, bool direct);
 
 uint32_t blendDifference(TVG_UNUSED const SwSurface* surface, uint32_t s, uint32_t d);
 uint32_t blendExclusion(TVG_UNUSED const SwSurface* surface, uint32_t s, uint32_t d);

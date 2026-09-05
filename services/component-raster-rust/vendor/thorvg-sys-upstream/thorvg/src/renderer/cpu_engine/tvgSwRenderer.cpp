@@ -680,6 +680,7 @@ void SwRenderer::prepare(RenderEffect* effect, const Matrix& transform)
         case SceneEffect::Fill: effectFillUpdate(static_cast<RenderEffectFill*>(effect)); break;
         case SceneEffect::Tint: effectTintUpdate(static_cast<RenderEffectTint*>(effect)); break;
         case SceneEffect::Tritone: effectTritoneUpdate(static_cast<RenderEffectTritone*>(effect)); break;
+        case SceneEffect::ColorMatrix: effectColorMatrixUpdate(static_cast<RenderEffectColorMatrix*>(effect)); break;
         default: break;
     }
 }
@@ -794,6 +795,9 @@ bool SwRenderer::render(RenderCompositor* cmp, const RenderEffect* effect, bool 
         }
         case SceneEffect::Tritone: {
             return effectTritone(p, static_cast<const RenderEffectTritone*>(effect), direct);
+        }
+        case SceneEffect::ColorMatrix: {
+            return effectColorMatrix(p, static_cast<const RenderEffectColorMatrix*>(effect), direct);
         }
         default: return false;
     }

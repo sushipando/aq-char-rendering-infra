@@ -461,6 +461,26 @@ static Paint* _applyFilter(SvgParserContext& ctx, Paint* paint, const SvgNode* n
 
     auto child = filterNode->child.data;
     for (uint32_t i = 0; i < filterNode->child.count; ++i, ++child) {
+        if ((*child)->type == SvgNodeType::ColorMatrix) {
+            auto& cm = (*child)->node.colorMatrix;
+            if (!cm.valid) continue;
+            auto& v = cm.values;
+            // feColorMatrix type="matrix" re-maps every rendered pixel of the
+            // filtered scene: the 4x5 row-major matrix is applied to straight
+            // (unpremultiplied) sRGB RGBA, then the result is premultiplied
+            // back for the compositing pipeline. Effects stack in document
+            // order; with a single matrix primitive (the AQW pipeline's
+            // shape), the scene's content is fully re-colored.
+            scene->add(SceneEffect::ColorMatrix,
+                (double)v[0], (double)v[1], (double)v[2], (double)v[3], (double)v[4],
+                (double)v[5], (double)v[6], (double)v[7], (double)v[8], (double)v[9],
+                (double)v[10], (double)v[11], (double)v[12], (double)v[13], (double)v[14],
+                (double)v[15], (double)v[16], (double)v[17], (double)v[18], (double)v[19]);
+        }
+    }
+
+    child = filterNode->child.data;
+    for (uint32_t i = 0; i < filterNode->child.count; ++i, ++child) {
         if ((*child)->type == SvgNodeType::GaussianBlur) {
             auto& gauss = (*child)->node.gaussianBlur;
 

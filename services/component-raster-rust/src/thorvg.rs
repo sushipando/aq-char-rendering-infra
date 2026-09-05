@@ -256,5 +256,87 @@ mod tests {
         let again =
             render_svg(SAMPLE.as_bytes(), (8, 6)).expect("thorvg must recover after errors");
         assert_eq!((again.width, again.height), (8, 6));
+
+        // 4. feColorMatrix type="matrix" tints reach the output (the AQW CC
+        //    path): a red rect under a flat-tint matrix "0 0 0 0 1, ... green
+        //    0.5" must render exactly (255, 128, 0) with alpha preserved.
+        let tint = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="6" height="4">
+  <defs>
+    <filter id="tint" x="-100%" y="-100%" width="300%" height="300%" color-interpolation-filters="sRGB">
+      <feColorMatrix type="matrix" values="0 0 0 0 1 0 0 0 0 0.5 0 0 0 0 0 0 0 0 1 0"/>
+    </filter>
+  </defs>
+  <g filter="url(#tint)">
+    <rect x="1" y="1" width="4" height="2" fill="#8040ff"/>
+  </g>
+</svg>"##;
+        let tinted = render_svg(tint.as_bytes(), (6, 4)).expect("thorvg must apply feColorMatrix");
+        // Pixel (2,2) inside the rect: row 2 * stride 6 + col 2. The engine
+        // colors pass through a 254/255 alpha lerp, so assert +-1 instead of
+        // exact bytes.
+        #[allow(clippy::identity_op)]
+        let at = (2 * 6 + 2) * 4;
+        assert!(
+            (tinted.pixels[at] as i16 - 255).abs() <= 1,
+            "tint red channel, got {}",
+            tinted.pixels[at]
+        );
+        assert!(
+            (tinted.pixels[at + 1] as i16 - 128).abs() <= 1,
+            "tint green channel, got {}",
+            tinted.pixels[at + 1]
+        );
+        assert!(
+            tinted.pixels[at + 2] == 0,
+            "tint blue channel, got {}",
+            tinted.pixels[at + 2]
+        );
+        assert!(
+            (tinted.pixels[at + 3] as i16 - 255).abs() <= 1,
+            "tint keeps alpha, got {}",
+            tinted.pixels[at + 3]
+        );
+        // Outside the rect stays transparent.
+        assert_eq!(tinted.pixels[3 * 4], 0);
+
+        // 5. Authored-CXFORM style diagonal with multipliers: red * 2 clamps
+        //    to 255 and the alpha row keeps alpha.
+        let cx = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3">
+  <defs>
+    <filter id="cx" x="-100%" y="-100%" width="300%" height="300%">
+      <feColorMatrix type="matrix" values="2 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 1 0"/>
+    </filter>
+  </defs>
+  <g filter="url(#cx)">
+    <rect x="1" y="1" width="2" height="1" fill="#806040" opacity="0.5"/>
+  </g>
+</svg>"##;
+        let cxform = render_svg(cx.as_bytes(), (4, 3)).expect("thorvg must apply diagonal matrix");
+        #[allow(clippy::identity_op)]
+        let cxat = (1 * 4 + 1) * 4;
+        // 2x red clamps at 255; the 254/255 lerp again allows +-1. Translucent
+        // alpha (0.5) must survive the alpha-identity row.
+        assert!(
+            (cxform.pixels[cxat] as i16 - 255).abs() <= 1,
+            "2x red must clamp, got {}",
+            cxform.pixels[cxat]
+        );
+        assert!(
+            (cxform.pixels[cxat + 1] as i16 - 96).abs() <= 3,
+            "1x green, got {}",
+            cxform.pixels[cxat + 1]
+        );
+        assert!(
+            (cxform.pixels[cxat + 2] as i16 - 64).abs() <= 3,
+            "1x blue, got {}",
+            cxform.pixels[cxat + 2]
+        );
+        let cx_alpha = cxform.pixels[cxat + 3];
+        assert!(
+            cx_alpha > 60 && cx_alpha < 195,
+            "alpha multiplier row keeps translucency, got {cx_alpha}"
+        );
     }
 }

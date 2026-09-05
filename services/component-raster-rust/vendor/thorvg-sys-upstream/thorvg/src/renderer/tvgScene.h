@@ -283,6 +283,10 @@ struct SceneImpl : Scene
                         ret = new RenderEffectTritone(*(RenderEffectTritone*)(*p));
                         break;
                     }
+                    case SceneEffect::ColorMatrix: {
+                        ret = new RenderEffectColorMatrix(*(RenderEffectColorMatrix*)(*p));
+                        break;
+                    }
                     default: break;
                 }
                 if (ret) {
@@ -424,6 +428,10 @@ struct SceneImpl : Scene
             }
             case SceneEffect::Tritone: {
                 re = RenderEffectTritone::gen(args);
+                break;
+            }
+            case SceneEffect::ColorMatrix: {
+                re = RenderEffectColorMatrix::gen(args);
                 break;
             }
             default: break;
