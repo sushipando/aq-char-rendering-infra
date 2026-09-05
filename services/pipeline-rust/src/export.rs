@@ -1,22 +1,32 @@
-//! The exporter never imports the bounds module or rasterizes an image.
+//! The exporter never rasterizes an image. It can publish bounds-prefetch
+//! tasks after each unique SVG is durably stored.
 use anyhow::{ensure, Context, Result};
 use aqw_component_raster::{
     import::{transformed_bounds, IDENTITY},
     svg::{self, FFDEC_NS, XLINK_NS},
 };
 use futures::{stream, StreamExt, TryStreamExt};
+use notify::{
+    event::{AccessKind, AccessMode, CreateKind, ModifyKind, RenameMode},
+    Event, EventKind, RecursiveMode, Watcher,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::process::Command;
 
 use crate::{
     model::*,
+    queue::BoundsPublisher,
     store::{self, Store},
     swf::Swf,
 };
@@ -24,6 +34,12 @@ use crate::{
 pub struct Ffdec {
     pub jar: PathBuf,
     pub deadline: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct FrameRange {
+    start: usize,
+    count: usize,
 }
 
 impl Ffdec {
@@ -54,15 +70,16 @@ impl Ffdec {
         Ok(())
     }
 
-    pub async fn frames(
+    async fn frames(
         &self,
         source: &Path,
         requests: &[SymbolRequest],
         destination: &Path,
         zoom: f64,
-        start: usize,
-        count: usize,
+        range: FrameRange,
+        live_prefetch: Option<&SvgPrefetcher<'_>>,
     ) -> Result<BTreeMap<String, Vec<Vec<u8>>>> {
+        let FrameRange { start, count } = range;
         ensure!(
             start > 0 && count > 0 && count <= 2008,
             "invalid export frame range"
@@ -134,7 +151,12 @@ impl Ffdec {
                 output.to_string_lossy().into_owned(),
                 source.to_string_lossy().into_owned(),
             ]);
-            self.run(&destination.join("ffdec-home"), &args).await?;
+            if let Some(prefetcher) = live_prefetch {
+                self.run_streaming(&destination.join("ffdec-home"), &args, &output, prefetcher)
+                    .await?;
+            } else {
+                self.run(&destination.join("ffdec-home"), &args).await?;
+            }
             for request in selected {
                 let prefix = format!("DefineSprite_{}", request.character_id);
                 let mut directories = Vec::new();
@@ -188,6 +210,196 @@ impl Ffdec {
         }
         Ok(result)
     }
+
+    async fn run_streaming(
+        &self,
+        home: &Path,
+        args: &[String],
+        output_root: &Path,
+        prefetcher: &SvgPrefetcher<'_>,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(home).await?;
+        tokio::fs::create_dir_all(output_root).await?;
+        let (event_sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher = match notify::recommended_watcher(move |event| {
+            let _ = event_sender.send(event);
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                crate::log(
+                    "ffdec_svg_watch_unavailable",
+                    json!({"output_root":output_root.to_string_lossy(),"error":error.to_string()}),
+                );
+                return self.run(home, args).await;
+            }
+        };
+        if let Err(error) = watcher.watch(output_root, RecursiveMode::Recursive) {
+            crate::log(
+                "ffdec_svg_watch_unavailable",
+                json!({"output_root":output_root.to_string_lossy(),"error":error.to_string()}),
+            );
+            return self.run(home, args).await;
+        }
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .context("FFDec deadline exhausted")?;
+        let command = Command::new("java")
+            .arg(format!("-Duser.home={}", home.display()))
+            .arg("-Djava.awt.headless=true")
+            .arg("-jar")
+            .arg(&self.jar)
+            .args(args)
+            .kill_on_drop(true)
+            .output();
+        let run = async {
+            tokio::pin!(command);
+            let mut observed = BTreeSet::new();
+            let mut streamed = 0usize;
+            let process_output = loop {
+                tokio::select! {
+                    result = &mut command => break result?,
+                    Some(event) = events.recv() => {
+                        let mut scan = match event {
+                            Ok(event) => svg_completion_event(&event),
+                            Err(error) => {
+                                crate::log(
+                                    "ffdec_svg_watch_error",
+                                    json!({"output_root":output_root.to_string_lossy(),"error":error.to_string()}),
+                                );
+                                false
+                            }
+                        };
+                        // Coalesce events that arrived while the previous S3/SQS
+                        // submissions were in flight, then scan once.
+                        while let Ok(event) = events.try_recv() {
+                            match event {
+                                Ok(event) => scan |= svg_completion_event(&event),
+                                Err(error) => crate::log(
+                                    "ffdec_svg_watch_error",
+                                    json!({"output_root":output_root.to_string_lossy(),"error":error.to_string()}),
+                                ),
+                            }
+                        }
+                        if scan {
+                            streamed += stream_completed_svgs(output_root, &mut observed, prefetcher).await;
+                        }
+                    }
+                }
+            };
+            // Reconcile once after exit because filesystem events are an
+            // optimization, not the source of truth. The later manifest pass
+            // does this again after settled-frame corrections are applied.
+            streamed += stream_completed_svgs(output_root, &mut observed, prefetcher).await;
+            crate::log(
+                "ffdec_svg_stream_complete",
+                json!({
+                    "output_root": output_root.to_string_lossy(),
+                    "completed_files_observed": observed.len(),
+                    "unique_prefetches_started": streamed,
+                }),
+            );
+            ensure!(
+                process_output.status.success(),
+                "FFDec failed: {}",
+                String::from_utf8_lossy(
+                    &process_output.stderr[process_output.stderr.len().saturating_sub(2000)..]
+                )
+            );
+            Ok(())
+        };
+        let result = tokio::time::timeout(remaining, run)
+            .await
+            .context("FFDec timed out (child terminated)")?;
+        drop(watcher);
+        result
+    }
+}
+
+fn svg_completion_event(event: &Event) -> bool {
+    event.need_rescan()
+        || (event
+            .paths
+            .iter()
+            .any(|path| path.extension().is_some_and(|extension| extension == "svg"))
+            && matches!(
+                event.kind,
+                EventKind::Access(AccessKind::Close(AccessMode::Write | AccessMode::Any))
+                    | EventKind::Create(CreateKind::File | CreateKind::Any)
+                    | EventKind::Modify(ModifyKind::Data(_))
+                    | EventKind::Modify(ModifyKind::Name(
+                        RenameMode::To | RenameMode::Both | RenameMode::Any
+                    ))
+                    | EventKind::Any
+            ))
+}
+
+fn svg_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() && entry.path().extension().is_some_and(|e| e == "svg") {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+async fn stream_completed_svgs(
+    root: &Path,
+    observed: &mut BTreeSet<PathBuf>,
+    prefetcher: &SvgPrefetcher<'_>,
+) -> usize {
+    let paths = match svg_files(root) {
+        Ok(paths) => paths,
+        Err(error) => {
+            crate::log(
+                "ffdec_svg_stream_scan_failed",
+                json!({"output_root":root.to_string_lossy(),"error":error.to_string()}),
+            );
+            return 0;
+        }
+    };
+    let ready = stream::iter(paths.into_iter().filter(|path| !observed.contains(path)))
+        .map(|path| async move {
+            let bytes = tokio::fs::read(&path).await.ok()?;
+            // FFDec creates the destination before it finishes writing. Only
+            // parseable documents are safe to expose to another Lambda.
+            svg::parse(&bytes).ok()?;
+            Some((path, bytes))
+        })
+        .buffer_unordered(16)
+        .filter_map(async move |item| item)
+        .collect::<Vec<_>>()
+        .await;
+    let submissions = ready.into_iter().map(|(path, bytes)| {
+        // A complete SVG is immutable in FFDec's export layout. Marking the
+        // path here avoids re-reading it after later filesystem events; the
+        // manifest pass retries failed uploads/publications using final bytes.
+        observed.insert(path.clone());
+        async move { (path, prefetcher.submit(bytes).await) }
+    });
+    let mut started = 0;
+    stream::iter(submissions)
+        .buffer_unordered(16)
+        .map(|(path, result)| match result {
+            Ok(true) => started += 1,
+            Ok(false) => {}
+            Err(error) => crate::log(
+                "bounds_prefetch_stream_failed",
+                json!({"path":path.to_string_lossy(),"error":error.to_string()}),
+            ),
+        })
+        .count()
+        .await;
+    started
 }
 
 fn ranges(values: &[usize]) -> String {
@@ -439,15 +651,192 @@ fn mirror_flip(frames: &[Vec<u8>]) -> Result<usize> {
     Ok(0)
 }
 
+#[derive(Clone, Copy)]
+pub struct BoundsPrefetch<'a> {
+    pub publisher: &'a dyn BoundsPublisher,
+    pub resolution: u32,
+    pub padding_pixels: u32,
+}
+
+pub struct ExportOptions<'a> {
+    pub jar: PathBuf,
+    pub timeout: Duration,
+    pub bounds_prefetch: Option<BoundsPrefetch<'a>>,
+}
+
+impl ExportOptions<'static> {
+    pub fn without_prefetch(jar: PathBuf, timeout: Duration) -> Self {
+        Self {
+            jar,
+            timeout,
+            bounds_prefetch: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PrefetchStats {
+    published: usize,
+    failed: usize,
+}
+
+struct SvgPrefetcher<'a> {
+    store: &'a dyn Store,
+    bucket: &'a str,
+    publisher: &'a dyn BoundsPublisher,
+    config: ProbeConfig,
+    cache_enabled: bool,
+    job_id: &'a str,
+    // A hash is retained only after its queue publication succeeds. Failed
+    // streaming attempts can therefore be retried by the manifest pass.
+    published_states: Mutex<BTreeSet<String>>,
+    published: AtomicUsize,
+    failed: AtomicUsize,
+}
+
+impl<'a> SvgPrefetcher<'a> {
+    fn new(
+        store: &'a dyn Store,
+        bucket: &'a str,
+        prefetch: BoundsPrefetch<'a>,
+        config: ProbeConfig,
+        cache_enabled: bool,
+        job_id: &'a str,
+    ) -> Self {
+        Self {
+            store,
+            bucket,
+            publisher: prefetch.publisher,
+            config,
+            cache_enabled,
+            job_id,
+            published_states: Mutex::new(BTreeSet::new()),
+            published: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+        }
+    }
+
+    async fn submit(&self, bytes: Vec<u8>) -> Result<bool> {
+        let state = StateRef::new(&bytes);
+        {
+            let mut published = self.published_states.lock().unwrap();
+            if !published.insert(state.sha256.clone()) {
+                return Ok(false);
+            }
+        }
+        if let Err(error) = self
+            .store
+            .put(self.bucket, &state.svg_key, bytes, "image/svg+xml", true)
+            .await
+        {
+            self.published_states.lock().unwrap().remove(&state.sha256);
+            return Err(error);
+        }
+        let task = prefetch_task(
+            state.clone(),
+            self.config.clone(),
+            self.cache_enabled,
+            self.job_id,
+        )?;
+        let stats = publish_prefetch(self.publisher, task).await;
+        self.published.fetch_add(stats.published, Ordering::Relaxed);
+        self.failed.fetch_add(stats.failed, Ordering::Relaxed);
+        if stats.failed > 0 {
+            self.published_states.lock().unwrap().remove(&state.sha256);
+        }
+        Ok(stats.published > 0)
+    }
+
+    fn stats(&self) -> PrefetchStats {
+        PrefetchStats {
+            published: self.published.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn prefetch_config(prefetch: BoundsPrefetch<'_>, zoom: f64) -> Result<ProbeConfig> {
+    let mut config = ProbeConfig::new(zoom);
+    config.resolution = prefetch.resolution;
+    config.padding_pixels = prefetch.padding_pixels;
+    config.validate()?;
+    Ok(config)
+}
+
+fn prefetch_task(
+    state: StateRef,
+    config: ProbeConfig,
+    cache_enabled: bool,
+    job_id: &str,
+) -> Result<ProbeTask> {
+    if cache_enabled {
+        ProbeTask::new(state, config)
+    } else {
+        ProbeTask::without_cache(state, config, job_id)
+    }
+}
+
+async fn publish_prefetch(publisher: &dyn BoundsPublisher, task: ProbeTask) -> PrefetchStats {
+    match publisher.publish(&task).await {
+        Ok(()) => PrefetchStats {
+            published: 1,
+            failed: 0,
+        },
+        Err(error) => {
+            // Prefetch is latency optimization only. PlanBounds will detect
+            // the missing result and run it through the selected barrier.
+            crate::log(
+                "bounds_prefetch_publish_failed",
+                json!({"state_sha256":task.state.sha256,"error":error.to_string()}),
+            );
+            PrefetchStats {
+                published: 0,
+                failed: 1,
+            }
+        }
+    }
+}
+
+async fn upload_and_prefetch(
+    store: &dyn Store,
+    bucket: &str,
+    uploads: BTreeMap<String, Vec<u8>>,
+    prefetcher: Option<&SvgPrefetcher<'_>>,
+) -> Result<()> {
+    stream::iter(uploads)
+        .map(|(key, bytes)| async move {
+            ensure!(
+                StateRef::new(&bytes).svg_key == key,
+                "SVG upload key does not match its contents"
+            );
+            if let Some(prefetcher) = prefetcher {
+                prefetcher.submit(bytes).await?;
+            } else {
+                store
+                    .put(bucket, &key, bytes, "image/svg+xml", true)
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
 pub async fn export_source(
     store: &dyn Store,
     work_bucket: &str,
     source_bucket: &str,
     event: &Value,
-    jar: PathBuf,
-    timeout: Duration,
+    options: ExportOptions<'_>,
 ) -> Result<Value> {
     let started = Instant::now();
+    let ExportOptions {
+        jar,
+        timeout,
+        bounds_prefetch,
+    } = options;
     let job = event["job_id"].as_str().context("missing job id")?;
     let input_key = event["input_key"].as_str().context("missing input key")?;
     let prepared: Value = store::read(store, work_bucket, input_key).await?;
@@ -472,9 +861,18 @@ pub async fn export_source(
         .context("missing source checksum")?;
     let source_idx = source["idx"].as_u64().context("invalid source index")?;
     let vector_cache = prepared["cache"]["vectors"].as_bool().unwrap_or(true);
+    let bounds_cache = prepared["cache"]["bounds"].as_bool().unwrap_or(true);
     let requests: Vec<SymbolRequest> = serde_json::from_value(source["requests"].clone())?;
     let settings = &prepared["settings"];
     let zoom = settings["zoom"].as_f64().context("missing zoom")?;
+    let probe_config = bounds_prefetch
+        .map(|prefetch| prefetch_config(prefetch, zoom))
+        .transpose()?;
+    let prefetcher = bounds_prefetch
+        .zip(probe_config.clone())
+        .map(|(prefetch, config)| {
+            SvgPrefetcher::new(store, work_bucket, prefetch, config, bounds_cache, job)
+        });
     let start = settings["subframe_start"]
         .as_u64()
         .context("missing subframe start")? as usize;
@@ -506,7 +904,7 @@ pub async fn export_source(
             if presence.iter().all(|b| *b) {
                 crate::log(
                     "prepare_export_complete",
-                    json!({"job_id":job,"source_idx":source_idx,"cache_enabled":true,"cache_hit":true,"unique_states":cached.states.len(),"raster_probes":0,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
+                    json!({"job_id":job,"source_idx":source_idx,"cache_enabled":true,"cache_hit":true,"unique_states":cached.states.len(),"bounds_prefetch_published":0,"bounds_prefetch_failed":0,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
                 );
                 return Ok(
                     json!({"job_id":job,"source_idx":source_idx,"manifest_key":manifest_key,"vector_cache_hit":true}),
@@ -573,8 +971,8 @@ pub async fn export_source(
             &requests,
             &temporary.path().join("exports"),
             zoom,
-            start,
-            count,
+            FrameRange { start, count },
+            prefetcher.as_ref(),
         )
         .await?;
     let mut corrections = BTreeMap::new();
@@ -595,8 +993,8 @@ pub async fn export_source(
                 &corrected,
                 &temporary.path().join("settled"),
                 zoom,
-                start,
-                count,
+                FrameRange { start, count },
+                prefetcher.as_ref(),
             )
             .await?;
         for (key, frames) in frames {
@@ -663,20 +1061,16 @@ pub async fn export_source(
         );
     }
     manifest.validate()?;
-    stream::iter(uploads)
-        .map(|(key, bytes)| async move {
-            store
-                .put(work_bucket, &key, bytes, "image/svg+xml", true)
-                .await
-        })
-        .buffer_unordered(16)
-        .try_collect::<Vec<_>>()
-        .await?;
+    upload_and_prefetch(store, work_bucket, uploads, prefetcher.as_ref()).await?;
+    let prefetch_stats = prefetcher
+        .as_ref()
+        .map(SvgPrefetcher::stats)
+        .unwrap_or_default();
     // Publish LAST: readers never observe a manifest whose SVGs aren't there.
     store::write(store, work_bucket, &manifest_key, &manifest, vector_cache).await?;
     crate::log(
         "prepare_export_complete",
-        json!({"job_id":job,"source_idx":source_idx,"cache_enabled":vector_cache,"cache_hit":false,"exported_frames":manifest.symbols.values().map(|s|s.schedule.len()).sum::<usize>(),"unique_states":manifest.states.len(),"raster_probes":0,"metadata_ms":metadata_ms,"ffdec_ms":ffdec_ms,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
+        json!({"job_id":job,"source_idx":source_idx,"cache_enabled":vector_cache,"cache_hit":false,"exported_frames":manifest.symbols.values().map(|s|s.schedule.len()).sum::<usize>(),"unique_states":manifest.states.len(),"bounds_prefetch_published":prefetch_stats.published,"bounds_prefetch_failed":prefetch_stats.failed,"metadata_ms":metadata_ms,"ffdec_ms":ffdec_ms,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(
         json!({"job_id":job,"source_idx":source_idx,"manifest_key":manifest_key,"vector_cache_hit":false}),
@@ -686,6 +1080,145 @@ pub async fn export_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::FsStore;
+    use std::sync::Mutex;
+
+    struct FakePublisher<'a> {
+        store: &'a FsStore,
+        seen: Mutex<Vec<ProbeTask>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BoundsPublisher for FakePublisher<'_> {
+        async fn publish(&self, task: &ProbeTask) -> Result<()> {
+            ensure!(
+                self.store.exists("work", &task.state.svg_key).await?,
+                "SVG was published before it was stored"
+            );
+            self.seen.lock().unwrap().push(task.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unique_svgs_are_stored_before_job_scoped_prefetch_is_published() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore(root.path().into());
+        let publisher = FakePublisher {
+            store: &store,
+            seen: Mutex::new(Vec::new()),
+        };
+        let first = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
+        let second = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>"#;
+        let uploads = [first.as_slice(), second.as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                let state = StateRef::new(bytes);
+                (state.svg_key, bytes.to_vec())
+            })
+            .collect();
+        let prefetch = BoundsPrefetch {
+            publisher: &publisher,
+            resolution: 256,
+            padding_pixels: 1,
+        };
+        let config = prefetch_config(prefetch, 1.0).unwrap();
+        let job_id = "45cfafbd-5089-4f6d-850a-caa798ec1fcb";
+        let prefetcher = SvgPrefetcher::new(&store, "work", prefetch, config, false, job_id);
+        upload_and_prefetch(&store, "work", uploads, Some(&prefetcher))
+            .await
+            .unwrap();
+        let stats = prefetcher.stats();
+        assert_eq!((stats.published, stats.failed), (2, 0));
+        let seen = publisher.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|task| {
+            !task.cache_enabled
+                && task.job_id.as_deref() == Some(job_id)
+                && task
+                    .result_key
+                    .starts_with(&format!("jobs/{job_id}/prepare/bounds-results/"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn live_stream_ignores_incomplete_files_and_deduplicates_svg_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore(root.path().join("objects"));
+        let publisher = FakePublisher {
+            store: &store,
+            seen: Mutex::new(Vec::new()),
+        };
+        let prefetch = BoundsPrefetch {
+            publisher: &publisher,
+            resolution: 256,
+            padding_pixels: 1,
+        };
+        let prefetcher = SvgPrefetcher::new(
+            &store,
+            "work",
+            prefetch,
+            prefetch_config(prefetch, 1.0).unwrap(),
+            true,
+            "job",
+        );
+        let output = root.path().join("ffdec");
+        tokio::fs::create_dir_all(output.join("DefineSprite_1"))
+            .await
+            .unwrap();
+        let complete = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
+        tokio::fs::write(output.join("DefineSprite_1/1.svg"), complete)
+            .await
+            .unwrap();
+        tokio::fs::write(output.join("DefineSprite_1/2.svg"), complete)
+            .await
+            .unwrap();
+        tokio::fs::write(output.join("DefineSprite_1/3.svg"), b"<svg")
+            .await
+            .unwrap();
+
+        let mut observed = BTreeSet::new();
+        assert_eq!(
+            stream_completed_svgs(&output, &mut observed, &prefetcher).await,
+            1
+        );
+        assert_eq!(observed.len(), 2);
+        assert_eq!(publisher.seen.lock().unwrap().len(), 1);
+
+        let different = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>"#;
+        tokio::fs::write(output.join("DefineSprite_1/3.svg"), different)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_completed_svgs(&output, &mut observed, &prefetcher).await,
+            1
+        );
+        assert_eq!(observed.len(), 3);
+        assert_eq!(publisher.seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn filesystem_events_select_completed_svg_writes_and_rescans() {
+        let svg = PathBuf::from("/tmp/export/frame.svg");
+        assert!(svg_completion_event(
+            &Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                .add_path(svg.clone())
+        ));
+        assert!(svg_completion_event(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(svg.clone())
+        ));
+        assert!(!svg_completion_event(
+            &Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read))).add_path(svg)
+        ));
+        assert!(!svg_completion_event(
+            &Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                .add_path(PathBuf::from("/tmp/export/frame.tmp"))
+        ));
+        assert!(svg_completion_event(
+            &Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+    }
+
     #[test]
     fn scripts_keep_cc_stops_and_random_pose() {
         let mut value = ScriptMetadata::default();

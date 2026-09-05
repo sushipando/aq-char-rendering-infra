@@ -289,16 +289,16 @@ pub fn probe(bytes: &[u8], task: &ProbeTask) -> Result<BoundsResult> {
 pub async fn run_probe(store: &dyn Store, bucket: &str, task: &ProbeTask) -> Result<BoundsResult> {
     let started = Instant::now();
     task.validate()?;
-    if task.cache_enabled {
-        if let Some(cached) = store::cached::<BoundsResult>(store, bucket, &task.result_key).await?
-        {
-            cached.validate(task)?;
-            crate::log(
-                "bounds_probe",
-                json!({"state_sha256":task.state.sha256,"cache_enabled":true,"cache_hit":true,"total_ms":started.elapsed().as_secs_f64()*1000.0}),
-            );
-            return Ok(cached);
-        }
+    // A cache-disabled task still has an immutable, job-scoped result key.
+    // Reusing that key is required for exporter prefetch and SQS retries; it
+    // never enables reuse by another job.
+    if let Some(cached) = store::cached::<BoundsResult>(store, bucket, &task.result_key).await? {
+        cached.validate(task)?;
+        crate::log(
+            "bounds_probe",
+            json!({"state_sha256":task.state.sha256,"cache_enabled":task.cache_enabled,"cache_hit":task.cache_enabled,"result_reused":true,"total_ms":started.elapsed().as_secs_f64()*1000.0}),
+        );
+        return Ok(cached);
     }
     let bytes = store
         .get(bucket, &task.state.svg_key)
@@ -307,10 +307,12 @@ pub async fn run_probe(store: &dyn Store, bucket: &str, task: &ProbeTask) -> Res
     let download_ms = started.elapsed().as_secs_f64() * 1000.0;
     let result = probe(&bytes, task)?;
     let probe_ms = started.elapsed().as_secs_f64() * 1000.0 - download_ms;
-    store::write(store, bucket, &task.result_key, &result, task.cache_enabled).await?;
+    // Both shared and job-scoped identities are deterministic. Immutable
+    // writes make concurrent prefetch/barrier delivery harmless.
+    store::write(store, bucket, &task.result_key, &result, true).await?;
     crate::log(
         "bounds_probe",
-        json!({"state_sha256":task.state.sha256,"cache_enabled":task.cache_enabled,"cache_hit":false,"download_ms":download_ms,"probe_ms":probe_ms,"total_ms":started.elapsed().as_secs_f64()*1000.0,"resolution":result.resolution_used,"visibility":result.visibility,"fallback_reason":result.fallback_reason}),
+        json!({"state_sha256":task.state.sha256,"cache_enabled":task.cache_enabled,"cache_hit":false,"result_reused":false,"download_ms":download_ms,"probe_ms":probe_ms,"total_ms":started.elapsed().as_secs_f64()*1000.0,"resolution":result.resolution_used,"visibility":result.visibility,"fallback_reason":result.fallback_reason}),
     );
     Ok(result)
 }
@@ -380,24 +382,22 @@ pub async fn plan(
             states.entry(hash).or_insert(task);
         }
     }
-    let missing: Vec<_> = if cache_enabled {
-        let checks: Vec<_> = stream::iter(states.values().cloned())
-            .map(|task| async move {
-                let cached = store::cached::<BoundsResult>(store, bucket, &task.result_key).await?;
-                if let Some(result) = cached {
-                    result.validate(&task)?;
-                    Ok(None)
-                } else {
-                    Ok::<_, anyhow::Error>(Some(task))
-                }
-            })
-            .buffered(16)
-            .try_collect()
-            .await?;
-        checks.into_iter().flatten().collect()
-    } else {
-        states.values().cloned().collect()
-    };
+    // Always check the task's exact result key. Cache-disabled tasks use a
+    // job-scoped prefix, so this sees only work prefetched for this job.
+    let checks: Vec<_> = stream::iter(states.values().cloned())
+        .map(|task| async move {
+            let cached = store::cached::<BoundsResult>(store, bucket, &task.result_key).await?;
+            if let Some(result) = cached {
+                result.validate(&task)?;
+                Ok(None)
+            } else {
+                Ok::<_, anyhow::Error>(Some(task))
+            }
+        })
+        .buffered(16)
+        .try_collect()
+        .await?;
+    let missing: Vec<_> = checks.into_iter().flatten().collect();
     let inline_tasks = match mode {
         BoundsMode::Inline => {
             let encoded_size = serde_json::to_vec(&missing)?.len();
@@ -423,7 +423,7 @@ pub async fn plan(
     store::write(store, bucket, &plan_key, &plan, false).await?;
     crate::log(
         "plan_bounds",
-        json!({"job_id":job_id,"cache_enabled":cache_enabled,"bounds_mode":mode.as_str(),"exported_frames":exported_frames,"unique_states":plan.states.len(),"cache_hits":if cache_enabled {plan.states.len()-missing.len()} else {0},"missing_states":missing.len(),"total_ms":started.elapsed().as_secs_f64()*1000.0}),
+        json!({"job_id":job_id,"cache_enabled":cache_enabled,"bounds_mode":mode.as_str(),"exported_frames":exported_frames,"unique_states":plan.states.len(),"cache_hits":if cache_enabled {plan.states.len()-missing.len()} else {0},"ready_results":plan.states.len()-missing.len(),"missing_states":missing.len(),"total_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(
         json!({"plan_key":plan_key,"tasks_key":tasks_key,"task_count":missing.len(),"bounds_mode":mode.as_str(),"inline_tasks":inline_tasks}),

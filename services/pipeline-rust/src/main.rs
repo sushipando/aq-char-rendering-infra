@@ -16,6 +16,7 @@ async fn prepare(
     config: &Config,
     event: &Value,
     budget: Duration,
+    bounds_publisher: Option<&dyn pipeline::queue::BoundsPublisher>,
 ) -> Result<Value> {
     match event["phase"].as_str().unwrap_or("resolve") {
         "resolve" => {
@@ -32,8 +33,17 @@ async fn prepare(
                 &config.work_bucket,
                 &config.source_bucket,
                 event,
-                config.ffdec.clone(),
-                budget,
+                pipeline::export::ExportOptions {
+                    jar: config.ffdec.clone(),
+                    timeout: budget,
+                    bounds_prefetch: bounds_publisher.map(|publisher| {
+                        pipeline::export::BoundsPrefetch {
+                            publisher,
+                            resolution: config.bounds_resolution,
+                            padding_pixels: config.bounds_padding_pixels,
+                        }
+                    }),
+                },
             )
             .await
         }
@@ -64,10 +74,8 @@ async fn prepare(
                     .as_f64()
                     .context("missing zoom")?,
             );
-            config_probe.padding_pixels =
-                pipeline::config::number("CHAR_RENDER_BOUNDS_PADDING_PIXELS", 1, 1, 8)? as u32;
-            config_probe.resolution =
-                pipeline::config::number("CHAR_RENDER_BOUNDS_RESOLUTION", 256, 64, 1024)? as u32;
+            config_probe.padding_pixels = config.bounds_padding_pixels;
+            config_probe.resolution = config.bounds_resolution;
             pipeline::bounds::plan(
                 store,
                 &config.work_bucket,
@@ -129,7 +137,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
             _ => {
                 let mut event = event;
                 event["phase"] = phase.clone().into();
-                prepare(&store, &config, &event, Duration::from_secs(280)).await?
+                prepare(&store, &config, &event, Duration::from_secs(280), None).await?
             }
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -186,8 +194,28 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                         .await
                     }
                 }
-                "prepare" | "export" => {
-                    prepare(store.as_ref(), &control.config, &payload, budget).await
+                "prepare" => prepare(store.as_ref(), &control.config, &payload, budget, None).await,
+                "export" => {
+                    async {
+                        let queue_url = control
+                            .config
+                            .bounds_queue_url
+                            .as_deref()
+                            .context("missing CHAR_RENDER_BOUNDS_QUEUE_URL")?;
+                        let publisher = pipeline::queue::SqsBoundsPublisher::new(
+                            control.sqs.clone(),
+                            queue_url,
+                        );
+                        prepare(
+                            store.as_ref(),
+                            &control.config,
+                            &payload,
+                            budget,
+                            Some(&publisher),
+                        )
+                        .await
+                    }
+                    .await
                 }
                 "finalize" => {
                     async {

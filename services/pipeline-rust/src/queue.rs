@@ -9,7 +9,45 @@ use serde_json::{json, Value};
 #[derive(Deserialize)]
 struct Message {
     task: ProbeTask,
-    task_token: String,
+    #[serde(default)]
+    task_token: Option<String>,
+}
+
+/// The export worker uses the same bounds queue as the callback workflow, but
+/// its messages intentionally omit a task token. They are speculative work;
+/// PlanBounds remains the completion barrier.
+#[async_trait::async_trait]
+pub trait BoundsPublisher: Send + Sync {
+    async fn publish(&self, task: &ProbeTask) -> Result<()>;
+}
+
+pub struct SqsBoundsPublisher {
+    client: aws_sdk_sqs::Client,
+    queue_url: String,
+}
+
+impl SqsBoundsPublisher {
+    pub fn new(client: aws_sdk_sqs::Client, queue_url: impl Into<String>) -> Self {
+        Self {
+            client,
+            queue_url: queue_url.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BoundsPublisher for SqsBoundsPublisher {
+    async fn publish(&self, task: &ProbeTask) -> Result<()> {
+        task.validate()?;
+        self.client
+            .send_message()
+            .queue_url(&self.queue_url)
+            .message_body(json!({"task":task}).to_string())
+            .send()
+            .await
+            .context("bounds prefetch queue unavailable")?;
+        Ok(())
+    }
 }
 
 pub fn stale_callback(code: Option<&str>) -> bool {
@@ -67,22 +105,33 @@ async fn record(
     .context("invalid bounds queue message")?;
     let result = crate::bounds::run_probe(store, bucket, &message.task).await;
     match result {
-        Ok(_) => {
-            callback
-                .success(&message.task_token, &message.task.result_key)
-                .await
-        }
+        Ok(_) => match message.task_token.as_deref() {
+            Some(token) => callback.success(token, &message.task.result_key).await,
+            None => {
+                crate::log(
+                    "bounds_prefetch_complete",
+                    json!({"state_sha256":message.task.state.sha256,"result_key":message.task.result_key}),
+                );
+                Ok(())
+            }
+        },
         Err(error) => {
             crate::log(
                 "bounds_probe_failed",
-                json!({"state_sha256":message.task.state.sha256,"error":error.to_string()}),
+                json!({"state_sha256":message.task.state.sha256,"prefetch":message.task_token.is_none(),"error":error.to_string()}),
             );
+            let Some(token) = message.task_token.as_deref() else {
+                // Fire-and-forget probes have no workflow callback to fail.
+                // Keep returning the record so SQS retries and eventually
+                // redrives poison input instead of silently acknowledging it.
+                anyhow::bail!("bounds prefetch will retry");
+            };
             let attempts = record["attributes"]["ApproximateReceiveCount"]
                 .as_str()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1);
             if attempts >= max_attempts {
-                callback.failure(&message.task_token).await
+                callback.failure(token).await
             } else {
                 anyhow::bail!("bounds probe will retry")
             }
@@ -187,6 +236,53 @@ mod tests {
             json!([])
         );
         assert_eq!(callback.failures.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prefetch_messages_need_no_callback_and_poison_still_redrives() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore(root.path().into());
+        let callback = Fake {
+            successes: 0.into(),
+            failures: 0.into(),
+        };
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"/>"#;
+        let task = ProbeTask::new(StateRef::new(bytes), ProbeConfig::new(1.0)).unwrap();
+        store
+            .put(
+                "work",
+                &task.state.svg_key,
+                bytes.to_vec(),
+                "image/svg+xml",
+                true,
+            )
+            .await
+            .unwrap();
+        let event = json!({"Records":[{"messageId":"prefetch","body":json!({"task":task}).to_string(),"attributes":{"ApproximateReceiveCount":"1"}}]});
+        assert_eq!(
+            handle(&store, "work", &callback, &event, 3).await.unwrap()["batchItemFailures"],
+            json!([])
+        );
+        assert_eq!(callback.successes.load(Ordering::SeqCst), 0);
+        assert_eq!(callback.failures.load(Ordering::SeqCst), 0);
+
+        let poison = ProbeTask::new(StateRef::new(b"broken"), ProbeConfig::new(1.0)).unwrap();
+        store
+            .put(
+                "work",
+                &poison.state.svg_key,
+                b"broken".to_vec(),
+                "image/svg+xml",
+                true,
+            )
+            .await
+            .unwrap();
+        let event = json!({"Records":[{"messageId":"bad-prefetch","body":json!({"task":poison}).to_string(),"attributes":{"ApproximateReceiveCount":"3"}}]});
+        assert_eq!(
+            handle(&store, "work", &callback, &event, 3).await.unwrap()["batchItemFailures"],
+            json!([{"itemIdentifier":"bad-prefetch"}])
+        );
+        assert_eq!(callback.failures.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn only_terminal_token_errors_are_acknowledged() {

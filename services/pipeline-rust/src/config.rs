@@ -8,6 +8,7 @@ pub struct Config {
     pub work_bucket: String,
     pub job_table: String,
     pub result_queue_url: String,
+    pub bounds_queue_url: Option<String>,
     pub public_base_url: String,
     pub dataset_version: String,
     pub asset_manifest_key: String,
@@ -19,6 +20,8 @@ pub struct Config {
     pub compose_batch_size: usize,
     pub frames_per_lambda: usize,
     pub download_concurrency: usize,
+    pub bounds_resolution: u32,
+    pub bounds_padding_pixels: u32,
     pub worker_concurrency: BTreeMap<String, i32>,
     pub defaults: Value,
 }
@@ -56,6 +59,9 @@ impl Config {
             work_bucket: required("CHAR_RENDER_WORK_BUCKET")?,
             job_table: required("CHAR_RENDER_JOB_TABLE")?,
             result_queue_url: required("CHAR_RENDER_RESULT_QUEUE_URL")?,
+            bounds_queue_url: std::env::var("CHAR_RENDER_BOUNDS_QUEUE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             public_base_url: required("CHAR_RENDER_PUBLIC_BASE_URL")?
                 .trim_end_matches('/')
                 .into(),
@@ -77,6 +83,8 @@ impl Config {
             )?,
             frames_per_lambda: number("CHAR_RENDER_FRAMES_PER_LAMBDA", 30, 1, 2000)?,
             download_concurrency: number("CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY", 16, 1, 128)?,
+            bounds_resolution: number("CHAR_RENDER_BOUNDS_RESOLUTION", 256, 64, 1024)? as u32,
+            bounds_padding_pixels: number("CHAR_RENDER_BOUNDS_PADDING_PIXELS", 1, 1, 8)? as u32,
             worker_concurrency: serde_json::from_str(&env("CHAR_RENDER_WORKER_CONCURRENCY", "{}"))?,
             defaults,
         })

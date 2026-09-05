@@ -134,6 +134,17 @@ test('bounds delivery is batch-one, bounded, retry-aware, and included in shutdo
   const shutdown = functions.find((fn) => fn.Properties.FunctionName === 'aqw-char-dev-shutdown')!;
   expect(JSON.stringify(shutdown.Properties.Environment.Variables.CHAR_RENDER_STOP_FUNCTIONS)).toContain('BoundsProbeFunction');
   expect(JSON.stringify(shutdown.Properties.Environment.Variables.CHAR_RENDER_STOP_FUNCTIONS)).toContain('ExportSourceFunction');
+
+  const exporter = functions.find((fn) => fn.Properties.FunctionName === 'aqw-char-dev-exportsource')!;
+  expect(JSON.stringify(exporter.Properties.Environment.Variables.CHAR_RENDER_BOUNDS_QUEUE_URL))
+    .toContain('BoundsQueue');
+  const policies = Object.values(template.findResources('AWS::IAM::Policy'));
+  expect(policies.some((policy) => {
+    const serialized = JSON.stringify(policy);
+    return serialized.includes('ExportSourceFunctionServiceRole')
+      && serialized.includes('sqs:SendMessage')
+      && serialized.includes('BoundsQueue');
+  })).toBe(true);
 });
 
 test('every Rust image build is ARM64-only and preserves Cargo build caches', () => {

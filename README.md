@@ -80,8 +80,8 @@ resampling, while larger rasters are downsampled once before WebP encoding.
 Discord bot -> DynamoDB admission transaction -> job SQS -> launcher
   -> Step Functions Standard
       -> PrepareResolve (final-cache fast path)
-      -> ExportSourceFrames (one FFDec invocation per source; unique SVGs)
-      -> PlanBounds (global SVG dedup and bounds-cache checks)
+      -> ExportSourceFrames (one FFDec invocation per source; unique SVGs -> bounds SQS prefetch)
+      -> PlanBounds (global SVG dedup, completed-result check, and correctness barrier)
       -> ProbeUniqueStatesInline (request-selected direct Rust resvg)
          or ProbeUniqueStatesDistributed (request-selected S3 -> Standard children -> SQS callback)
       -> PrepareFinish (validated bounds, schedules, shared canvas)
@@ -93,6 +93,15 @@ Discord bot -> DynamoDB admission transaction -> job SQS -> launcher
 
 CloudFront -> private S3 /renders/ objects
 ```
+
+Each source exporter uses an inotify-backed filesystem watcher to discover
+completed SVGs while its FFDec subprocess is still generating later frames,
+then durably stores and submits each unique SVG as a fire-and-forget bounds
+task. This lets small resvg probes overlap the same source export as well as
+other source exports. `PlanBounds` still runs after
+every exporter completes, reuses valid prefetched results (including job-scoped
+no-cache results), and sends only unfinished work through the request-selected
+Inline or Distributed path.
 
 The bulk SWF corpus is checksummed and immutable. If a live character refers
 to a legitimate staff/legacy asset absent from that corpus, Prepare can fetch

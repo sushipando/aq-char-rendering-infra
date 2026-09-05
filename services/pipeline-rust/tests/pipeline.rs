@@ -15,6 +15,7 @@ fn config() -> Config {
         work_bucket: "work".into(),
         job_table: "jobs".into(),
         result_queue_url: "https://example.test/results".into(),
+        bounds_queue_url: None,
         public_base_url: "https://example.test".into(),
         dataset_version: "dev-v1".into(),
         asset_manifest_key: "datasets/dev-v1/manifest.json".into(),
@@ -28,6 +29,8 @@ fn config() -> Config {
         compose_batch_size: 4,
         frames_per_lambda: 1,
         download_concurrency: 4,
+        bounds_resolution: 256,
+        bounds_padding_pixels: 1,
         worker_concurrency: BTreeMap::new(),
         defaults: json!({}),
     }
@@ -265,6 +268,9 @@ async fn cache_bypass_uses_job_scoped_bounds_and_explicit_fanout_modes() -> Resu
     )
     .await?;
     assert_eq!(distributed["bounds_mode"], "distributed");
+    // Cache bypass forbids cross-job reuse, but the exporter prefetch and the
+    // barrier share this job-scoped result identity.
+    assert_eq!(distributed["task_count"], 0);
     assert!(distributed["inline_tasks"].is_null());
     Ok(())
 }
@@ -299,8 +305,7 @@ async fn incident_ground_cold_export_and_warm_cache() -> Result<()> {
         "work",
         "source",
         &event,
-        config().ffdec,
-        Duration::from_secs(280),
+        pipeline::export::ExportOptions::without_prefetch(config().ffdec, Duration::from_secs(280)),
     )
     .await?;
     let manifest: SourceManifest =
@@ -315,8 +320,10 @@ async fn incident_ground_cold_export_and_warm_cache() -> Result<()> {
         "work",
         "source",
         &event,
-        PathBuf::from("/nonexistent/ffdec.jar"),
-        Duration::from_secs(30),
+        pipeline::export::ExportOptions::without_prefetch(
+            PathBuf::from("/nonexistent/ffdec.jar"),
+            Duration::from_secs(30),
+        ),
     )
     .await?;
     assert_eq!(warm["vector_cache_hit"], true);
@@ -470,8 +477,10 @@ async fn replay_incident_through_all_rust_stages() -> Result<()> {
             "work",
             "source",
             &json!({"job_id":job,"input_key":input_key,"source":source}),
-            config.ffdec.clone(),
-            Duration::from_secs(280),
+            pipeline::export::ExportOptions::without_prefetch(
+                config.ffdec.clone(),
+                Duration::from_secs(280),
+            ),
         )
         .await?;
         sources.insert(

@@ -22,7 +22,18 @@ Export runs per source SWF, grouping its symbol requests. FFDec has a deadline
 shorter than the invocation deadline and is killed on timeout. Export hashes
 the effective SVG after settled-child registration corrections, preserves
 ordered schedules and the eight-frame validation tail, and never probes a
-raster. It publishes unique SVGs before publishing the source manifest.
+raster itself. While FFDec is still running, an event watcher backed by inotify
+on Lambda Linux discovers each completed, parseable SVG, stores it durably, and
+publishes a fire-and-forget task to the bounds SQS queue. This overlaps probes
+with later SVG generation in the same FFDec invocation as well as work in other
+source Lambdas. A final
+manifest pass reconciles missed files and publishes any effective SVGs produced
+by settled-frame registration corrections. It publishes the source manifest
+only after its referenced SVG uploads and queue attempts.
+Queue publication failure does not fail vector export because the later bounds
+barrier detects and dispatches unfinished work. A vector-manifest cache hit
+does not enqueue redundant prefetch messages; `PlanBounds` handles any
+independently disabled or missing bounds results.
 
 All new intermediate/cache objects are in the work bucket:
 
@@ -43,25 +54,27 @@ final results retain the existing lifecycle rules. Bump `EXPORT_POLICY`,
 `BOUNDS_POLICY`, and/or `rendererVersion` when their associated semantics change.
 
 The planner globally deduplicates exact SVG hashes, not thumbnail pixels, and
-queues only cache misses. Each request explicitly selects `bounds_mode` as
-`inline` or `distributed`; missing fields are hydrated to `inline` for older
-clients. The planner never changes that selection based on task count. Inline
-Map runs at most 40 probes concurrently and processes any remaining probes in
-later waves, subject to a conservative state-payload guard. Distributed mode
-uses the S3 JSON ItemReader and Standard SQS callback children, keeping the
-task list out of workflow payloads. Both paths form a completion barrier; an
-empty task list bypasses both Maps. Finish verifies every required result again
-before calculating the shared canvas. Raster tasks reference one `svg_key` and
-verified hash, not a duplicate-frame archive; the raster worker still accepts
-legacy `bundle_key` tasks.
+selects only results that are still missing after prefetch. Each request
+explicitly selects `bounds_mode` as `inline` or `distributed`; missing fields
+are hydrated to `inline` for older clients. The planner never changes that
+selection based on task count. Inline Map runs at most 40 probes concurrently
+and processes any remaining probes in later waves, subject to a conservative
+state-payload guard. Distributed mode uses the S3 JSON ItemReader and Standard
+SQS callback children, keeping the task list out of workflow payloads. Both
+paths form a completion barrier; an empty task list bypasses both Maps. Finish
+verifies every required result again before calculating the shared canvas.
+Raster tasks reference one `svg_key` and verified hash, not a duplicate-frame
+archive; the raster worker still accepts legacy `bundle_key` tasks.
 
 Requests may independently disable completed-render, animation-loop metadata,
 vector-export, bounds, and appearance-independent component-raster cache reuse.
 Bounds-cache bypass uses job-scoped result keys, so finish cannot read a
-pre-existing shared result. Vector bypass reruns FFDec and script metadata
-extraction and publishes a job-scoped source manifest. Component bypass skips
-both shared reads and writes. Exact source SWFs and generated SVG blobs remain
-content-addressed pipeline inputs rather than mutable cache entries.
+pre-existing shared result. Export prefetch and the barrier can reuse that same
+job-scoped result without enabling cross-job caching. Vector bypass reruns
+FFDec and script metadata extraction and publishes a job-scoped source
+manifest. Component bypass skips both shared reads and writes. Exact source
+SWFs and generated SVG blobs remain content-addressed pipeline inputs rather
+than mutable cache entries.
 
 Component raster fan-out is independently selected per request through
 `component_raster_mode`. Missing fields default to `inline`. Inline mode invokes
@@ -88,8 +101,10 @@ One-pixel padding is an estimate, not proof against arbitrarily faint features
 absent in an otherwise nonempty thumbnail. Conservative invisible fallbacks
 can also increase the canvas; representative visual validation remains required.
 
-Worker writes are immutable and precede callbacks. Duplicate deliveries and
-callback failures reuse stored results. Expired/already-completed callback
+Worker writes are immutable and precede callbacks. The same SQS worker accepts
+both fire-and-forget exporter prefetch messages and task-token callback messages.
+Duplicate deliveries, barrier races, and callback failures reuse stored results.
+Expired/already-completed callback
 tokens are acknowledged; transient callback errors retry. Probe failure on
 the third delivery sends task failure. Crashes/poison messages that cannot
 callback reach the DLQ; the explicit workflow deadline still fails the job.
@@ -154,7 +169,7 @@ source frames but limits final output to 12 frames, 512px raster / 256px output.
 Observed locally on 2026-09-05:
 
 - Ground incident: 128 frames, 104 unique SVGs, mirror boundary 49; exporter
-  recorded zero raster probes. A separate cold release-mode export took 4.18s;
+  performed no raster work. A separate cold release-mode export took 4.18s;
   warm export took 4.2ms and succeeded with an unavailable FFDec jar. These
   timings use local filesystem storage, not S3 or Lambda.
 - All six incident sources: 2,048 symbol-frames -> 149 unique SVGs. Full local

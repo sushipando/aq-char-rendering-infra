@@ -87,6 +87,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     });
     const stateMachine = this.createWorkflow(stageName, tuning, functions, queues.bounds, workBucket);
 
+    // Each source exporter starts bounds work as soon as its unique SVGs are
+    // durable. PlanBounds still checks the results and remains the workflow
+    // completion barrier for anything not finished yet.
+    functions.exportSource.addEnvironment('CHAR_RENDER_BOUNDS_QUEUE_URL', queues.bounds.queueUrl);
+    queues.bounds.grantSendMessages(functions.exportSource);
+
     functions.launcher.addEnvironment('CHAR_RENDER_STATE_MACHINE_ARN', stateMachine.stateMachineArn);
     stateMachine.grantStartExecution(functions.launcher);
     stateMachine.grantRead(functions.launcher);
@@ -484,8 +490,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       backoffRate: 2,
       maxAttempts: 5,
     };
-    // Export only vectors per source; a separate callback Map probes unique
-    // states before the finish phase can compute the shared canvas.
+    // Export stores vectors per source and immediately prefetches their bounds.
+    // This planner is still the barrier and dispatches only unfinished states.
     const prepareResolve = new tasks.LambdaInvoke(this, 'PrepareResolve', {
       lambdaFunction: functions.prepare,
       payload: sfn.TaskInput.fromObject({ request: sfn.JsonPath.objectAt('$.request') }),
