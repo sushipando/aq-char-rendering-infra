@@ -32,8 +32,13 @@ vendored tree byte-for-byte.)
 
 Files changed in our fork (relative to v0.48.1):
 - `crates/resvg/Cargo.toml` — add optional `libblur` dep + `simd-blur` feature.
-- `crates/resvg/src/filter/mod.rs` — `apply_blur` routes feGaussianBlur through
-  libblur (premultiplied RGBA) when the `simd-blur` feature is on, with
-  runtime `RESVG_BLUR_BACKEND=libblur|original` (default libblur),
-  `RESVG_BLUR_MODE=exact|fixed` (default exact), `RESVG_BLUR_EDGE=clamp|wrap|reflect`
-  (default reflect).
+- `crates/resvg/src/filter/mod.rs` — `apply_blur` routes large-sigma feGaussianBlur
+  (both axes >= 2, matching resvg's own box-blur threshold) through libblur's
+  `gaussian_box_blur` (three-box / CLT SIMD approximation on premultiplied RGBA)
+  when the `simd-blur` feature is on. The blur input is borrowed directly from
+  tiny-skia (no Pixmap->Vec copy) and the destination transferred into a fresh
+  Pixmap (no Vec->Pixmap copy), with one wrapper-owned allocation so an OOM is
+  a graceful fallback to resvg's in-place blur. Runtime switches:
+  `RESVG_BLUR_BACKEND=libblur|original` (default libblur),
+  `RESVG_BLUR_THREADS=single|adaptive` (default single). Small sigma (< 2)
+  and one-axis blurs keep upstream resvg IIR/box behavior.
