@@ -16,12 +16,13 @@ pub struct CliOptions {
     pub manifest_key: String,
     pub task_index: i64,
     pub benchmark_output_prefix: Option<String>,
+    pub raster_backend: Option<String>,
 }
 
 fn usage() -> &'static str {
     "\
 usage: aqw-component-raster local-raster --store-root DIR --job-id JOB --task-index N \
-[--manifest-key KEY] [--benchmark-output-prefix PREFIX]"
+[--manifest-key KEY] [--benchmark-output-prefix PREFIX] [--raster-backend resvg|thorvg]"
 }
 
 pub fn parse_cli(args: &[String]) -> Result<CliOptions, RasterError> {
@@ -33,6 +34,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, RasterError> {
     let mut manifest_key: Option<String> = None;
     let mut task_index: Option<i64> = None;
     let mut benchmark_output_prefix: Option<String> = None;
+    let mut raster_backend: Option<String> = None;
 
     let mut index = 1;
     while index < args.len() {
@@ -52,6 +54,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, RasterError> {
                 );
             }
             "--benchmark-output-prefix" => benchmark_output_prefix = Some(value.clone()),
+            "--raster-backend" => raster_backend = Some(value.clone()),
             _ => {
                 return Err(RasterError::invalid(format!(
                     "unknown argument {flag}\n{}",
@@ -76,6 +79,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, RasterError> {
         manifest_key,
         task_index,
         benchmark_output_prefix,
+        raster_backend,
     })
 }
 
@@ -92,6 +96,7 @@ pub async fn run_local(cli: &CliOptions) -> Result<RasterResult, RasterError> {
         manifest_key: cli.manifest_key.clone(),
         task_index: cli.task_index,
         benchmark_output_prefix: cli.benchmark_output_prefix.clone(),
+        raster_backend: cli.raster_backend.clone(),
     };
     let result = run_raster_task(&event, &store, &store).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);

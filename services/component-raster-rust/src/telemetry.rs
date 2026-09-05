@@ -56,6 +56,7 @@ pub struct RasterStats {
     pub filter_count: usize,
     pub raster_pixel_count: u64,
     pub component_raster_space: String,
+    pub raster_backend: crate::raster::RenderBackend,
     pub raster_canvas: (i64, i64),
     pub output_canvas: (i64, i64),
     pub cache_hit: bool,
@@ -88,6 +89,7 @@ pub fn log_raster_profile(stats: &RasterStats) {
         "component_raster_space",
         stats.component_raster_space.clone(),
     );
+    field(&mut fields, "render_backend", stats.raster_backend.to_str());
     field(&mut fields, "raster_canvas_width", stats.raster_canvas.0);
     field(&mut fields, "raster_canvas_height", stats.raster_canvas.1);
     field(&mut fields, "output_canvas_width", stats.output_canvas.0);

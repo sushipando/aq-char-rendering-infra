@@ -153,6 +153,19 @@ pub async fn run_raster_task(
     }
 
     let zoom = settings.zoom;
+    // Selected SVG rasterizer: the manifest carries the render job's choice
+    // (hydrated by the launcher from the SQS payload / CLI). The local-raster
+    // CLI can force a backend per invocation for A/B comparisons.
+    let raster_backend_name = event
+        .raster_backend
+        .clone()
+        .unwrap_or_else(|| settings.raster_backend.clone());
+    let raster_backend =
+        crate::raster::RenderBackend::parse(&raster_backend_name).ok_or_else(|| {
+            RasterError::invalid(format!(
+                "Unsupported render backend {raster_backend_name:?}"
+            ))
+        })?;
     let symbol_key = task.symbol_key.clone();
     let part = prepared.parts.get(&symbol_key).cloned().ok_or_else(|| {
         RasterError::invalid(format!(
@@ -211,6 +224,7 @@ pub async fn run_raster_task(
                 output_size,
                 &component_raster_space,
                 zoom,
+                raster_backend.to_str(),
                 &part,
             )?),
             None => None,
@@ -249,6 +263,7 @@ pub async fn run_raster_task(
                 symbol_key: symbol_key.clone(),
                 layer_name: task.layer_name.clone(),
                 result_key: String::new(),
+                render_backend: raster_backend.to_str().to_string(),
                 rasterize_ms: 0.0,
                 crop_ms: 0.0,
                 downsample_ms: 0.0,
@@ -293,6 +308,7 @@ pub async fn run_raster_task(
                 raster_canvas: (raster_canvas[0], raster_canvas[1]),
                 output_canvas: (output_canvas[0], output_canvas[1]),
                 cache_hit,
+                raster_backend,
                 timings: RasterTimings {
                     manifest_ms,
                     ..RasterTimings::default()
@@ -397,6 +413,7 @@ pub async fn run_raster_task(
         symbol_key: symbol_key.clone(),
         layer_name: task.layer_name.clone(),
         result_key: String::new(),
+        render_backend: raster_backend.to_str().to_string(),
         rasterize_ms: 0.0,
         crop_ms: 0.0,
         downsample_ms: 0.0,
@@ -417,7 +434,7 @@ pub async fn run_raster_task(
 
     if component.visible {
         let rasterize_started = Instant::now();
-        let rendered = render_svg(&svg_bytes, (page_width, page_height))?;
+        let rendered = render_svg(&svg_bytes, (page_width, page_height), raster_backend)?;
         timings.rasterize_ms = elapsed_ms(rasterize_started);
         result.rasterize_ms = crate::telemetry::rounded2(timings.rasterize_ms);
 
@@ -537,6 +554,7 @@ pub async fn run_raster_task(
         raster_canvas: (raster_canvas[0], raster_canvas[1]),
         output_canvas: (output_canvas[0], output_canvas[1]),
         cache_hit,
+        raster_backend,
         timings,
         total_ms,
     };

@@ -246,7 +246,6 @@ def run_python(root: Path, resvg: str, task_index: int) -> dict:
         asset_manifest_key="datasets/dev-v1/manifest.json",
         character_renderer_key="character-renderer/dev-v1/characterB.swf",
         finalizer_download_concurrency=4,
-        component_raster_enabled=True,
         component_raster_frame_cap=120,
         render_cache_enabled=False,
         rsvg_convert=resvg,
@@ -263,7 +262,12 @@ def run_python(root: Path, resvg: str, task_index: int) -> dict:
 
 
 def run_rust(
-    root: Path, binary: str, task_index: int, *, env: dict[str, str] | None = None
+    root: Path,
+    binary: str,
+    task_index: int,
+    *,
+    env: dict[str, str] | None = None,
+    raster_backend: str = "resvg",
 ) -> dict:
     result = subprocess.run(
         [
@@ -275,6 +279,8 @@ def run_rust(
             "raster-parity",
             "--task-index",
             str(task_index),
+            "--raster-backend",
+            raster_backend,
         ],
         capture_output=True,
         text=True,
@@ -358,12 +364,17 @@ def fir_tolerance(case: dict, task_count: int) -> tuple[bool, dict[str, object]]
     }
 
 
-def compare_one(case: dict, task_index: int, *, strict: bool = False) -> dict:
+def compare_one(
+    case: dict, task_index: int, *, strict: bool = False, backend: str = "resvg"
+) -> dict:
     """Compare one task. With ``strict`` (the exact downsample path) everything
     must match Pillow exactly. With ``strict=False`` (the FIR default) bbox
     geometry may drift by +-1 px (measured on the synthetic fixture) because
     FIR rounds premultiply differently; pixel fidelity is enforced separately
-    by ``fir_tolerance``.
+    by ``fir_tolerance``. With ``backend='thorvg'`` the Rust side renders with
+    ThorVG 1.1.1: the output is NOT pixel-identical to resvg, so the
+    comparison is informational (reports the max channel diff and the share of
+    pixels beyond a soft threshold) and only geometry consistency is asserted.
     """
     py = case["py_result"][task_index]
     rs = case["rs_result"][task_index]
@@ -415,13 +426,21 @@ def compare_one(case: dict, task_index: int, *, strict: bool = False) -> dict:
         else:
             diff = int(np.abs(a_arr - b_arr).max())
             max_diff = diff
-            pixel_status = (
-                "exact"
-                if diff == 0
-                else (
-                    f"diff={diff}" if strict else f"strict-fir-diff={diff} (tolerated)"
+            if backend == "thorvg":
+                significant = int((np.abs(a_arr - b_arr).max(axis=2) > 2).sum())
+                total = a_arr.shape[0] * a_arr.shape[1]
+                pixel_status = (
+                    f"engines-differ max={diff} significant={(significant * 100) // max(total, 1)}% "
+                    f"(informational)"
                 )
-            )
+            else:
+                pixel_status = (
+                    "exact"
+                    if diff == 0
+                    else (
+                        f"diff={diff}" if strict else f"strict-fir-diff={diff} (tolerated)"
+                    )
+                )
     return {
         "task_index": task_index,
         "checks": checks,
@@ -450,6 +469,13 @@ def main() -> int:
         "--exact",
         action="store_true",
         help="run the Rust worker with AQW_DOWNSAMPLER=exact (expects bit-identical",
+    )
+    parser.add_argument(
+        "--raster-backend",
+        choices=("resvg", "thorvg"),
+        default="resvg",
+        help="SVG rasterizer for the Rust worker: resvg (default, parity) or thorvg "
+        "(1.1.1; informational delta against the resvg reference)",
     )
     args = parser.parse_args()
 
@@ -503,7 +529,15 @@ def main() -> int:
             env = None
             if args.exact:
                 env = {"AQW_DOWNSAMPLER": "exact"}
-            rs_results.append(run_rust(rs_root, str(args.rust_binary), index, env=env))
+            rs_results.append(
+                run_rust(
+                    rs_root,
+                    str(args.rust_binary),
+                    index,
+                    env=env,
+                    raster_backend=args.raster_backend,
+                )
+            )
         case = {
             "py_root": py_root,
             "rs_root": rs_root,
@@ -511,9 +545,16 @@ def main() -> int:
             "rs_result": rs_results,
         }
         comparisons = [
-            compare_one(case, index, strict=args.exact) for index in range(task_count)
+            compare_one(case, index, strict=args.exact, backend=args.raster_backend)
+            for index in range(task_count)
         ]
-        if args.exact:
+        if args.raster_backend == "thorvg":
+            # ThorVG is an intentionally different renderer: no pixel-parity
+            # claim. Assert that both engines produced a bbox of the same
+            # shape (within the +-1 px tolerance) and report the visual delta.
+            ok = all(all(compare["checks"].values()) for compare in comparisons)
+            tolerance_ok, tolerance_stats = True, {}
+        elif args.exact:
             # Pillow-verbatim path: exact geometry and bit-identical pixels.
             ok = all(
                 compare["pixel_status"] in {"exact", "both-empty"}

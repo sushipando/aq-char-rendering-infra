@@ -237,7 +237,11 @@ pub fn run_bench(opts: &BenchOptions) -> Result<(), RasterError> {
     };
 
     let started = Instant::now();
-    let image = render_svg(mutated.as_bytes(), (w, h))?;
+    let image = render_svg(
+        mutated.as_bytes(),
+        (w, h),
+        crate::raster::RenderBackend::Resvg,
+    )?;
     let total_ms = elapsed_ms(started);
 
     println!(

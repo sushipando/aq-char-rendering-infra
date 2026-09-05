@@ -289,6 +289,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       CHAR_RENDER_DEFAULT_SUBFRAME_START: String(tuning.render.subframeStart),
       CHAR_RENDER_DEFAULT_WEBP_QUALITY: String(tuning.render.webpQuality),
       CHAR_RENDER_DEFAULT_WEBP_METHOD: String(tuning.render.webpMethod),
+      CHAR_RENDER_DEFAULT_RASTER_BACKEND: String(tuning.render.rasterBackend),
       CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK: String(
         tuning.render.allowOfficialAssetFallback,
       ),

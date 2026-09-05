@@ -27,9 +27,11 @@ use crate::storage::{Sink, Source};
 use crate::telemetry::sha256_hex;
 
 /// Bump when the raster pipeline changes in a way that can alter output
-/// bytes for identical inputs (resvg / fast_image_resize / downsample
-/// settings). Stale entries are simply never hit after a bump.
-pub const CACHE_SCHEMA: &str = "1";
+/// bytes for identical inputs (resvg / thorvg / fast_image_resize /
+/// downsample settings). Stale entries are simply never hit after a bump.
+/// Schema 2: backend-scoped keys so resvg and thorvg rasters of the same
+/// no-CC part never collide.
+pub const CACHE_SCHEMA: &str = "2";
 
 /// A part is appearance-independent iff it has no color customization.
 pub fn is_no_cc(part: &Part) -> bool {
@@ -52,6 +54,7 @@ struct CacheKeyInput {
     output_size: i64,
     component_raster_space: String,
     zoom: f64,
+    render_backend: String,
     root_class: String,
     character_id: Option<i64>,
 }
@@ -72,6 +75,7 @@ pub fn cache_key(
     output_size: i64,
     component_raster_space: &str,
     zoom: f64,
+    render_backend: &str,
     part: &Part,
 ) -> Result<String, RasterError> {
     let input = CacheKeyInput {
@@ -86,6 +90,7 @@ pub fn cache_key(
         output_size,
         component_raster_space: component_raster_space.to_string(),
         zoom,
+        render_backend: render_backend.to_string(),
         root_class: part.root_class.clone(),
         character_id: part.character_id,
     };
@@ -207,6 +212,7 @@ mod tests {
             256,
             "output",
             2.0,
+            "resvg",
             &no_cc_part(),
         )
         .unwrap();
@@ -221,6 +227,7 @@ mod tests {
             256,
             "output",
             2.0,
+            "resvg",
             &no_cc_part(),
         )
         .unwrap();
@@ -239,6 +246,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -253,6 +261,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -267,6 +276,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -281,6 +291,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -295,6 +306,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -309,6 +321,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -323,6 +336,7 @@ mod tests {
                 256,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -337,6 +351,7 @@ mod tests {
                 128,
                 "output",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -351,6 +366,7 @@ mod tests {
                 256,
                 "raster",
                 2.0,
+                "resvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -365,6 +381,23 @@ mod tests {
                 256,
                 "output",
                 3.0,
+                "resvg",
+                &no_cc_part(),
+            )
+            .unwrap(),
+            // A different SVG rasterizer must never reuse a resvg entry.
+            cache_key(
+                "sig-1",
+                [1.0, 0.0, 0.0, 1.0, 5.0, 6.0],
+                false,
+                3,
+                "armor_chest",
+                [0.0, 0.0, 100.0, 200.0],
+                512,
+                256,
+                "output",
+                2.0,
+                "thorvg",
                 &no_cc_part(),
             )
             .unwrap(),
@@ -392,6 +425,7 @@ mod tests {
             256,
             "output",
             2.0,
+            "resvg",
             &no_cc_part(),
         )
         .unwrap();
@@ -406,6 +440,7 @@ mod tests {
             256,
             "output",
             2.0,
+            "resvg",
             &other,
         )
         .unwrap();

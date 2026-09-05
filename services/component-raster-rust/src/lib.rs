@@ -14,4 +14,5 @@ pub mod resample;
 pub mod storage;
 pub mod svg;
 pub mod telemetry;
+pub mod thorvg;
 pub mod worker;

@@ -197,7 +197,8 @@ AWS_PROFILE=aqw-char-dev AWS_DEFAULT_REGION=us-west-2 \
 Multiple characters queue one job each; `--webp-lossless` selects lossless
 encoding; `--max-frames` controls the animation length; `--no-watch` queues
 without waiting; `--no-verify` skips the CloudFront fetch (`--help` for all
-options).
+options). **`--raster-backend thorvg`** renders that character's component
+SVGs with ThorVG 1.1.1 instead of the default resvg 0.48.1.
 
 ### Rust component workers
 
@@ -211,7 +212,11 @@ renderer (see `docs/rust-component-compose-plan.md`):
   as a library and downsamples with a Pillow-exact Lanczos resampler
   (fast_image_resize remains available via `AQW_DOWNSAMPLER`); selected
   through `componentRasterBackend` (default `python` until deployed parity is
-  confirmed).
+  confirmed). Each render job can swap the SVG rasterizer to **ThorVG 1.1.1**
+  through `render.raster_backend` (per-character via
+  `submit_render.py --raster-backend thorvg`, fleet default via CDK tuning
+  `render.rasterBackend`); the two engines are intentionally not
+  pixel-identical.
 
 Both use the same `provided:al2023` Dockerfile build with
 `RUSTFLAGS="-C target-cpu=x86-64-v2"` and pass the local parity harnesses

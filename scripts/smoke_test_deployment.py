@@ -61,6 +61,12 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Encode frames with cwebp -lossless 1 instead of lossy",
     )
+    result.add_argument(
+        "--raster-backend",
+        choices=("resvg", "thorvg"),
+        default="resvg",
+        help="SVG rasterizer for the component pass: resvg (pinned 0.48.1, default) or thorvg (1.1.1)",
+    )
     result.add_argument("--timeout-seconds", type=int, default=1_200)
     result.add_argument("--poll-seconds", type=float, default=5)
     return result
@@ -211,6 +217,7 @@ def main() -> int:
             webp_quality=args.webp_quality,
             webp_method=args.webp_method,
             webp_lossless=args.webp_lossless or None,
+            raster_backend=args.raster_backend,
         ),
         appearance=appearance,
     )
@@ -226,6 +233,7 @@ def main() -> int:
         "webp_quality": request.render.webp_quality,
         "webp_method": request.render.webp_method,
         "webp_lossless": request.render.webp_lossless,
+        "raster_backend": request.render.raster_backend,
     }
     sqs = boto3.client("sqs")
     try:

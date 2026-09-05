@@ -326,6 +326,19 @@ def rasterize_component_state(
             f"Unsupported component raster space {component_raster_space!r}"
         )
     zoom = float(settings["zoom"])
+    raster_backend = str(settings.get("raster_backend") or "resvg")
+    if raster_backend not in {"resvg", "thorvg"}:
+        raise character_svg.CharacterSvgError(
+            f"Unsupported render backend {raster_backend!r}"
+        )
+    if raster_backend == "thorvg":
+        # The reference Python worker rasterizes with the resvg CLI only; the
+        # deployed Rust worker owns the ThorVG path. Refuse loudly instead of
+        # silently emitting a resvg raster for a thorvg job.
+        raise character_svg.CharacterSvgError(
+            "The Python component-raster worker does not support "
+            "render.raster_backend='thorvg'; use the Rust worker"
+        )
     fields = {str(key): str(value) for key, value in prepared["fields"].items()}
     all_color_rules = [tuple(value) for value in prepared["all_color_rules"]]
     symbol_key = str(task["symbol_key"])

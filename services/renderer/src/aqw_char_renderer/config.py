@@ -53,6 +53,13 @@ def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
     raise ConfigurationError(f"{name} must be a boolean")
 
 
+def _choice(environment: Mapping[str, str], name: str, default: str, allowed: set[str]) -> str:
+    raw = environment.get(name, default).strip()
+    if raw not in allowed:
+        raise ConfigurationError(f"{name} must be one of {sorted(allowed)}")
+    return raw
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     source_bucket: str
@@ -77,6 +84,7 @@ class RuntimeConfig:
     default_subframe_start: int = 1
     default_webp_quality: float = 85.0
     default_webp_method: int = 4
+    default_raster_backend: str = "resvg"
     allow_official_asset_fallback: bool = True
     official_asset_timeout_seconds: int = 15
     # When false, prepare/finalize skip the content-addressed render cache
@@ -162,6 +170,12 @@ class RuntimeConfig:
             default_webp_method=_integer(
                 values, "CHAR_RENDER_DEFAULT_WEBP_METHOD", 4, 0, 6
             ),
+            default_raster_backend=_choice(
+                values,
+                "CHAR_RENDER_DEFAULT_RASTER_BACKEND",
+                "resvg",
+                {"resvg", "thorvg"},
+            ),
             allow_official_asset_fallback=_boolean(
                 values, "CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK", True
             ),
@@ -223,4 +237,5 @@ class RuntimeConfig:
             "webp_quality": self.default_webp_quality,
             "webp_method": self.default_webp_method,
             "webp_lossless": False,
+            "raster_backend": self.default_raster_backend,
         }

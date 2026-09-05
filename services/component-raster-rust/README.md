@@ -20,6 +20,53 @@ and a real FFDec pet export: the FIR default passes a premultiplied-on-gray
 tolerance gate (max 6/255, <0.01% significant pixels), and `--exact` requires
 bit-identical RGBA.
 
+## Alternate SVG rasterizer: ThorVG 1.1.1
+
+Each render job can pick which engine rasterizes the tight-page component
+SVGs via `render.raster_backend` (`resvg` default | `thorvg`):
+
+```bash
+uv run --package aqw-char-renderer python scripts/submit_render.py alina \
+  --raster-backend thorvg
+```
+
+- **Rust backend** — `src/thorvg.rs` drives the vendored ThorVG 1.1.1 C API
+  (`tvg_engine_init` -> `tvg_swcanvas_create` -> `tvg_picture_load_data` ->
+  `tvg_swcanvas_set_target(ARGB8888S)` -> add/draw/sync) into a caller-owned
+  straight-alpha buffer at the exact page size, with the same alpha-bbox crop,
+  output-grid downsample, and PNG encode as the resvg path.
+- **Vendoring** — `vendor/thorvg-sys-upstream/` bundles the `thorvg-sys`
+  0.3.2 crate (build.rs, hosted build via cc-rs) with the trimmed ThorVG 1.1.1
+  C++ **source** (renderer + cpu_engine + svg/png/sfnt loaders + C API;
+  lottie/gpu/webp/jpg/media are stripped). The Rust bindings are
+  pre-generated into `bindings.rs` and the patched `build.rs` copies them
+  instead of invoking bindgen, so the Lambda Docker build needs **no
+  libclang**. `Cargo.toml` pins `thorvg-sys` with
+  `features = [vendored, svg, png, fonts, threads]`.
+- **Selection plumbing** — the launcher hydrates
+  `CHAR_RENDER_DEFAULT_RASTER_BACKEND` (CDK tuning `render.rasterBackend`)
+  into every sparse request; `render.raster_backend` is validated in
+  `contracts.py`, written by Prepare into the manifest `settings`, consumed by
+  the worker (per-invocation override via `local-raster --raster-backend` for
+  A/B runs), and surfaced in the result record + telemetry. The Python
+  reference worker refuses `thorvg` loudly.
+- **Cache** — `CACHE_SCHEMA` is bumped to `2` and the content-addressed key
+  includes the backend, so resvg and thorvg entries never collide.
+- **Notes** — ThorVG 1.1.1 starts C-API paints at refcount 0, so teardown
+  must call `tvg_paint_rel` *before* `tvg_canvas_destroy` (rel is a no-op for
+  canvas-adopted paints, a delete for unadopted ones — see `src/thorvg.rs`).
+  The engine is process-global and its init/term refcount is not
+  thread-safe, so the ThorVG unit test is a single serialized
+  `engine_round_trip` test (production is one SVG per process anyway).
+  Outputs are intentionally **not** pixel-identical to resvg; the parity
+  harness compares ThorVG side channels geometrically (±1 px bbox) and
+  reports the pixel delta as informational:
+
+```bash
+uv run --package aqw-char-renderer python scripts/rust_raster_parity.py \
+  --raster-backend thorvg
+```
+
 ## Layout
 
 ```text

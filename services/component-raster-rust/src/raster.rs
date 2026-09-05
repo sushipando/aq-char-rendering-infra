@@ -1,16 +1,62 @@
-//! resvg in-process rasterization, alpha cropping, output-grid downsampling
-//! via fast_image_resize, and PNG encoding.
+//! resvg or ThorVG in-process rasterization, alpha cropping, output-grid
+//! downsampling via fast_image_resize, and PNG encoding.
 
 use fast_image_resize as fir;
 
 use crate::compositor::RgbaImage;
 use crate::error::RasterError;
 
-/// Rasterize a serialized component SVG at its natural px size. The page is
-/// built with integer px width/height matching the job's shared pixel scale,
-/// so `tree.size()` equals the expected page exactly (like the resvg CLI with
-/// `--width`/`--height` at scale 1).
-pub fn render_svg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaImage, RasterError> {
+/// The SVG rasterizer that renders the tight-page component SVGs.
+///
+/// `resvg` is the pinned 0.48.1 upstream (with the repo's libblur SIMD blur
+/// patch vendored under `vendor/resvg-upstream`); `thorvg` is the pinned
+/// 1.1.1 upstream built through `vendor/thorvg-sys-upstream`. Both render the
+/// same assembled SVG; the outputs are intentionally not pixel-identical, and
+/// the either/or is chosen per render job via `render.raster_backend`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderBackend {
+    Resvg,
+    Thorvg,
+}
+
+pub const DEFAULT_RENDER_BACKEND: RenderBackend = RenderBackend::Resvg;
+
+impl RenderBackend {
+    /// Parse a manifest `raster_backend` value; unknown values are rejected
+    /// so a typo can never silently fall back to the wrong engine.
+    pub fn parse(value: &str) -> Option<RenderBackend> {
+        match value {
+            "resvg" => Some(RenderBackend::Resvg),
+            "thorvg" => Some(RenderBackend::Thorvg),
+            _ => None,
+        }
+    }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            RenderBackend::Resvg => "resvg",
+            RenderBackend::Thorvg => "thorvg",
+        }
+    }
+}
+
+/// Rasterize a serialized component SVG at its natural px size with the
+/// selected backend. The page is built with integer px width/height matching
+/// the job's shared pixel scale, so both engines see the same expected size.
+pub fn render_svg(
+    svg_bytes: &[u8],
+    expected: (u32, u32),
+    backend: RenderBackend,
+) -> Result<RgbaImage, RasterError> {
+    match backend {
+        RenderBackend::Resvg => render_svg_resvg(svg_bytes, expected),
+        RenderBackend::Thorvg => crate::thorvg::render_svg(svg_bytes, expected),
+    }
+}
+
+/// The resvg path: usvg parse -> tiny_skia premultiplied pixmap -> exact
+/// CLI demultiply (kept bit-identical to the shared image's `/opt/resvg`).
+pub fn render_svg_resvg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaImage, RasterError> {
     let mut options = resvg::usvg::Options {
         resources_dir: None,
         ..resvg::usvg::Options::default()

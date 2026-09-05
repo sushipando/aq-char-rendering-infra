@@ -19,6 +19,10 @@ pub struct RasterEvent {
     pub task_index: i64,
     #[serde(default, rename = "benchmark_output_prefix")]
     pub benchmark_output_prefix: Option<String>,
+    // Optional per-invocation backend override (local-raster A/B testing).
+    // Production map events omit it; the manifest is authoritative there.
+    #[serde(default, rename = "raster_backend")]
+    pub raster_backend: Option<String>,
 }
 
 /// The prepare-manifest fields the raster worker depends on.
@@ -45,6 +49,15 @@ pub struct ManifestSettings {
     pub zoom: f64,
     pub webp_quality: f64,
     pub webp_method: i64,
+    // SVG rasterizer for the component pass: "resvg" (default, upstream
+    // 0.48.1 + vendored patches) or "thorvg" (1.1.1). Manifests written by
+    // older prepare versions omit it; default keeps them on resvg.
+    #[serde(default = "default_raster_backend")]
+    pub raster_backend: String,
+}
+
+fn default_raster_backend() -> String {
+    "resvg".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -144,6 +157,9 @@ pub struct RasterResult {
     pub symbol_key: String,
     pub layer_name: String,
     pub result_key: String,
+    // Which SVG rasterizer produced this raster (resvg | thorvg). Surface it
+    // in the result record + telemetry so per-backend renders are auditable.
+    pub render_backend: String,
     pub rasterize_ms: f64,
     pub crop_ms: f64,
     pub downsample_ms: f64,
@@ -167,6 +183,18 @@ mod tests {
             event.benchmark_output_prefix.as_deref(),
             Some("benchmarks/rust-raster/job-1")
         );
+        assert_eq!(event.raster_backend, None);
+    }
+
+    #[test]
+    fn parses_manifest_raster_backend_with_default() {
+        let raw = r#"{"job_id":"j","viewbox":[0.0,0.0,10.0,10.0],"settings":{"raster_size":512,"output_size":256,"zoom":1.0,"webp_quality":85.0,"webp_method":4},"fields":{},"component_tasks":[],"parts":{}}"#;
+        let manifest: PrepareManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(manifest.settings.raster_backend, "resvg");
+
+        let raw_thorvg = r#"{"job_id":"j","viewbox":[0.0,0.0,10.0,10.0],"settings":{"raster_size":512,"output_size":256,"zoom":1.0,"webp_quality":85.0,"webp_method":4,"raster_backend":"thorvg"},"fields":{},"component_tasks":[],"parts":{}}"#;
+        let manifest: PrepareManifest = serde_json::from_str(raw_thorvg).unwrap();
+        assert_eq!(manifest.settings.raster_backend, "thorvg");
     }
 
     #[test]

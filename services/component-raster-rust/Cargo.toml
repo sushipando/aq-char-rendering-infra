@@ -35,6 +35,13 @@ fast_image_resize = "6"
 flate2 = "1"
 tar = "0.4"
 roxmltree = "0.20"
+# ThorVG 1.1.1 (vendored C++ source under vendor/thorvg-sys-upstream, built
+# with cc-rs) renders the same tight-page component SVGs through an alternate
+# SVG backend. The safe crate is pinned 0.3.2 and the [patch] below replaces
+# the registry source with the vendored 0.3.2+thorvg-1.1.1 build. Loaders are
+# trimmed to svg/png (embedded bitmaps) + fonts (text); lottie/expressions and
+# file-io are unused by the component SVGs we assemble.
+thorvg-sys = { version = "0.3.2", default-features = false, features = ["vendored", "svg", "png", "fonts", "threads"] }
 
 [profile.release]
 opt-level = 3
@@ -45,3 +52,4 @@ panic = "abort"
 
 [patch.crates-io]
 resvg = { path = "vendor/resvg-upstream/crates/resvg" }
+thorvg-sys = { path = "vendor/thorvg-sys-upstream" }

@@ -22,6 +22,10 @@ export interface RenderTuning {
   readonly mapConcurrency: number;
   readonly webpQuality: number;
   readonly webpMethod: number;
+  // Fleet default SVG rasterizer for the component pass: 'resvg' (pinned
+  // 0.48.1) or 'thorvg' (1.1.1). Individual render jobs can still override
+  // per-character via render.raster_backend.
+  readonly rasterBackend: 'resvg' | 'thorvg';
   readonly allowOfficialAssetFallback: boolean;
   readonly officialAssetTimeoutSeconds: number;
   readonly maxActivePerUser: number;
@@ -167,6 +171,7 @@ const DEV_TUNING: InfrastructureTuning = {
     mapConcurrency: 300,
     webpQuality: 85,
     webpMethod: 4,
+    rasterBackend: 'resvg',
     allowOfficialAssetFallback: true,
     officialAssetTimeoutSeconds: 15,
     maxActivePerUser: 2,

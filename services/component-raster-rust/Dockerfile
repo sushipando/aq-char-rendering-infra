@@ -20,6 +20,9 @@ RUN dnf install -y \
     && rm -rf /var/cache/dnf
 
 # Rust stable, pinned to match the toolchain that produced Cargo.lock.
+# ThorVG's Rust bindings are frozen in vendor/thorvg-sys-upstream/bindings.rs
+# (the patched build.rs copies them instead of invoking bindgen), so this
+# image needs no libclang; cc-rs compiles the vendored ThorVG C++ with gcc.
 ARG RUST_VERSION=1.98.0
 RUN curl --fail --location --retry 3 https://sh.rustup.rs -sSf | \
       sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \

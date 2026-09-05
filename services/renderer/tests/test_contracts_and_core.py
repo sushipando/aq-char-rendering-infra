@@ -87,6 +87,7 @@ def request_payload() -> dict:
             "padding": 0,
             "webp_quality": 85,
             "webp_method": 4,
+            "raster_backend": "resvg",
         },
     }
 
@@ -184,6 +185,17 @@ def test_request_contract_rejects_unknown_fields() -> None:
     payload["render"]["arbitrary_url"] = "https://example.com/item.swf"
     with pytest.raises(ContractError, match="unsupported field"):
         JobRequest.from_dict(payload)
+
+
+def test_request_contract_accepts_raster_backend_choices() -> None:
+    payload = request_payload()
+    payload["render"]["raster_backend"] = "thorvg"
+    assert JobRequest.from_dict(payload).render.raster_backend == "thorvg"
+
+    payload2 = request_payload()
+    payload2["render"]["raster_backend"] = "not-a-backend"
+    with pytest.raises(ContractError, match="raster_backend"):
+        JobRequest.from_dict(payload2)
 
 
 def test_request_contract_rejects_output_larger_than_raster() -> None:

@@ -19,6 +19,7 @@ _ALLOWED_SLOTS = frozenset({"armor", "weapon", "helm", "cape", "ground"})
 _MAX_APPEARANCE_FIELDS = 128
 _MAX_APPEARANCE_VALUE_BYTES = 2_048
 _MAX_APPEARANCE_BYTES = 32_768
+_ALLOWED_RASTER_BACKENDS = frozenset({"resvg", "thorvg"})
 
 
 class ContractError(ValueError):
@@ -114,6 +115,13 @@ def _number(value: Any, label: str, minimum: float, maximum: float) -> float:
     return number
 
 
+def _choice(value: Any, label: str, allowed: set[str]) -> str:
+    text = str(value)
+    if text not in allowed:
+        raise ContractError(f"{label} must be one of {sorted(allowed)}")
+    return text
+
+
 @dataclass(frozen=True)
 class DiscordTarget:
     user_id: str
@@ -167,6 +175,10 @@ class RenderSettings:
     webp_quality: float = 85.0
     webp_method: int = 4
     webp_lossless: bool | None = None
+    # SVG rasterizer for the component pass: "resvg" (default, the pinned
+    # 0.48.1 upstream) or "thorvg" (1.1.1). Both render the same assembled
+    # SVG; the outputs are intentionally not pixel-identical.
+    raster_backend: str = "resvg"
 
     @classmethod
     def from_dict(cls, value: Any) -> RenderSettings:
@@ -189,6 +201,7 @@ class RenderSettings:
             "webp_quality",
             "webp_method",
             "webp_lossless",
+            "raster_backend",
         }
         _only_keys(payload, allowed, "render")
         facing = str(payload.get("facing", "right")).casefold()
@@ -243,6 +256,11 @@ class RenderSettings:
                 _boolean(payload["webp_lossless"], "render.webp_lossless")
                 if payload.get("webp_lossless") is not None
                 else None
+            ),
+            raster_backend=_choice(
+                payload.get("raster_backend", "resvg"),
+                "render.raster_backend",
+                _ALLOWED_RASTER_BACKENDS,
             ),
         )
 
