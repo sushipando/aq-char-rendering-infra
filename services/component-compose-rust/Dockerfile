@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Multi-stage build for the aqw-component-compose Lambda.
 
 # Build stage uses Amazon Linux 2023 (the same glibc 2.34 as the
@@ -5,6 +7,8 @@
 # the Lambda runtime and needs no musl cross-compilation. This worker runs
 # only on Graviton (arm64); +neon enables tiny-skia SIMD.
 FROM public.ecr.aws/lambda/provided:al2023 AS build
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = "arm64" || (echo "component-compose-rust must be built for linux/arm64" >&2; exit 1)
 
 # curl-minimal with /usr/bin/curl is already present in the al2023 base.
 RUN dnf install -y \
@@ -36,8 +40,13 @@ ENV CARGO_PROFILE_RELEASE_LTO="thin" \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS="1" \
     CARGO_PROFILE_RELEASE_STRIP="symbols" \
     CARGO_PROFILE_RELEASE_PANIC="abort"
-RUN . "$HOME/.cargo/env" && RUSTFLAGS="-C target-feature=+neon" \
-    cargo build --release --locked --bin aqw-component-compose
+RUN --mount=type=cache,id=aqw-component-compose-cargo-registry-arm64,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=aqw-component-compose-cargo-git-arm64,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=aqw-component-compose-target-arm64,target=/build/target,sharing=locked \
+    . "/root/.cargo/env" \
+    && RUSTFLAGS="-C target-feature=+neon" cargo build --release --locked --bin aqw-component-compose \
+    && mkdir -p /out \
+    && cp target/release/aqw-component-compose /out/bootstrap
 
 # ---- runtime image ---------------------------------------------------------
 FROM public.ecr.aws/lambda/provided:al2023
@@ -62,7 +71,7 @@ RUN dnf install -y tar gzip \
     && rm -rf /var/cache/dnf \
     && /opt/libwebp/bin/cwebp -version
 
-COPY --from=build /build/target/release/aqw-component-compose ${LAMBDA_RUNTIME_DIR}/bootstrap
+COPY --from=build /out/bootstrap ${LAMBDA_RUNTIME_DIR}/bootstrap
 RUN chmod +x ${LAMBDA_RUNTIME_DIR}/bootstrap
 
 ENV CHAR_RENDER_CWEBP=/opt/libwebp/bin/cwebp \

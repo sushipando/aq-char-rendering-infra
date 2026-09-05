@@ -20,13 +20,15 @@ and a real FFDec pet export: the FIR default passes a premultiplied-on-gray
 tolerance gate (max 6/255, <0.01% significant pixels), and `--exact` requires
 bit-identical RGBA.
 
-## Alternate SVG rasterizer: ThorVG 1.1.1
+## Optional local SVG comparison: ThorVG 1.1.1
 
-Each render job can pick which engine rasterizes the tight-page component
-SVGs via `render.raster_backend` (`resvg` default | `thorvg`):
+Production and pipeline builds are resvg-only and do not compile or link the
+vendored ThorVG C++ backend. To run a local comparison, opt into the Cargo
+feature explicitly:
 
 ```bash
-uv run --package aqw-char-renderer python scripts/submit_render.py alina \
+cargo run --release --features thorvg -- local-raster \
+  --store-root /path/to/store --job-id JOB --task-index 0 \
   --raster-backend thorvg
 ```
 
@@ -43,13 +45,9 @@ uv run --package aqw-char-renderer python scripts/submit_render.py alina \
   instead of invoking bindgen, so the Lambda Docker build needs **no
   libclang**. `Cargo.toml` pins `thorvg-sys` with
   `features = [vendored, svg, png, fonts, threads]`.
-- **Selection plumbing** — the launcher hydrates
-  `CHAR_RENDER_DEFAULT_RASTER_BACKEND` (CDK tuning `render.rasterBackend`)
-  into every sparse request; `render.raster_backend` is validated in
-  `contracts.py`, written by Prepare into the manifest `settings`, consumed by
-  the worker (per-invocation override via `local-raster --raster-backend` for
-  A/B runs), and surfaced in the result record + telemetry. The Python
-  reference worker refuses `thorvg` loudly.
+- **Selection plumbing** — `local-raster --raster-backend thorvg` is accepted
+  only by builds compiled with `--features thorvg`. The deployed pipeline
+  contract accepts only `resvg`.
 - **Cache** — `CACHE_SCHEMA` is bumped to `2` and the content-addressed key
   includes the backend, so resvg and thorvg entries never collide.
 - **Notes** — ThorVG 1.1.1 starts C-API paints at refcount 0, so teardown
@@ -63,6 +61,7 @@ uv run --package aqw-char-renderer python scripts/submit_render.py alina \
   reports the pixel delta as informational:
 
 ```bash
+cargo build --release --features thorvg
 uv run --package aqw-char-renderer python scripts/rust_raster_parity.py \
   --raster-backend thorvg
 ```

@@ -20,9 +20,14 @@ pub struct CliOptions {
 }
 
 fn usage() -> &'static str {
+    #[cfg(feature = "thorvg")]
+    return "\
+usage: aqw-component-raster local-raster --store-root DIR --job-id JOB --task-index N \
+[--manifest-key KEY] [--benchmark-output-prefix PREFIX] [--raster-backend resvg|thorvg]";
+    #[cfg(not(feature = "thorvg"))]
     "\
 usage: aqw-component-raster local-raster --store-root DIR --job-id JOB --task-index N \
-[--manifest-key KEY] [--benchmark-output-prefix PREFIX] [--raster-backend resvg|thorvg]"
+[--manifest-key KEY] [--benchmark-output-prefix PREFIX] [--raster-backend resvg]"
 }
 
 pub fn parse_cli(args: &[String]) -> Result<CliOptions, RasterError> {

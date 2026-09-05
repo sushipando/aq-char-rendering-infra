@@ -1,5 +1,6 @@
-//! resvg or ThorVG in-process rasterization, alpha cropping, output-grid
-//! downsampling via fast_image_resize, and PNG encoding.
+//! resvg in-process rasterization, alpha cropping, output-grid downsampling
+//! via fast_image_resize, and PNG encoding. ThorVG remains opt-in for local
+//! comparison builds through the `thorvg` Cargo feature.
 
 use fast_image_resize as fir;
 
@@ -16,6 +17,7 @@ use crate::error::RasterError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderBackend {
     Resvg,
+    #[cfg(feature = "thorvg")]
     Thorvg,
 }
 
@@ -27,6 +29,7 @@ impl RenderBackend {
     pub fn parse(value: &str) -> Option<RenderBackend> {
         match value {
             "resvg" => Some(RenderBackend::Resvg),
+            #[cfg(feature = "thorvg")]
             "thorvg" => Some(RenderBackend::Thorvg),
             _ => None,
         }
@@ -35,6 +38,7 @@ impl RenderBackend {
     pub fn to_str(&self) -> &'static str {
         match self {
             RenderBackend::Resvg => "resvg",
+            #[cfg(feature = "thorvg")]
             RenderBackend::Thorvg => "thorvg",
         }
     }
@@ -50,6 +54,7 @@ pub fn render_svg(
 ) -> Result<RgbaImage, RasterError> {
     match backend {
         RenderBackend::Resvg => render_svg_resvg(svg_bytes, expected),
+        #[cfg(feature = "thorvg")]
         RenderBackend::Thorvg => crate::thorvg::render_svg(svg_bytes, expected),
     }
 }

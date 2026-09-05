@@ -8,19 +8,22 @@ compact result row per character and (optionally) verifies the delivered WebP
 on CloudFront.
 
 Examples:
-    # Single default render (artix, 2048, q85/m4 lossy)
-    uv run --package aqw-char-renderer python scripts/submit_render.py
+    # The short wrapper supplies uv and the dev AWS profile/Region.
+    scripts/render-character artix
 
-    # One character with the WebP toggles
-    uv run --package aqw-char-renderer python scripts/submit_render.py alina \\
-        --output-size 1024 --webp-quality 70 --webp-method 2
+    # One character with render and WebP controls.
+    scripts/render-character alina -s 1024 -n 30 -q 70 -m 2 \\
+        --facing left --zoom 1 --padding 8
 
     # Multiple characters in one run (each gets its own job)
-    uv run --package aqw-char-renderer python scripts/submit_render.py \\
-        alina godlow --webp-lossless
+    scripts/render-character alina godlow --lossless
 
     # Queue without waiting
-    uv run --package aqw-char-renderer python scripts/submit_render.py alina --no-watch
+    scripts/render-character alina --no-watch
+
+    # Force a true cold-path benchmark through every cross-job stage.
+    scripts/render-character mck -s 1024 --bounds-mode inline \
+        --component-raster-mode inline --no-cache
 """
 
 from __future__ import annotations
@@ -34,7 +37,9 @@ from uuid import uuid4
 
 import boto3
 from aqw_char_renderer.contracts import (
+    CacheSettings,
     DiscordTarget,
+    ItemOverride,
     JobRequest,
     RenderSettings,
     utc_now,
@@ -52,21 +57,137 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("usernames", nargs="*", help="Public AQW character name(s)")
     result.add_argument("--outputs", type=Path, default=Path("cdk-outputs.dev.json"))
-    result.add_argument("--output-size", type=int, choices=(256, 512, 1024, 2048), default=2048)
-    result.add_argument("--webp-quality", type=float, default=85.0, help="cwebp -q 0..100 (default 85)")
-    result.add_argument("--webp-method", type=int, default=4, help="cwebp -m 0..6 (default 4)")
+    result.add_argument(
+        "-s",
+        "--output-size",
+        type=int,
+        choices=(256, 512, 1024, 2048),
+        default=2048,
+        help="final longest dimension (default: 2048)",
+    )
+    result.add_argument(
+        "--raster-size",
+        type=int,
+        help="raster longest dimension, 64..4096 (default: 2x output size)",
+    )
+    result.add_argument(
+        "--zoom", type=float, default=1.0, help="FFDec zoom, 0.25..8 (default: 1)"
+    )
+    result.add_argument(
+        "--padding", type=int, default=0, help="final transparent padding in pixels"
+    )
+    result.add_argument("--facing", choices=("left", "right"), default="right")
+    result.add_argument(
+        "--base-items", action="store_true", help="render base equipped items"
+    )
+    result.add_argument(
+        "--show-hidden", action="store_true", help="include hidden equipped items"
+    )
+    result.add_argument(
+        "--complete-loop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="complete an animation loop (use --no-complete-loop to disable)",
+    )
+    result.add_argument(
+        "--subframe-start",
+        "--start-frame",
+        dest="subframe_start",
+        type=int,
+        default=1,
+        help="one-based source frame at which to start (default: 1)",
+    )
+    result.add_argument(
+        "--item-id",
+        "--override-item-id",
+        dest="override_item_id",
+        type=int,
+        help="temporarily equip an AQW item ID",
+    )
+    result.add_argument(
+        "--slot",
+        "--override-slot",
+        dest="override_slot",
+        choices=("armor", "weapon", "helm", "cape", "ground"),
+        help="slot for --item-id when it cannot be inferred",
+    )
+    result.add_argument(
+        "-q",
+        "--webp-quality",
+        type=float,
+        default=85.0,
+        help="cwebp -q 0..100 (default: 85)",
+    )
+    result.add_argument(
+        "-m",
+        "--webp-method",
+        type=int,
+        choices=range(7),
+        default=4,
+        help="cwebp -m 0..6 (default: 4)",
+    )
     result.add_argument(
         "--raster-backend",
-        choices=("resvg", "thorvg"),
+        choices=("resvg",),
         default="resvg",
-        help="SVG rasterizer for the component pass: resvg (pinned 0.48.1, default) or thorvg (1.1.1)",
+        help="SVG rasterizer (the deployed pipeline is resvg-only)",
     )
     result.add_argument(
         "--webp-lossless",
+        "--lossless",
         action="store_true",
         help="Encode frames with cwebp -lossless instead of lossy",
     )
-    result.add_argument("--max-frames", type=int, default=120, help="animation frame count (default 120)")
+    result.add_argument(
+        "-n",
+        "--max-frames",
+        type=int,
+        default=120,
+        help="animation frame count (default: 120)",
+    )
+    result.add_argument(
+        "--bounds-mode",
+        choices=("inline", "distributed"),
+        default="inline",
+        help="bounds fan-out mode selected for this job (default: inline)",
+    )
+    result.add_argument(
+        "--component-raster-mode",
+        choices=("inline", "distributed"),
+        default="inline",
+        help="component-raster fan-out mode selected for this job (default: inline)",
+    )
+    cache = result.add_argument_group("cache control")
+    cache.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="bypass every cross-job compute cache",
+    )
+    cache.add_argument(
+        "--no-render-cache",
+        action="store_true",
+        help="bypass a completed final-render cache hit",
+    )
+    cache.add_argument(
+        "--no-animation-cache",
+        action="store_true",
+        help="ignore cached animation-loop metadata",
+    )
+    cache.add_argument(
+        "--no-vector-cache",
+        action="store_true",
+        help="rerun FFDec instead of reusing vector manifests or metadata",
+    )
+    cache.add_argument(
+        "--no-bounds-cache",
+        action="store_true",
+        help="recompute SVG bounds into job-scoped result objects",
+    )
+    cache.add_argument(
+        "--no-component-cache",
+        action="store_true",
+        help="rerasterize appearance-independent component states",
+    )
     result.add_argument("--user-id", default="900000000000000001")
     result.add_argument("--channel-id", default="900000000000000002")
     result.add_argument("--guild-id", default="900000000000000003")
@@ -111,6 +232,11 @@ def queue_one(
         dataset_version=args.dataset_version,
     )
     job_id = str(uuid4())
+    override = (
+        ItemOverride(item_id=args.override_item_id, slot=args.override_slot)
+        if args.override_item_id is not None
+        else None
+    )
     request = JobRequest(
         job_id=job_id,
         created_at=utc_now(),
@@ -121,42 +247,54 @@ def queue_one(
         ),
         render=RenderSettings(
             username=username,
+            base_items=args.base_items,
+            show_hidden=args.show_hidden,
+            facing=args.facing,
+            override=override,
+            complete_loop=args.complete_loop,
             max_frames=args.max_frames,
-            raster_size=args.output_size * 2,
+            subframe_start=args.subframe_start,
+            zoom=args.zoom,
+            raster_size=args.raster_size,
             output_size=args.output_size,
+            padding=args.padding,
             webp_quality=args.webp_quality,
             webp_method=args.webp_method,
             webp_lossless=args.webp_lossless or None,
             raster_backend=args.raster_backend,
         ),
+        bounds_mode=args.bounds_mode,
+        component_raster_mode=args.component_raster_mode,
+        cache=CacheSettings(
+            render=not (args.no_cache or args.no_render_cache),
+            animation=not (args.no_cache or args.no_animation_cache),
+            vectors=not (args.no_cache or args.no_vector_cache),
+            bounds=not (args.no_cache or args.no_bounds_cache),
+            components=not (args.no_cache or args.no_component_cache),
+        ),
         appearance=appearance,
     )
     jobs = JobStore(outputs["JobTableName"])
     jobs.acquire(request, args.max_active)
-    # Match the public bot contract: a sparse render block the launcher hydrates.
+    # Keep this CLI deterministic: every exposed flag is included explicitly,
+    # independently of fleet defaults used to hydrate sparse Discord requests.
     queue_payload = request.to_dict()
-    queue_payload["render"] = {
-        "username": request.render.username,
-        "max_frames": request.render.max_frames,
-        "raster_size": request.render.raster_size,
-        "output_size": request.render.output_size,
-        "webp_quality": request.render.webp_quality,
-        "webp_method": request.render.webp_method,
-        "webp_lossless": request.render.webp_lossless,
-        "raster_backend": request.render.raster_backend,
-    }
     sqs = boto3.client("sqs")
     try:
         sqs.send_message(
             QueueUrl=outputs["JobQueueUrl"],
-            MessageBody=json.dumps(queue_payload, separators=(",", ":"), sort_keys=True),
+            MessageBody=json.dumps(
+                queue_payload, separators=(",", ":"), sort_keys=True
+            ),
         )
     except Exception as error:
         try:
             jobs.release(
                 job_id,
                 "FAILED",
-                attributes={"error_code": f"SUBMIT_QUEUE_SEND_FAILED:{type(error).__name__}"},
+                attributes={
+                    "error_code": f"SUBMIT_QUEUE_SEND_FAILED:{type(error).__name__}"
+                },
             )
         except Exception:  # noqa: BLE001, S110 - preserve the enqueue error.
             pass
@@ -196,7 +334,11 @@ def result_row(
     """Build the final per-job result row (optionally verifying the WebP)."""
     payload = record.get("result_payload")
     if not isinstance(payload, dict):
-        return {"job_id": job_id, "status": str(record.get("status")), "no_result_payload": True}
+        return {
+            "job_id": job_id,
+            "status": str(record.get("status")),
+            "no_result_payload": True,
+        }
     result = payload.get("result")
     if not isinstance(result, dict) or not isinstance(result.get("url"), str):
         return {
@@ -225,8 +367,28 @@ def result_row(
 
 def main() -> int:
     args = parser().parse_args()
+    args.raster_size = args.raster_size or args.output_size * 2
     if args.max_active < 1 or not 1 <= args.max_frames <= 2000:
-        raise SystemExit("--max-active and --max-frames must be positive/within range")
+        raise SystemExit(
+            "--max-active must be positive and --max-frames must be 1..2000"
+        )
+    if not 64 <= args.raster_size <= 4096 or args.output_size > args.raster_size:
+        raise SystemExit("--raster-size must be 64..4096 and at least --output-size")
+    if not 0.25 <= args.zoom <= 8:
+        raise SystemExit("--zoom must be 0.25..8")
+    if not 0 <= args.webp_quality <= 100:
+        raise SystemExit("--webp-quality must be 0..100")
+    if not 1 <= args.subframe_start <= 10_000:
+        raise SystemExit("--subframe-start must be 1..10000")
+    if not 0 <= args.padding <= 1023 or args.padding * 2 >= args.output_size:
+        raise SystemExit("--padding must be 0..1023 and less than half --output-size")
+    if args.override_slot is not None and args.override_item_id is None:
+        raise SystemExit("--slot requires --item-id")
+    if (
+        args.override_item_id is not None
+        and not 1 <= args.override_item_id <= 10_000_000
+    ):
+        raise SystemExit("--item-id must be 1..10000000")
     usernames = args.usernames or ["artix"]
     if any(not 1 <= len(name) <= 25 for name in usernames):
         raise SystemExit("Usernames must be between 1 and 25 characters")
@@ -242,7 +404,19 @@ def main() -> int:
                     "event": "queued",
                     "job_id": job_id,
                     "username": username,
+                    "bounds_mode": _payload["bounds_mode"],
+                    "component_raster_mode": _payload["component_raster_mode"],
                     "render": _payload["render"],
+                    "cache": _payload.get(
+                        "cache",
+                        {
+                            "render": True,
+                            "animation": True,
+                            "vectors": True,
+                            "bounds": True,
+                            "components": True,
+                        },
+                    ),
                 },
                 sort_keys=True,
             ),
@@ -260,15 +434,16 @@ def main() -> int:
         row = result_row(outputs, job_id, record, args)
         row["username"] = username
         results.append(row)
-        print(json.dumps({"result": row}, indent=2, sort_keys=True, default=str), flush=True)
+        print(
+            json.dumps({"result": row}, indent=2, sort_keys=True, default=str),
+            flush=True,
+        )
 
     print("\n=== SUMMARY ===")
     print("| username | job_id | status | bytes | size | url |")
     print("|---|---|---|---|---|---|")
     for row in results:
-        size = (
-            f"{row['width']}x{row['height']}" if row.get("width") else "?"
-        )
+        size = f"{row['width']}x{row['height']}" if row.get("width") else "?"
         print(
             f"| {row.get('username', '?')} | {row['job_id'][:8]} | {row.get('status', '?')} "
             f"| {row.get('bytes', row.get('content_length', '?'))} | {size} | {row.get('url', row.get('error', '?'))} |"

@@ -108,7 +108,8 @@ impl RgbaImage {
         let mut bottom = 0u32;
         for y in 0..height {
             let row = &self.pixels[(y * width * 4) as usize..((y + 1) * width * 4) as usize];
-            let mut x = row[3] != 0;
+            // Track whether this row has updated `top`, including x == 0.
+            let mut x = false;
             for (index, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
                 if pixel[3] != 0 {
                     left = left.min(index as u32);
@@ -144,6 +145,14 @@ impl RgbaImage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn alpha_bounds_include_rows_starting_at_the_first_column() {
+        let image = super::RgbaImage::new(1, 3, vec![0, 0, 0, 0, 255, 0, 0, 255, 0, 0, 0, 0]);
+        let bbox = image.alpha_bbox(1, 3).unwrap();
+        assert_eq!(bbox, (0, 1, 1, 2));
+        let cropped = image.crop(bbox);
+        assert_eq!((cropped.width, cropped.height), (1, 1));
+    }
     use super::*;
 
     #[test]

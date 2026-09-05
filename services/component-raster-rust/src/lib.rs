@@ -14,5 +14,6 @@ pub mod resample;
 pub mod storage;
 pub mod svg;
 pub mod telemetry;
+#[cfg(feature = "thorvg")]
 pub mod thorvg;
 pub mod worker;

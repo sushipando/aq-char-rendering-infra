@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::import::AuthoredColorTransform;
 
-/// The event produced by `RasterComponentStates` Distributed Map.
+/// The event produced by either `RasterComponentStates` Map mode.
 ///
 /// ```json
 /// {"job_id": "...", "manifest_key": "jobs/.../prepare/manifest.json", "task_index": 0}
@@ -31,6 +31,8 @@ pub struct PrepareManifest {
     pub job_id: String,
     pub viewbox: Vec<f64>,
     pub settings: ManifestSettings,
+    #[serde(default)]
+    pub cache: ManifestCacheSettings,
     pub fields: HashMap<String, String>,
     #[serde(default)]
     pub all_color_rules: Vec<Vec<String>>,
@@ -40,6 +42,18 @@ pub struct PrepareManifest {
     pub component_tasks: Vec<ComponentTask>,
     #[serde(default)]
     pub parts: HashMap<String, Part>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ManifestCacheSettings {
+    #[serde(default = "default_true")]
+    pub components: bool,
+}
+
+impl Default for ManifestCacheSettings {
+    fn default() -> Self {
+        Self { components: true }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -60,6 +74,10 @@ fn default_raster_backend() -> String {
     "resvg".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ComponentTask {
     pub task_id: String,
@@ -72,6 +90,10 @@ pub struct ComponentTask {
     pub matrix: Vec<f64>,
     #[serde(default)]
     pub darken: bool,
+    /// New manifests point directly at the immutable, content-addressed SVG.
+    /// Archive fields remain readable for executions already in flight.
+    #[serde(default)]
+    pub svg_key: Option<String>,
     #[serde(default)]
     pub bundle_key: String,
     #[serde(default)]
@@ -191,10 +213,15 @@ mod tests {
         let raw = r#"{"job_id":"j","viewbox":[0.0,0.0,10.0,10.0],"settings":{"raster_size":512,"output_size":256,"zoom":1.0,"webp_quality":85.0,"webp_method":4},"fields":{},"component_tasks":[],"parts":{}}"#;
         let manifest: PrepareManifest = serde_json::from_str(raw).unwrap();
         assert_eq!(manifest.settings.raster_backend, "resvg");
+        assert!(manifest.cache.components);
 
         let raw_thorvg = r#"{"job_id":"j","viewbox":[0.0,0.0,10.0,10.0],"settings":{"raster_size":512,"output_size":256,"zoom":1.0,"webp_quality":85.0,"webp_method":4,"raster_backend":"thorvg"},"fields":{},"component_tasks":[],"parts":{}}"#;
         let manifest: PrepareManifest = serde_json::from_str(raw_thorvg).unwrap();
         assert_eq!(manifest.settings.raster_backend, "thorvg");
+
+        let raw_no_cache = r#"{"job_id":"j","viewbox":[0.0,0.0,10.0,10.0],"settings":{"raster_size":512,"output_size":256,"zoom":1.0,"webp_quality":85.0,"webp_method":4},"cache":{"components":false},"fields":{},"component_tasks":[],"parts":{}}"#;
+        let manifest: PrepareManifest = serde_json::from_str(raw_no_cache).unwrap();
+        assert!(!manifest.cache.components);
     }
 
     #[test]

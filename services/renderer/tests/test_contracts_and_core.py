@@ -8,7 +8,7 @@ import pytest
 
 from aqw_char_renderer.batching import partition_frames
 from aqw_char_renderer.config import RuntimeConfig
-from aqw_char_renderer.contracts import ContractError, JobRequest
+from aqw_char_renderer.contracts import CacheSettings, ContractError, JobRequest
 from aqw_char_renderer.geometry import shared_canvas, union_bounds
 from aqw_char_renderer.handlers.launcher import hydrate_request_defaults
 from aqw_char_renderer.hashing import canonical_sha256, render_key
@@ -95,7 +95,55 @@ def request_payload() -> dict:
 def test_request_contract_normalizes_username_and_round_trips() -> None:
     request = JobRequest.from_dict(request_payload())
     assert request.render.username == "Sora to Hoshi"
+    assert request.bounds_mode == "inline"
+    assert request.component_raster_mode == "inline"
+    assert request.to_dict()["bounds_mode"] == "inline"
+    assert request.to_dict()["component_raster_mode"] == "inline"
     assert JobRequest.from_dict(request.to_dict()) == request
+
+
+def test_request_contract_validates_bounds_mode() -> None:
+    payload = request_payload()
+    payload["bounds_mode"] = "distributed"
+    assert JobRequest.from_dict(payload).bounds_mode == "distributed"
+
+    payload["bounds_mode"] = "automatic"
+    with pytest.raises(ContractError, match="bounds_mode"):
+        JobRequest.from_dict(payload)
+
+
+def test_request_contract_validates_component_raster_mode() -> None:
+    payload = request_payload()
+    payload["component_raster_mode"] = "distributed"
+    assert JobRequest.from_dict(payload).component_raster_mode == "distributed"
+
+    payload["component_raster_mode"] = "automatic"
+    with pytest.raises(ContractError, match="component_raster_mode"):
+        JobRequest.from_dict(payload)
+
+
+def test_request_contract_validates_optional_cache_controls() -> None:
+    payload = request_payload()
+    payload["cache"] = {"render": False, "bounds": False}
+    request = JobRequest.from_dict(payload)
+    assert request.cache == CacheSettings(
+        render=False,
+        animation=True,
+        vectors=True,
+        bounds=False,
+        components=True,
+    )
+    assert request.to_dict()["cache"] == {
+        "render": False,
+        "animation": True,
+        "vectors": True,
+        "bounds": False,
+        "components": True,
+    }
+
+    payload["cache"] = {"vectors": "false"}
+    with pytest.raises(ContractError, match="cache.vectors"):
+        JobRequest.from_dict(payload)
 
 
 def test_request_contract_accepts_bounded_matching_appearance() -> None:
@@ -334,8 +382,6 @@ def test_missing_manifest_asset_is_fetched_only_from_official_host_then_cached()
         assert path.read_bytes() == b"FWS12345"
         assert cached_path.read_bytes() == b"FWS12345"
 
-    assert requested_urls == [
-        "https://game.aq.com/game/gamefiles/classes/F/Yami%20Armor.swf"
-    ]
+    assert requested_urls == ["https://game.aq.com/game/gamefiles/classes/F/Yami%20Armor.swf"]
     assert cached_record == record
     assert record.key.startswith("dynamic-assets/dev-v1/")

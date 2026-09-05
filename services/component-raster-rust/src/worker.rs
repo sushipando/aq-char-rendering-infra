@@ -211,7 +211,7 @@ pub async fn run_raster_task(
     // reused verbatim across jobs and characters: the key is computed from
     // manifest + task fields only, so a hit skips bundle download, import,
     // SVG build, resvg, downsample, and encode.
-    let cache_key = if crate::cache::is_no_cc(&part) {
+    let cache_key = if prepared.cache.components && crate::cache::is_no_cc(&part) {
         match &task.state_signature {
             Some(signature) => Some(crate::cache::cache_key(
                 signature,
@@ -307,6 +307,7 @@ pub async fn run_raster_task(
                 component_raster_space,
                 raster_canvas: (raster_canvas[0], raster_canvas[1]),
                 output_canvas: (output_canvas[0], output_canvas[1]),
+                cache_enabled: prepared.cache.components,
                 cache_hit,
                 raster_backend,
                 timings: RasterTimings {
@@ -322,11 +323,25 @@ pub async fn run_raster_task(
 
     // ---- bundle -------------------------------------------------------------
     let bundle_started = Instant::now();
-    let bundle_bytes = source.fetch(&bundle_key).await?;
+    let bundle_bytes = source
+        .fetch(task.svg_key.as_deref().unwrap_or(&bundle_key))
+        .await?;
     let bundle_download_ms = elapsed_ms(bundle_started);
 
     let extract_started = Instant::now();
-    let (state_svg, input_bytes) = extract_member(&bundle_bytes, &member)?;
+    let (state_svg, input_bytes) = if task.svg_key.is_some() {
+        let expected = task
+            .state_signature
+            .as_deref()
+            .ok_or_else(|| RasterError::invalid("direct SVG task has no checksum"))?;
+        if sha256_hex(&bundle_bytes) != expected {
+            return Err(RasterError::invalid("direct SVG checksum mismatch"));
+        }
+        let size = bundle_bytes.len() as u64;
+        (bundle_bytes, size)
+    } else {
+        extract_member(&bundle_bytes, &member)?
+    };
     let extract_ms = elapsed_ms(extract_started);
     let state_svg = String::from_utf8(state_svg)
         .map_err(|_| RasterError::Svg("state svg is not valid utf-8".to_string()))?;
@@ -553,6 +568,7 @@ pub async fn run_raster_task(
         component_raster_space,
         raster_canvas: (raster_canvas[0], raster_canvas[1]),
         output_canvas: (output_canvas[0], output_canvas[1]),
+        cache_enabled: prepared.cache.components,
         cache_hit,
         raster_backend,
         timings,

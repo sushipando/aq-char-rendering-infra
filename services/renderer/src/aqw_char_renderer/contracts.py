@@ -20,6 +20,7 @@ _MAX_APPEARANCE_FIELDS = 128
 _MAX_APPEARANCE_VALUE_BYTES = 2_048
 _MAX_APPEARANCE_BYTES = 32_768
 _ALLOWED_RASTER_BACKENDS = frozenset({"resvg", "thorvg"})
+_ALLOWED_FANOUT_MODES = frozenset({"inline", "distributed"})
 
 
 class ContractError(ValueError):
@@ -56,9 +57,7 @@ def _appearance(value: Any, username: str) -> dict[str, str] | None:
         return None
     payload = _object(value, "appearance")
     if len(payload) > _MAX_APPEARANCE_FIELDS:
-        raise ContractError(
-            f"appearance must contain at most {_MAX_APPEARANCE_FIELDS} fields"
-        )
+        raise ContractError(f"appearance must contain at most {_MAX_APPEARANCE_FIELDS} fields")
     result: dict[str, str] = {}
     total_bytes = 0
     for raw_key, raw_value in payload.items():
@@ -68,9 +67,7 @@ def _appearance(value: Any, username: str) -> dict[str, str] | None:
             raise ContractError(f"appearance.{raw_key} must be a string")
         value_bytes = len(raw_value.encode("utf-8"))
         if value_bytes > _MAX_APPEARANCE_VALUE_BYTES:
-            raise ContractError(
-                f"appearance.{raw_key} exceeds {_MAX_APPEARANCE_VALUE_BYTES} bytes"
-            )
+            raise ContractError(f"appearance.{raw_key} exceeds {_MAX_APPEARANCE_VALUE_BYTES} bytes")
         total_bytes += len(raw_key.encode("utf-8")) + value_bytes
         result[raw_key] = raw_value
     if total_bytes > _MAX_APPEARANCE_BYTES:
@@ -159,6 +156,35 @@ class ItemOverride:
 
 
 @dataclass(frozen=True)
+class CacheSettings:
+    """Per-request permission to reuse cross-job rendering artifacts."""
+
+    render: bool = True
+    animation: bool = True
+    vectors: bool = True
+    bounds: bool = True
+    components: bool = True
+
+    @classmethod
+    def from_dict(cls, value: Any) -> CacheSettings:
+        if value is None:
+            return cls()
+        payload = _object(value, "cache")
+        _only_keys(
+            payload,
+            {"render", "animation", "vectors", "bounds", "components"},
+            "cache",
+        )
+        return cls(
+            render=_boolean(payload.get("render", True), "cache.render"),
+            animation=_boolean(payload.get("animation", True), "cache.animation"),
+            vectors=_boolean(payload.get("vectors", True), "cache.vectors"),
+            bounds=_boolean(payload.get("bounds", True), "cache.bounds"),
+            components=_boolean(payload.get("components", True), "cache.components"),
+        )
+
+
+@dataclass(frozen=True)
 class RenderSettings:
     username: str
     base_items: bool = False
@@ -208,12 +234,9 @@ class RenderSettings:
         if facing not in {"left", "right"}:
             raise ContractError("render.facing must be left or right")
         legacy_size = payload.get("max_size")
-        if legacy_size is not None and (
-            "raster_size" in payload or "output_size" in payload
-        ):
+        if legacy_size is not None and ("raster_size" in payload or "output_size" in payload):
             raise ContractError(
-                "render.max_size cannot be combined with render.raster_size or "
-                "render.output_size"
+                "render.max_size cannot be combined with render.raster_size or render.output_size"
             )
         raster_size = _integer(
             payload.get("raster_size", legacy_size if legacy_size is not None else 2048),
@@ -274,6 +297,9 @@ class JobRequest:
     created_at: str
     discord: DiscordTarget
     render: RenderSettings
+    bounds_mode: str = "inline"
+    component_raster_mode: str = "inline"
+    cache: CacheSettings = field(default_factory=CacheSettings)
     appearance: dict[str, str] | None = None
     schema_version: int = field(default=SCHEMA_VERSION, init=False)
 
@@ -288,6 +314,9 @@ class JobRequest:
                 "created_at",
                 "discord",
                 "render",
+                "bounds_mode",
+                "component_raster_mode",
+                "cache",
                 "appearance",
             },
             "job request",
@@ -320,18 +349,36 @@ class JobRequest:
             created_at=normalized_time,
             discord=DiscordTarget.from_dict(payload.get("discord")),
             render=render,
+            bounds_mode=_choice(
+                payload.get("bounds_mode", "inline"),
+                "bounds_mode",
+                _ALLOWED_FANOUT_MODES,
+            ),
+            component_raster_mode=_choice(
+                payload.get("component_raster_mode", "inline"),
+                "component_raster_mode",
+                _ALLOWED_FANOUT_MODES,
+            ),
+            cache=CacheSettings.from_dict(payload.get("cache")),
             appearance=_appearance(payload.get("appearance"), render.username),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "job_id": self.job_id,
             "created_at": self.created_at,
             "discord": asdict(self.discord),
             "render": self.render.to_dict(),
+            "bounds_mode": self.bounds_mode,
+            "component_raster_mode": self.component_raster_mode,
             "appearance": self.appearance,
         }
+        # Keep default requests compatible with launchers deployed before the
+        # optional cache-control extension was introduced.
+        if self.cache != CacheSettings():
+            payload["cache"] = asdict(self.cache)
+        return payload
 
 
 def utc_now() -> str:

@@ -482,3 +482,29 @@ fn local_raster_reuses_no_cc_cache_on_second_run() {
     assert!(third_record["width"].as_i64().unwrap() > 0);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn local_raster_can_bypass_no_cc_cache() {
+    let root = unique_dir("cache-disabled");
+    let mut manifest = no_cc_manifest(vec![default_task()], 512, 256);
+    manifest["cache"] = json!({"components": false});
+    populate(&root, &manifest);
+
+    let output = run(&root, 0);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root.join("work").join("component-rasters").exists(),
+        "cache-disabled renders must not publish shared component entries"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"cache_enabled\":false"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("\"cache_hit\":false"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&root).ok();
+}

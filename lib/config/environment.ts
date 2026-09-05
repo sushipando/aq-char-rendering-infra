@@ -22,14 +22,13 @@ export interface RenderTuning {
   readonly mapConcurrency: number;
   readonly webpQuality: number;
   readonly webpMethod: number;
-  // Fleet default SVG rasterizer for the component pass: 'resvg' (pinned
-  // 0.48.1) or 'thorvg' (1.1.1). Individual render jobs can still override
-  // per-character via render.raster_backend.
-  readonly rasterBackend: 'resvg' | 'thorvg';
+  // Bounds and final component passes use the same patched resvg revision.
+  readonly rasterBackend: 'resvg';
   readonly allowOfficialAssetFallback: boolean;
   readonly officialAssetTimeoutSeconds: number;
   readonly maxActivePerUser: number;
   readonly renderCacheEnabled: boolean;
+  readonly componentRasterInlineConcurrency: number;
   readonly componentRasterConcurrency: number;
   readonly componentRasterFrameCap: number;
   readonly componentComposeFramesPerLambda: number;
@@ -52,6 +51,7 @@ export interface InfrastructureTuning {
   readonly functions: Readonly<{
     launcher: FunctionTuning;
     prepare: FunctionTuning;
+    bounds: FunctionTuning;
     finalizer: FunctionTuning;
     componentRaster: FunctionTuning;
     componentCompose: FunctionTuning;
@@ -65,6 +65,12 @@ export interface InfrastructureTuning {
   readonly workflowTimeoutMinutes: number;
   readonly jobQueueVisibilitySeconds: number;
   readonly prepareExportConcurrency: number;
+  readonly boundsInlineConcurrency: number;
+  readonly boundsConcurrency: number;
+  readonly boundsResolution: number;
+  readonly boundsPaddingPixels: number;
+  readonly boundsQueueVisibilitySeconds: number;
+  readonly boundsCallbackTimeoutSeconds: number;
 }
 
 export interface EnvironmentConfig {
@@ -90,6 +96,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // 120-frame jobs must produce fast (<300s) and each source SWF spawns its
     // own FFDec JVM, so prepare runs are capped at 300s.
     prepare: mib(3008, 4096, 300),
+    bounds: mib(1024, 512, 60),
     finalizer: mib(3008, 4096, 300),
     // Component workers rasterize one unique placed state each (tight page at
     // the shared pixel scale); a 4096-raster benchmark needs the render-class
@@ -104,6 +111,8 @@ const DEV_TUNING: InfrastructureTuning = {
   },
   render: {
     schemaVersion: 1,
+    // v20: Rust preparation/control handlers, content-addressed SVG states,
+    // and independently cached distributed resvg bounds probes.
     // v19: downsample each completed 2x component raster once, on the exact
     // final pixel grid, before output-size frame composition.
     // v18: apply scripted color filters directly to their SVG graphics
@@ -135,7 +144,7 @@ const DEV_TUNING: InfrastructureTuning = {
     // v7: mirror-flip (random-pose ground cosmetic) layers are frozen at
     // their initial pose instead of looping the direction swap, so v6 cache
     // entries are invalidated.
-    rendererVersion: 'v19',
+    rendererVersion: 'v20-rust-bounds',
     // Replace this before uploading/deploying a source corpus.
     assetDatasetVersion: 'dev-v1',
     // Raster at full resolution, then optionally downsample once before WebP
@@ -179,10 +188,10 @@ const DEV_TUNING: InfrastructureTuning = {
     // benchmarks always exercise the real pipeline. Enable in prod for
     // cost/latency deduplication of identical requests.
     renderCacheEnabled: false,
-    // Rasterize every unique placed component state once at the requested 2x
-    // raster size, downsample it to the output grid, then compose at most
-    // `componentRasterFrameCap` frames in a second concurrency-capped Map.
-    // See docs/component-raster-pipeline.md.
+    // Each request selects the Inline or Distributed component-raster Map.
+    // Inline Map is the default and processes additional tasks in later waves.
+    componentRasterInlineConcurrency: 40,
+    // Distributed mode remains available for explicit high-concurrency tests.
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
     // Twelve 10-frame workers cover the current 120-frame maximum in one Map
@@ -205,6 +214,17 @@ const DEV_TUNING: InfrastructureTuning = {
   // A character normally has about five sources, so keep enough concurrency
   // to export all of them in one wave.
   prepareExportConcurrency: 8,
+  // A request selects Inline or Distributed bounds fan-out. AWS Inline Map
+  // supports at most 40 concurrent iterations, processing larger task lists
+  // in additional waves while they fit within the workflow payload limit.
+  boundsInlineConcurrency: 40,
+  boundsConcurrency: 100,
+  boundsResolution: 256,
+  boundsPaddingPixels: 1,
+  // Six times the worker timeout; three delivery attempts fit inside the
+  // callback deadline, with room for cold starts, throttling, and callbacks.
+  boundsQueueVisibilitySeconds: 360,
+  boundsCallbackTimeoutSeconds: 1200,
   jobQueueVisibilitySeconds: 180,
 };
 

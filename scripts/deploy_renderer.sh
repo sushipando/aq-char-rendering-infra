@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the AQW character renderer stack to the dev environment.
+# Operator-run only: agents and unattended automation must stop after checks
+# and diff review; the repository owner invokes this script for deployments.
 #
 # Handles the whole loop so neither the bot author nor CI needs to remember the
 # SSO profile, region, account, or the exact CDK incantation:
@@ -9,19 +11,19 @@
 #   3. checks     — npm ci, tsc build, jest, cdk synth (read-only), cdk diff
 #   4. bootstrap  — auto-detects and runs `cdk bootstrap` exactly when needed
 #   5. deploy     — `cdk deploy --require-approval broadening` (auto-approve w/ --yes)
-#   6. smoke      — optional: queue a real ThorVG render to close the loop
+#   6. smoke      — optional: queue a real resvg render to close the loop
 #
 # Usage:
 #   scripts/deploy_renderer.sh [--sso] [--yes] [--bootstrap] [--skip-checks]
-#                             [--smoke] [--dry-run] [--help]
+#                             [--smoke [USERNAME]] [--dry-run] [--help]
 #
 # Flags:
 #   --sso           force `aws sso login` (opens the browser) before validating
-#   --yes           skip the final confirmation and use `--require-approval any-change`
+#   --yes           skip the final confirmation and use `--require-approval never`
 #   --bootstrap     force `cdk bootstrap` even if the marker looks present
 #   --skip-checks   skip npm ci/build/test/synth/diff (deploy immediately)
-#   --smoke         after deploy, queue `alina --raster-backend thorvg` via
-#                   scripts/submit_render.py and wait for the WebP
+#   --smoke [USER]  after deploy, queue USER through scripts/render-character
+#                   and wait for the resvg WebP (default: alina)
 #   --dry-run       run auth/docker/checks/bootstrap-detection, then stop
 #                   (never deploys; safe to run anywhere)
 
@@ -36,7 +38,7 @@ readonly REGION="us-west-2"
 readonly ACCOUNT="538522204887"
 # Marker `cdk bootstrap` writes (SSM param referenced by the synth template).
 readonly BOOTSTRAP_PARAM="/cdk-bootstrap/hnb659fds/version"
-readonly SMOKE_USERNAME="${SMOKE_USERNAME:-alina}"
+SMOKE_USERNAME="${SMOKE_USERNAME:-alina}"
 
 # ---- flags -------------------------------------------------------------------
 FORCE_SSO=0
@@ -47,7 +49,7 @@ SMOKE=0
 DRY_RUN=0
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -56,7 +58,21 @@ while [[ $# -gt 0 ]]; do
     --yes) AUTO_YES=1 ;;
     --bootstrap) FORCE_BOOTSTRAP=1 ;;
     --skip-checks) SKIP_CHECKS=1 ;;
-    --smoke) SMOKE=1 ;;
+    --smoke)
+      SMOKE=1
+      if [[ $# -gt 1 && "$2" != -* ]]; then
+        SMOKE_USERNAME="$2"
+        shift
+      fi
+      ;;
+    --smoke=*)
+      SMOKE=1
+      SMOKE_USERNAME="${1#*=}"
+      if [[ -z "$SMOKE_USERNAME" ]]; then
+        echo "--smoke requires a non-empty username after '='" >&2
+        exit 2
+      fi
+      ;;
     --dry-run) DRY_RUN=1 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -147,21 +163,19 @@ if (( ! AUTO_YES )); then
 fi
 
 echo ">> npm run deploy -- --profile $PROFILE (long; container images build locally,"
-echo "   incl. component-raster-rust with ThorVG C++ ~15 min on first run)"
+echo "   incl. ARM64 Rust renderer images; warm Cargo caches speed up rebuilds)"
 approval="--require-approval broadening"
-(( AUTO_YES )) && approval="--require-approval any-change"
+(( AUTO_YES )) && approval="--require-approval never"
 npm run deploy -- --profile "$PROFILE" $approval
 
 # ---- 6. smoke -----------------------------------------------------------------
 if (( SMOKE )); then
-  echo ">> queueing smoke render: $SMOKE_USERNAME --raster-backend thorvg (1024)"
+  echo ">> queueing uncached inline smoke render: $SMOKE_USERNAME (resvg, 1024)"
   AWS_PROFILE="$PROFILE" AWS_DEFAULT_REGION="$REGION" \
-    uv run --package aqw-char-renderer python scripts/submit_render.py \
-      "$SMOKE_USERNAME" --output-size 1024 --raster-backend thorvg
+    scripts/render-character "$SMOKE_USERNAME" --output-size 1024 --bounds-mode inline \
+      --component-raster-mode inline --no-cache
 else
   echo
-  echo "Deploy finished. Re-run with --smoke to queue a ThorVG render, or submit one:"
-  echo "  AWS_PROFILE=$PROFILE AWS_DEFAULT_REGION=$REGION \\"
-  echo "    uv run --package aqw-char-renderer python scripts/submit_render.py alina \\"
-  echo "      --output-size 2048 --raster-backend thorvg"
+  echo "Deploy finished. Re-run with --smoke USERNAME to queue a resvg render, or submit one:"
+  echo "  scripts/render-character alina"
 fi

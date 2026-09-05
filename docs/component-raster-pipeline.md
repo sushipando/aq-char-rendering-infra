@@ -36,7 +36,7 @@ Discord request
        choose at most the configured output-frame cap
        determine the shared character viewbox and pixel scale
        build unique placed-component raster tasks
-  -> RasterComponentStates Map
+  -> RasterComponentStatesInline | RasterComponentStatesDistributed Map
        one Lambda invocation per unique placed component state
        component SVG + character placement + colors -> high-resolution PNG
        premultiplied Lanczos -> cropped output-grid PNG + integer offset
@@ -51,10 +51,11 @@ Discord request
   -> complete job and send result
 ```
 
-Step Functions invokes the component-raster Lambda directly. That Map is the
-synchronization barrier: the compose Map starts only after every component
-iteration succeeds. SQS is not used between these stages; an empty queue would
-not prove that every worker completed successfully.
+Inline mode invokes the component-raster Lambda directly; distributed mode
+invokes it through Express child workflows. Either Map is the synchronization
+barrier: the compose Map starts only after every component iteration succeeds.
+SQS is not used between these stages; an empty queue would not prove that every
+worker completed successfully.
 
 ## Unit of component work
 
@@ -213,23 +214,24 @@ the raster Map; it is no longer repeated for every completed frame. Manifests
 created by older deployments continue to use the raster-grid/full-frame
 downsample fallback.
 
-## Step Functions shape for the benchmark
+## Step Functions shape
 
 ```text
 PrepareResolve
   -> ExportSourceFrames Map
   -> PrepareFinish
-  -> RasterComponentStates Map
+  -> RasterComponentStatesInline | RasterComponentStatesDistributed Map
   -> ComposeComponentFrameChunks Map
   -> FinalizeAnimation
 ```
 
-The component Map exposes `componentRasterConcurrency`. It is a Distributed
-Map whose iterations are Express child workflows, so values above the Inline
-Map ceiling of 40 are effective. With the development value of 200, up to 200
-unique component states can rasterize in one wave. Lambda regional concurrency
-is still the account-wide safety ceiling.
-The component Lambda's reserved concurrency can provide a matching hard cap.
+Each request explicitly selects `component_raster_mode` as `inline` or
+`distributed`, with `inline` as the default. Inline directly invokes up to 40
+component Lambdas concurrently and processes remaining tasks in later waves.
+Distributed uses Express child workflows and `componentRasterConcurrency`; the
+development value of 200 allows up to 200 unique component states in one wave.
+The state machine never switches modes based on task count. Lambda regional
+concurrency is still the account-wide safety ceiling.
 
 Each iteration needs normal Lambda service/throttle retries. A failed
 component must fail the Map and enter the existing protected workflow failure
@@ -237,7 +239,8 @@ handler; the compositor must never silently omit a failed layer.
 
 `ComposeComponentFrameChunks` replaced the legacy `RenderFrameBatches` Map;
 the full-frame legacy renderer has since been removed and every job now runs
-`RasterComponentStates -> ComposeComponentFrameChunks -> FinalizeAnimation`.
+`RasterComponentStatesInline|RasterComponentStatesDistributed ->
+ComposeComponentFrameChunks -> FinalizeAnimation`.
 `FinalizeAnimation` remains the lightweight mux and publish barrier. Keeping
 composition distinct from component rasterization makes timings, memory use,
 and concurrency independently tunable.
@@ -247,6 +250,7 @@ and concurrency independently tunable.
 Add explicit development tuning for the experiment:
 
 ```text
+componentRasterInlineConcurrency = 40
 componentRasterConcurrency = 200
 componentRasterFrameCap = 120
 componentComposeFramesPerLambda = 10

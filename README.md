@@ -1,12 +1,13 @@
 # AQW Character Rendering Infrastructure
 
 This repository owns the distributed `/char` rendering system: AWS CDK
-infrastructure, Step Functions orchestration, Python rendering services,
+infrastructure, Step Functions orchestration, Rust Lambda services,
 container definitions, tests, and operational documentation. Rendering uses
 FFDec only; it does not use AIR or Ruffle.
 
-Nothing has been deployed from this working tree yet. `cdk synth` is read-only,
-but `cdk bootstrap` and `cdk deploy` create billable AWS resources.
+The dev stack is deployed. Local changes do not reach AWS until the repository
+owner runs the deployment script. `cdk synth` is read-only, but `cdk bootstrap`
+and `cdk deploy` create or change billable AWS resources.
 
 ## Development environment
 
@@ -16,7 +17,7 @@ but `cdk bootstrap` and `cdk deploy` create billable AWS resources.
 | AWS Region | `us-west-2` |
 | AWS CLI profile | `aqw-char-dev` |
 | CDK language | TypeScript |
-| Renderer language | Python 3.13, managed with `uv` |
+| Renderer language | Rust (FFDec remains a pinned Java subprocess) |
 
 Authenticate with temporary IAM Identity Center credentials:
 
@@ -34,7 +35,16 @@ npm test
 npm run synth -- --profile aqw-char-dev
 ```
 
-Install and validate all Python workspace packages:
+Validate the Rust pipeline (see the [pipeline guide](services/pipeline-rust/README.md)
+for local replay and rollout requirements):
+
+```bash
+cargo test --manifest-path services/pipeline-rust/Cargo.toml --locked
+cargo clippy --manifest-path services/pipeline-rust/Cargo.toml --locked --all-targets -- -D warnings
+```
+
+The Python workspace remains available for legacy reference tests and offline
+dataset tooling; it is not included in any deployed Lambda image:
 
 ```bash
 uv sync --all-packages
@@ -42,9 +52,9 @@ uv run --package aqw-char-renderer pytest services/renderer/tests
 uv run --package aqw-char-renderer ruff check services/renderer
 ```
 
-Docker is required before deployment because every renderer Lambda uses the
-same pinned Linux container image. The image includes FFDec 26.2.1, Java 21,
-`rsvg-convert`, `cwebp`, and `webpmux`.
+Docker is required before deployment. ARM64 images contain native Rust
+bootstraps and patched resvg. Only the exporter image adds FFDec 26.2.1 and
+Java 21; composition/finalization use pinned libwebp tools.
 
 ## Tuning
 
@@ -69,11 +79,16 @@ resampling, while larger rasters are downsampled once before WebP encoding.
 ```text
 Discord bot -> DynamoDB admission transaction -> job SQS -> launcher
   -> Step Functions Standard
-      -> Prepare (resolve character, FFDec export, loop/cache detection,
-         shared-canvas computation, per-part frame archives)
-      -> parallel render batches (compose in memory -> rasterize once
-         against the shared canvas -> optional downsample -> WebP encode)
-      -> final WebP mux, immutable promotion, and inline job completion
+      -> PrepareResolve (final-cache fast path)
+      -> ExportSourceFrames (one FFDec invocation per source; unique SVGs)
+      -> PlanBounds (global SVG dedup and bounds-cache checks)
+      -> ProbeUniqueStatesInline (request-selected direct Rust resvg)
+         or ProbeUniqueStatesDistributed (request-selected S3 -> Standard children -> SQS callback)
+      -> PrepareFinish (validated bounds, schedules, shared canvas)
+      -> RasterComponentStatesInline (request-selected direct patched resvg)
+         or RasterComponentStatesDistributed (request-selected Express children)
+      -> ComposeComponentFrameChunks (Rust composition and WebP encoding)
+      -> FinalizeAnimation (validated WebP mux, publish, inline completion)
       -> result SQS -> Discord bot
 
 CloudFront -> private S3 /renders/ objects
@@ -85,6 +100,25 @@ only from `https://game.aq.com/game/gamefiles/`, validate the SWF header, and
 atomically preserve the first copy in the private versioned source bucket.
 
 ## Deployment sequence
+
+Deployments are operator-run only: agents and unattended automation may prepare,
+test, synthesize, and review a diff, but must not invoke the deployment command.
+This is a test bot, so normal deployments do not pause admissions or drain the
+queue; failed in-flight jobs are acceptable during a rollout.
+
+From the repository root, the owner runs:
+
+```bash
+scripts/deploy_renderer.sh --yes
+```
+
+The script validates the AWS account/profile, checks Docker, runs the build,
+tests, synth, and diff, then deploys the dev stack. Add `--smoke USERNAME` to
+submit that character as a resvg render after deployment; bare `--smoke`
+defaults to `alina`. `--skip-checks` is available only when the same revision
+has already passed those checks.
+
+The equivalent manual review sequence is:
 
 Review the synthesized template and tuning first:
 
@@ -184,42 +218,59 @@ docs/                 architecture and operating documentation
 
 ### Submitting renders
 
-`scripts/submit_render.py` queues real character renders through the deployed
+`scripts/render-character` queues real character renders through the deployed
 workflow (same SQS + DynamoDB admission as the Discord bot) and waits for the
-delivered CloudFront WebP:
+delivered CloudFront WebP. It supplies the dev AWS profile, Region, and `uv`
+command automatically:
 
 ```bash
-AWS_PROFILE=aqw-char-dev AWS_DEFAULT_REGION=us-west-2 \
-  uv run --package aqw-char-renderer python scripts/submit_render.py alina \
-    --output-size 2048 --webp-quality 70 --webp-method 2
+scripts/render-character alina -s 1024 -n 30 -q 70 -m 2
+scripts/render-character artix --facing left --zoom 1 --padding 8
+scripts/render-character alina --item-id 12345 --slot weapon --lossless
+scripts/render-character mck -s 1024 --bounds-mode inline --component-raster-mode inline --no-cache
+scripts/render-character mck -s 1024 --bounds-mode inline --component-raster-mode distributed --no-cache
 ```
 
 Multiple characters queue one job each; `--webp-lossless` selects lossless
 encoding; `--max-frames` controls the animation length; `--no-watch` queues
 without waiting; `--no-verify` skips the CloudFront fetch (`--help` for all
-options). **`--raster-backend thorvg`** renders that character's component
-SVGs with ThorVG 1.1.1 instead of the default resvg 0.48.1.
+options). Use `scripts/render-character --help` for facing, hidden/base items,
+loop, start-frame, zoom, raster/output size, padding, item override, and WebP
+controls. The deployed request contract is resvg-only.
+
+`--bounds-mode inline|distributed` and
+`--component-raster-mode inline|distributed` are independent per-job fan-out
+switches, and both default to `inline`. Each is stored on the submitted job;
+the state machine never selects a mode from task count. Inline Maps run up to
+40 iterations concurrently and process additional work in later waves. Bounds
+planning fails with instructions to use distributed mode if its inline task
+data would make the Step Functions state unsafe. Use `--no-cache` when
+comparing modes so a render, bounds, or component cache hit cannot bypass work.
+
+`--no-cache` forces a benchmark render to bypass every cross-job compute cache.
+The individual controls are `--no-render-cache`, `--no-animation-cache`,
+`--no-vector-cache`, `--no-bounds-cache`, and `--no-component-cache`.
+They bypass the completed render, animation-loop metadata, FFDec/vector export,
+SVG bounds, and appearance-independent component-raster caches respectively.
+Uncached bounds and vector manifests are written under the job prefix, so
+later stages cannot consume older shared results. Exact source SWFs and the
+newly generated SVG blobs remain immutable pipeline inputs, not cache hits.
 
 ### Rust component workers
 
-The component pipeline now runs two native Rust Lambdas alongside the Python
-renderer (see `docs/rust-component-compose-plan.md`):
+The component pipeline runs two native Rust Lambdas (see
+`docs/rust-component-compose-plan.md`):
 
 - `component-compose-rust` — composed components are decoded once, blended
   with a Pillow-exact integer compositor, and encoded with the pinned cwebp;
   selected through `componentComposeBackend`.
 - `component-raster-rust` — rasterizes each component with resvg/usvg linked
   as a library and downsamples with a Pillow-exact Lanczos resampler
-  (fast_image_resize remains available via `AQW_DOWNSAMPLER`); selected
-  through `componentRasterBackend` (default `python` until deployed parity is
-  confirmed). Each render job can swap the SVG rasterizer to **ThorVG 1.1.1**
-  through `render.raster_backend` (per-character via
-  `submit_render.py --raster-backend thorvg`, fleet default via CDK tuning
-  `render.rasterBackend`); the two engines are intentionally not
-  pixel-identical.
+  (fast_image_resize remains available via `AQW_DOWNSAMPLER`). Production
+  builds compile resvg only; ThorVG remains an opt-in local comparison feature.
 
 Both use the same `provided:al2023` Dockerfile build with
-`RUSTFLAGS="-C target-cpu=x86-64-v2"` and pass the local parity harnesses
+`RUSTFLAGS="-C target-feature=+neon"` for ARM64 and pass the local parity harnesses
 (`scripts/rust_compose_parity.py`, `scripts/rust_raster_parity.py`) with
 pixel-exact RGBA against the Python workers.
 

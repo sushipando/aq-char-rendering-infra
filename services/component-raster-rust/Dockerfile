@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Multi-stage build for the aqw-component-raster Lambda.
 #
 # Builds inside `provided:al2023` (the same glibc 2.34 as the runtime). This
@@ -6,6 +8,8 @@
 # release bootstrap is a single lean ELF with no resvg CLI process.
 
 FROM public.ecr.aws/lambda/provided:al2023 AS build
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = "arm64" || (echo "component-raster-rust must be built for linux/arm64" >&2; exit 1)
 
 # curl-minimal with /usr/bin/curl is already present in the al2023 base.
 RUN dnf install -y \
@@ -19,10 +23,9 @@ RUN dnf install -y \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
-# Rust stable, pinned to match the toolchain that produced Cargo.lock.
-# ThorVG's Rust bindings are frozen in vendor/thorvg-sys-upstream/bindings.rs
-# (the patched build.rs copies them instead of invoking bindgen), so this
-# image needs no libclang; cc-rs compiles the vendored ThorVG C++ with gcc.
+# Rust stable, pinned to match the toolchain that produced Cargo.lock. The
+# production build uses the crate's default resvg-only feature set, so the
+# optional vendored ThorVG C++ backend is not compiled or linked.
 ARG RUST_VERSION=1.98.0
 RUN curl --fail --location --retry 3 https://sh.rustup.rs -sSf | \
       sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \
@@ -45,14 +48,19 @@ ENV CARGO_PROFILE_RELEASE_LTO="thin" \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS="1" \
     CARGO_PROFILE_RELEASE_STRIP="symbols" \
     CARGO_PROFILE_RELEASE_PANIC="abort"
-RUN . "$HOME/.cargo/env" && RUSTFLAGS="-C target-feature=+neon" \
-    cargo build --release --locked --bin aqw-component-raster
+RUN --mount=type=cache,id=aqw-component-raster-cargo-registry-arm64,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=aqw-component-raster-cargo-git-arm64,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=aqw-component-raster-target-arm64,target=/build/target,sharing=locked \
+    . "/root/.cargo/env" \
+    && RUSTFLAGS="-C target-feature=+neon" cargo build --release --locked --no-default-features --bin aqw-component-raster \
+    && mkdir -p /out \
+    && cp target/release/aqw-component-raster /out/bootstrap
 
 # ---- runtime image ---------------------------------------------------------
 # resvg is linked statically into the bootstrap; only the binary ships.
 FROM public.ecr.aws/lambda/provided:al2023
 
-COPY --from=build /build/target/release/aqw-component-raster ${LAMBDA_RUNTIME_DIR}/bootstrap
+COPY --from=build /out/bootstrap ${LAMBDA_RUNTIME_DIR}/bootstrap
 RUN chmod +x ${LAMBDA_RUNTIME_DIR}/bootstrap
 
 CMD ["bootstrap"]

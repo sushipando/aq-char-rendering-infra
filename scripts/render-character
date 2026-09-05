@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Short operator wrapper for scripts/submit_render.py.
+
+set -euo pipefail
+
+readonly RENDER_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly RENDER_AWS_PROFILE="${AWS_PROFILE:-aqw-char-dev}"
+readonly RENDER_AWS_REGION="${AWS_DEFAULT_REGION:-us-west-2}"
+
+cd "$RENDER_REPO_ROOT"
+export AWS_PROFILE="$RENDER_AWS_PROFILE"
+export AWS_DEFAULT_REGION="$RENDER_AWS_REGION"
+export AWS_PAGER=""
+
+if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+  if ! aws sts get-caller-identity \
+      --profile "$RENDER_AWS_PROFILE" \
+      --region "$RENDER_AWS_REGION" >/dev/null 2>&1; then
+    echo ">> AWS session expired; opening SSO login for $RENDER_AWS_PROFILE"
+    aws sso login --profile "$RENDER_AWS_PROFILE"
+  fi
+fi
+
+exec uv run --package aqw-char-renderer python scripts/submit_render.py "$@"

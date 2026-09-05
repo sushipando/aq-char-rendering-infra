@@ -28,6 +28,8 @@ export interface AqwCharRenderingInfraStackProps extends cdk.StackProps {
 interface RendererFunctions {
   readonly launcher: lambda.DockerImageFunction;
   readonly prepare: lambda.DockerImageFunction;
+  readonly exportSource: lambda.DockerImageFunction;
+  readonly bounds: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
   readonly componentRasterRust: lambda.DockerImageFunction;
   readonly componentComposeRust: lambda.DockerImageFunction;
@@ -41,6 +43,21 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     super(scope, id, props);
 
     const { stageName, tuning } = props;
+    if (tuning.boundsQueueVisibilitySeconds < 6 * tuning.functions.bounds.timeoutSeconds) {
+      throw new Error('Bounds queue visibility must cover six worker timeouts');
+    }
+    if (tuning.boundsCallbackTimeoutSeconds <= 3 * tuning.boundsQueueVisibilitySeconds) {
+      throw new Error('Bounds callback deadline must cover all three delivery attempts');
+    }
+    if (tuning.boundsInlineConcurrency < 1 || tuning.boundsInlineConcurrency > 40) {
+      throw new Error('Bounds Inline Map concurrency must be between 1 and 40');
+    }
+    if (
+      tuning.render.componentRasterInlineConcurrency < 1
+      || tuning.render.componentRasterInlineConcurrency > 40
+    ) {
+      throw new Error('Component-raster Inline Map concurrency must be between 1 and 40');
+    }
     const removalPolicy = stageName === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
     const sourceBucket = this.createSourceBucket(stageName, removalPolicy);
     const workBucket = this.createWorkBucket(stageName, tuning, removalPolicy);
@@ -68,7 +85,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       resultQueue: queues.result,
       publicBaseUrl: `https://${distribution.distributionDomainName}`,
     });
-    const stateMachine = this.createWorkflow(stageName, tuning, functions);
+    const stateMachine = this.createWorkflow(stageName, tuning, functions, queues.bounds, workBucket);
 
     functions.launcher.addEnvironment('CHAR_RENDER_STATE_MACHINE_ARN', stateMachine.stateMachineArn);
     stateMachine.grantStartExecution(functions.launcher);
@@ -83,6 +100,20 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       reportBatchItemFailures: false,
     });
     queues.job.grantConsumeMessages(functions.launcher);
+
+    const boundsMapping = new lambda.EventSourceMapping(this, 'BoundsQueueMapping', {
+      target: functions.bounds,
+      eventSourceArn: queues.bounds.queueArn,
+      batchSize: 1,
+      maxConcurrency: tuning.boundsConcurrency,
+      enabled: true,
+      reportBatchItemFailures: true,
+    });
+    queues.bounds.grantConsumeMessages(functions.bounds);
+    functions.bounds.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['states:SendTaskSuccess', 'states:SendTaskFailure'],
+      resources: ['*'], // Callback APIs authorize task tokens, not resource ARNs.
+    }));
 
     this.configurePermissions(
       sourceBucket,
@@ -100,6 +131,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       stateMachine,
       renderEnabled,
       launcherMapping,
+      boundsMapping,
     );
     this.configureAlarms(queues, stateMachine, functions);
     const botPolicy = this.createBotPolicy(
@@ -121,6 +153,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'WorkResultBucketName', { value: workBucket.bucketName });
     new cdk.CfnOutput(this, 'JobQueueUrl', { value: queues.job.queueUrl });
     new cdk.CfnOutput(this, 'ResultQueueUrl', { value: queues.result.queueUrl });
+    new cdk.CfnOutput(this, 'BoundsQueueUrl', { value: queues.bounds.queueUrl });
     new cdk.CfnOutput(this, 'JobTableName', { value: jobTable.tableName });
     new cdk.CfnOutput(this, 'StateMachineArn', { value: stateMachine.stateMachineArn });
     new cdk.CfnOutput(this, 'RenderEnabledParameterName', { value: renderEnabled.parameterName });
@@ -180,6 +213,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     jobDlq: sqs.Queue;
     result: sqs.Queue;
     resultDlq: sqs.Queue;
+    bounds: sqs.Queue;
+    boundsDlq: sqs.Queue;
   } {
     const jobDlq = new sqs.Queue(this, 'JobDeadLetterQueue', {
       queueName: `aqw-char-render-jobs-${stageName}-dlq`,
@@ -205,7 +240,19 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       visibilityTimeout: cdk.Duration.seconds(120),
       deadLetterQueue: { queue: resultDlq, maxReceiveCount: 5 },
     });
-    return { job, jobDlq, result, resultDlq };
+    const boundsDlq = new sqs.Queue(this, 'BoundsDeadLetterQueue', {
+      queueName: `aqw-char-render-bounds-${stageName}-dlq`,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const bounds = new sqs.Queue(this, 'BoundsQueue', {
+      queueName: `aqw-char-render-bounds-${stageName}`,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      retentionPeriod: cdk.Duration.days(4),
+      visibilityTimeout: cdk.Duration.seconds(tuning.boundsQueueVisibilitySeconds),
+      deadLetterQueue: { queue: boundsDlq, maxReceiveCount: 3 },
+    });
+    return { job, jobDlq, result, resultDlq, bounds, boundsDlq };
   }
 
   private createJobTable(stageName: string, removalPolicy: cdk.RemovalPolicy): dynamodb.Table {
@@ -262,7 +309,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     publicBaseUrl: string;
   }): RendererFunctions {
     const { stageName, tuning, sourceBucket, workBucket, jobTable, resultQueue, publicBaseUrl } = input;
-    const context = path.join(__dirname, '..', 'services', 'renderer');
+    const context = path.join(__dirname, '..', 'services');
     const commonEnvironment = {
       CHAR_RENDER_SCHEMA_VERSION: String(tuning.render.schemaVersion),
       CHAR_RENDERER_VERSION: tuning.render.rendererVersion,
@@ -307,9 +354,10 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         tuning.render.componentComposeFramesPerLambda,
       ),
       CHAR_RENDER_FFDEC_PATH: '/opt/ffdec/ffdec-cli.jar',
-      CHAR_RENDER_RSVG_CONVERT: '/opt/resvg/resvg',
       CHAR_RENDER_CWEBP: '/opt/libwebp/bin/cwebp',
       CHAR_RENDER_WEBPMUX: '/opt/libwebp/bin/webpmux',
+      CHAR_RENDER_BOUNDS_RESOLUTION: String(tuning.boundsResolution),
+      CHAR_RENDER_BOUNDS_PADDING_PIXELS: String(tuning.boundsPaddingPixels),
     };
     const make = (
       logicalId: string,
@@ -324,13 +372,15 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       });
       return new lambda.DockerImageFunction(this, `${logicalId}Function`, {
         functionName,
-        architecture: lambda.Architecture.X86_64,
+        architecture: lambda.Architecture.ARM_64,
         code: lambda.DockerImageCode.fromImageAsset(context, {
-          cmd: [handler],
-          platform: ecrAssets.Platform.LINUX_AMD64,
+          file: 'pipeline-rust/Dockerfile',
+          target: handler === 'export' ? 'exporter' : 'runtime',
+          cmd: ['bootstrap'],
+          platform: ecrAssets.Platform.LINUX_ARM64,
         }),
         description: `AQW character renderer ${logicalId} stage`,
-        environment: commonEnvironment,
+        environment: { ...commonEnvironment, CHAR_RENDER_HANDLER: handler },
         ephemeralStorageSize: cdk.Size.mebibytes(settings.ephemeralStorageMiB),
         logGroup,
         memorySize: settings.memoryMiB,
@@ -340,8 +390,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       });
     };
 
-    // Rust component-compose implementation. The Python implementation stays
-    // deployed as a rollback backend selected through centralized tuning.
+    // Existing Rust frame compositor; no Python handlers are deployed.
     const rustContext = path.join(__dirname, '..', 'services', 'component-compose-rust');
     const componentComposeRustName = `aqw-char-${stageName}-componentcompose-rust`;
     const componentComposeRustLogGroup = new logs.LogGroup(this, 'ComponentComposeRustLogGroup', {
@@ -374,15 +423,14 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     });
 
     return {
-      launcher: make('Launcher', 'aqw_char_renderer.handlers.launcher.handler', tuning.functions.launcher),
-      prepare: make('Prepare', 'aqw_char_renderer.handlers.prepare.handler', tuning.functions.prepare),
-      finalizer: make('Finalizer', 'aqw_char_renderer.handlers.finalize.handler', tuning.functions.finalizer),
+      launcher: make('Launcher', 'launcher', tuning.functions.launcher),
+      prepare: make('Prepare', 'prepare', tuning.functions.prepare),
+      exportSource: make('ExportSource', 'export', tuning.functions.prepare),
+      bounds: make('BoundsProbe', 'bounds', tuning.functions.bounds),
+      finalizer: make('Finalizer', 'finalize', tuning.functions.finalizer),
       componentComposeRust,
 
-      // Isolated Rust component-raster candidate (see
-      // docs/rust-component-compose-plan.md). resvg is linked in-process; the
-      // image ships only the static bootstrap. Reserved concurrency one keeps
-      // the candidate from consuming production raster concurrency until
+      // Existing in-process component rasterizer now reads unique SVG objects.
       componentRasterRust: (() => {
         const rasterRustContext = path.join(__dirname, '..', 'services', 'component-raster-rust');
         const componentRasterRustName = `aqw-char-${stageName}-componentraster-rust`;
@@ -412,9 +460,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         });
         return componentRasterRust;
       })(),
-      complete: make('Complete', 'aqw_char_renderer.handlers.complete.handler', tuning.functions.complete),
-      cleanup: make('Cleanup', 'aqw_char_renderer.handlers.cleanup.handler', tuning.functions.cleanup),
-      shutdown: make('Shutdown', 'aqw_char_renderer.handlers.shutdown.handler', tuning.functions.shutdown),
+      complete: make('Complete', 'complete', tuning.functions.complete),
+      cleanup: make('Cleanup', 'cleanup', tuning.functions.cleanup),
+      shutdown: make('Shutdown', 'shutdown', tuning.functions.shutdown),
     };
   }
 
@@ -422,6 +470,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     stageName: string,
     tuning: InfrastructureTuning,
     functions: RendererFunctions,
+    boundsQueue: sqs.Queue,
+    workBucket: s3.Bucket,
   ): sfn.StateMachine {
     const lambdaRetry = {
       errors: [
@@ -434,9 +484,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       backoffRate: 2,
       maxAttempts: 5,
     };
-    // Prepare is split across three phases so the per-source FFDec export
-    // (the dominant cost, especially at maxFrames up to 2000) runs in
-    // parallel, one Lambda per source SWF.
+    // Export only vectors per source; a separate callback Map probes unique
+    // states before the finish phase can compute the shared canvas.
     const prepareResolve = new tasks.LambdaInvoke(this, 'PrepareResolve', {
       lambdaFunction: functions.prepare,
       payload: sfn.TaskInput.fromObject({ request: sfn.JsonPath.objectAt('$.request') }),
@@ -456,7 +505,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     });
     exportMap.itemProcessor(
       new tasks.LambdaInvoke(this, 'ExportSource', {
-        lambdaFunction: functions.prepare,
+        lambdaFunction: functions.exportSource,
         payload: sfn.TaskInput.fromObject({
           phase: 'export',
           job_id: sfn.JsonPath.stringAt('$.job_id'),
@@ -467,13 +516,61 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       }).addRetry(lambdaRetry),
     );
 
+    const planBounds = new tasks.LambdaInvoke(this, 'PlanBounds', {
+      lambdaFunction: functions.prepare,
+      payload: sfn.TaskInput.fromObject({
+        phase: 'plan_bounds',
+        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+        input_key: sfn.JsonPath.stringAt('$.prepare.input_key'),
+        export_results: sfn.JsonPath.listAt('$.export_results'),
+      }),
+      payloadResponseOnly: true,
+      resultPath: '$.bounds',
+    }).addRetry(lambdaRetry);
+    const inlineProbeMap = new sfn.Map(this, 'ProbeUniqueStatesInline', {
+      itemsPath: '$.bounds.inline_tasks',
+      maxConcurrency: tuning.boundsInlineConcurrency,
+      resultPath: sfn.JsonPath.DISCARD,
+    });
+    inlineProbeMap.itemProcessor(
+      new tasks.LambdaInvoke(this, 'ProbeUniqueStateInline', {
+        lambdaFunction: functions.bounds,
+        payload: sfn.TaskInput.fromObject({
+          phase: 'probe',
+          task: sfn.JsonPath.objectAt('$'),
+        }),
+        payloadResponseOnly: true,
+        resultPath: sfn.JsonPath.DISCARD,
+      }).addRetry(lambdaRetry),
+    );
+
+    const distributedProbeMap = new sfn.DistributedMap(this, 'ProbeUniqueStatesDistributed', {
+      itemReader: new sfn.S3JsonItemReader({
+        bucket: workBucket,
+        key: sfn.JsonPath.stringAt('$.bounds.tasks_key'),
+      }),
+      mapExecutionType: sfn.StateMachineType.STANDARD,
+      maxConcurrency: tuning.boundsConcurrency,
+      resultPath: sfn.JsonPath.DISCARD,
+    });
+    distributedProbeMap.itemProcessor(new tasks.SqsSendMessage(this, 'QueueBoundsProbe', {
+      queue: boundsQueue,
+      integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+      messageBody: sfn.TaskInput.fromObject({
+        task: sfn.JsonPath.objectAt('$'),
+        task_token: sfn.JsonPath.taskToken,
+      }),
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.seconds(tuning.boundsCallbackTimeoutSeconds)),
+      resultPath: sfn.JsonPath.DISCARD,
+    }));
+
     const prepareFinish = new tasks.LambdaInvoke(this, 'PrepareFinish', {
       lambdaFunction: functions.prepare,
       payload: sfn.TaskInput.fromObject({
         phase: 'finish',
         request: sfn.JsonPath.objectAt('$.request'),
         input_key: sfn.JsonPath.stringAt('$.prepare.input_key'),
-        export_results: sfn.JsonPath.listAt('$.export_results'),
+        bounds_plan_key: sfn.JsonPath.stringAt('$.bounds.plan_key'),
       }),
       payloadResponseOnly: true,
       resultPath: '$.prepare',
@@ -492,13 +589,11 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       payloadResponseOnly: true,
     }).addRetry(lambdaRetry);
 
-    // The first Map is the synchronization barrier: frame composition starts
-    // only after every unique component task succeeds. The worker is the Rust
-    // in-process resvg rasterizer (arm64).
-    const componentRasterMap = new sfn.DistributedMap(this, 'RasterComponentStates', {
+    // Both request-selected Maps implement the same synchronization barrier:
+    // frame composition starts only after every unique component task succeeds.
+    const componentRasterInlineMap = new sfn.Map(this, 'RasterComponentStatesInline', {
       itemsPath: '$.prepare.component_task_indices',
-      maxConcurrency: tuning.render.componentRasterConcurrency,
-      mapExecutionType: sfn.StateMachineType.EXPRESS,
+      maxConcurrency: tuning.render.componentRasterInlineConcurrency,
       resultPath: '$.component_results',
       itemSelector: {
         job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
@@ -506,8 +601,35 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         task_index: sfn.JsonPath.numberAt('$$.Map.Item.Value'),
       },
     });
-    componentRasterMap.itemProcessor(
-      new tasks.LambdaInvoke(this, 'RasterComponentState', {
+    componentRasterInlineMap.itemProcessor(
+      new tasks.LambdaInvoke(this, 'RasterComponentStateInline', {
+        lambdaFunction: functions.componentRasterRust,
+        payload: sfn.TaskInput.fromObject({
+          job_id: sfn.JsonPath.stringAt('$.job_id'),
+          manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
+          task_index: sfn.JsonPath.numberAt('$.task_index'),
+        }),
+        payloadResponseOnly: true,
+      }).addRetry(lambdaRetry),
+    );
+
+    const componentRasterDistributedMap = new sfn.DistributedMap(
+      this,
+      'RasterComponentStatesDistributed',
+      {
+        itemsPath: '$.prepare.component_task_indices',
+        maxConcurrency: tuning.render.componentRasterConcurrency,
+        mapExecutionType: sfn.StateMachineType.EXPRESS,
+        resultPath: '$.component_results',
+        itemSelector: {
+          job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+          manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
+          task_index: sfn.JsonPath.numberAt('$$.Map.Item.Value'),
+        },
+      },
+    );
+    componentRasterDistributedMap.itemProcessor(
+      new tasks.LambdaInvoke(this, 'RasterComponentStateDistributed', {
         lambdaFunction: functions.componentRasterRust,
         payload: sfn.TaskInput.fromObject({
           job_id: sfn.JsonPath.stringAt('$.job_id'),
@@ -545,9 +667,15 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       }).addRetry(lambdaRetry),
     );
 
-    const componentRenderMiss = componentRasterMap
-      .next(componentComposeMap)
-      .next(finalize);
+    componentComposeMap.next(finalize);
+    componentRasterInlineMap.next(componentComposeMap);
+    componentRasterDistributedMap.next(componentComposeMap);
+    const componentRasterMode = new sfn.Choice(this, 'SelectComponentRasterMode')
+      .when(
+        sfn.Condition.stringEquals('$.request.component_raster_mode', 'inline'),
+        componentRasterInlineMap,
+      )
+      .otherwise(componentRasterDistributedMap);
 
     const completeCached = new tasks.LambdaInvoke(this, 'CompleteCachedJob', {
       lambdaFunction: functions.complete,
@@ -568,12 +696,18 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         prepare: sfn.JsonPath.objectAt('$.prepare'),
       },
     });
-    // All jobs now run only the component-raster path: unique states are
-    // rasterized by the Rust worker, then composed/encoded in chunks.
-    const renderMiss = exportMap
-      .next(prepareFinish)
-      .next(discardExportResults)
-      .next(componentRenderMiss);
+    // All jobs run the component-raster path; the request controls only its
+    // orchestration mode, and both branches converge before composition.
+    prepareFinish.next(discardExportResults).next(componentRasterMode);
+    inlineProbeMap.next(prepareFinish);
+    distributedProbeMap.next(prepareFinish);
+    const probeMode = new sfn.Choice(this, 'SelectBoundsProbeMode')
+      .when(sfn.Condition.stringEquals('$.request.bounds_mode', 'inline'), inlineProbeMap)
+      .otherwise(distributedProbeMap);
+    const needsBounds = new sfn.Choice(this, 'HasMissingBounds')
+      .when(sfn.Condition.numberEquals('$.bounds.task_count', 0), prepareFinish)
+      .otherwise(probeMode);
+    const renderMiss = exportMap.next(planBounds).next(needsBounds);
     const cacheChoice = new sfn.Choice(this, 'CachedResultExists')
       .when(sfn.Condition.booleanEquals('$.prepare.cache_hit', true), completeCached)
       .otherwise(renderMiss);
@@ -622,6 +756,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     tuning: InfrastructureTuning,
   ): void {
     sourceBucket.grantRead(functions.prepare);
+    sourceBucket.grantRead(functions.exportSource);
     functions.prepare.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['s3:PutObject'],
@@ -629,12 +764,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           sourceBucket.arnForObjects(
             `dynamic-assets/${tuning.render.assetDatasetVersion}/*`,
           ),
-          // Content-addressed vector-state warm cache written by export workers.
-          sourceBucket.arnForObjects('vector-states/*'),
         ],
       }),
     );
     workBucket.grantReadWrite(functions.prepare);
+    workBucket.grantReadWrite(functions.exportSource);
+    workBucket.grantReadWrite(functions.bounds);
     workBucket.grantReadWrite(functions.finalizer);
     workBucket.grantReadWrite(functions.componentRasterRust);
     // Least-privilege S3: the Rust workers only read the prepare manifest and
@@ -654,6 +789,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     const concurrency = {
       [functions.launcher.functionName]: tuning.functions.launcher.reservedConcurrency,
       [functions.prepare.functionName]: tuning.functions.prepare.reservedConcurrency,
+      [functions.exportSource.functionName]: tuning.functions.prepare.reservedConcurrency,
+      [functions.bounds.functionName]: tuning.functions.bounds.reservedConcurrency,
       [functions.finalizer.functionName]: tuning.functions.finalizer.reservedConcurrency,
       [functions.componentRasterRust.functionName]: tuning.functions.componentRaster.reservedConcurrency,
       [functions.componentComposeRust.functionName]: tuning.functions.componentCompose.reservedConcurrency,
@@ -689,6 +826,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     stateMachine: sfn.StateMachine,
     renderEnabled: ssm.StringParameter,
     launcherMapping: lambda.EventSourceMapping,
+    boundsMapping: lambda.EventSourceMapping,
   ): void {
     functions.shutdown.addEnvironment('CHAR_RENDER_ENABLED_PARAMETER', renderEnabled.parameterName);
     functions.shutdown.addEnvironment('CHAR_RENDER_STATE_MACHINE_ARN', stateMachine.stateMachineArn);
@@ -697,6 +835,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       JSON.stringify([
         functions.launcher.functionName,
         functions.prepare.functionName,
+        functions.exportSource.functionName,
+        functions.bounds.functionName,
         functions.finalizer.functionName,
         functions.componentRasterRust.functionName,
         functions.componentComposeRust.functionName,
@@ -704,7 +844,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     );
     functions.shutdown.addEnvironment(
       'CHAR_RENDER_LAUNCHER_EVENT_SOURCE_UUIDS',
-      JSON.stringify([launcherMapping.eventSourceMappingId]),
+      JSON.stringify([launcherMapping.eventSourceMappingId, boundsMapping.eventSourceMappingId]),
     );
     renderEnabled.grantWrite(functions.shutdown);
     functions.shutdown.addToRolePolicy(
@@ -769,10 +909,15 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
   }
 
   private configureAlarms(
-    queues: { job: sqs.Queue; jobDlq: sqs.Queue; result: sqs.Queue; resultDlq: sqs.Queue },
+    queues: { job: sqs.Queue; jobDlq: sqs.Queue; result: sqs.Queue; resultDlq: sqs.Queue; bounds: sqs.Queue; boundsDlq: sqs.Queue },
     stateMachine: sfn.StateMachine,
     functions: RendererFunctions,
   ): void {
+    queues.boundsDlq.metricApproximateNumberOfMessagesVisible().createAlarm(this, 'BoundsDlqAlarm', {
+      threshold: 1,
+      evaluationPeriods: 1,
+      alarmDescription: 'An SVG bounds task exhausted queue delivery retries.',
+    });
     queues.jobDlq.metricApproximateNumberOfMessagesVisible().createAlarm(this, 'JobDlqAlarm', {
       threshold: 1,
       evaluationPeriods: 1,

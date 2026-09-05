@@ -59,6 +59,7 @@ pub struct RasterStats {
     pub raster_backend: crate::raster::RenderBackend,
     pub raster_canvas: (i64, i64),
     pub output_canvas: (i64, i64),
+    pub cache_enabled: bool,
     pub cache_hit: bool,
     pub timings: RasterTimings,
     pub total_ms: f64,
@@ -94,6 +95,7 @@ pub fn log_raster_profile(stats: &RasterStats) {
     field(&mut fields, "raster_canvas_height", stats.raster_canvas.1);
     field(&mut fields, "output_canvas_width", stats.output_canvas.0);
     field(&mut fields, "output_canvas_height", stats.output_canvas.1);
+    field(&mut fields, "cache_enabled", stats.cache_enabled);
     field(&mut fields, "cache_hit", stats.cache_hit);
     let timings = stats.timings;
     field(&mut fields, "manifest_ms", rounded(timings.manifest_ms));
