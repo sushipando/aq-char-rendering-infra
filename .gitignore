@@ -26,6 +26,9 @@ render_outputs/
 jobs/
 tmp/
 
+# macOS
+.DS_Store
+
 # Rust component-compose worker
 services/component-compose-rust/target/
 services/component-raster-rust/target/
