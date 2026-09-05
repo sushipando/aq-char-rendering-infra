@@ -1,5 +1,6 @@
 //! aqw-component-raster library facade.
 
+pub mod bench;
 pub mod cache;
 pub mod component_svg;
 pub mod compositor;

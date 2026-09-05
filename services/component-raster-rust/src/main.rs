@@ -72,8 +72,16 @@ async fn lambda_handler(event: LambdaEvent<RasterEvent>) -> Result<RasterResult,
 async fn main() -> Result<(), LambdaError> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
-        let cli = local::parse_cli(&args[1..]).map_err(Box::new)?;
-        let _ = local::run_local(&cli).await.map_err(Box::new)?;
+        match args[1].as_str() {
+            "bench-svg" => {
+                let bench = aqw_component_raster::bench::parse_cli(&args[1..]).map_err(Box::new)?;
+                aqw_component_raster::bench::run_bench(&bench).map_err(Box::new)?;
+            }
+            _ => {
+                let cli = local::parse_cli(&args[1..]).map_err(Box::new)?;
+                let _ = local::run_local(&cli).await.map_err(Box::new)?;
+            }
+        }
         return Ok(());
     }
     let function = service_fn(lambda_handler);
