@@ -31,7 +31,22 @@ use crate::telemetry::sha256_hex;
 /// downsample settings). Stale entries are simply never hit after a bump.
 /// Schema 2: backend-scoped keys so resvg and thorvg rasters of the same
 /// no-CC part never collide.
-pub const CACHE_SCHEMA: &str = "2";
+/// Schema 3: structural invisibility and prepared-tree-region allocation;
+/// bounds_key additionally scopes entries to the measured per-state hint.
+pub const CACHE_SCHEMA: &str = "3";
+
+/// Crop inputs affect allocations and potentially sampling. Never mix legacy
+/// rasters with prepared-tree-region rasters or two different measured hints.
+pub fn bounds_key(
+    base: &str,
+    bounds: &Option<crate::contract::RasterBounds>,
+) -> Result<String, RasterError> {
+    Ok(sha256_hex(&serde_json::to_vec(&(
+        base,
+        crate::region::POLICY,
+        bounds,
+    ))?))
+}
 
 /// A part is appearance-independent iff it has no color customization.
 pub fn is_no_cc(part: &Part) -> bool {

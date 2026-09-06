@@ -10,10 +10,12 @@ pub mod import;
 pub mod local;
 pub mod png;
 pub mod raster;
+pub mod region;
 pub mod resample;
 pub mod storage;
 pub mod svg;
 pub mod telemetry;
 #[cfg(feature = "thorvg")]
 pub mod thorvg;
+pub mod visibility;
 pub mod worker;

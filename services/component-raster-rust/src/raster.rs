@@ -62,6 +62,33 @@ pub fn render_svg(
 /// The resvg path: usvg parse -> tiny_skia premultiplied pixmap -> exact
 /// CLI demultiply (kept bit-identical to the shared image's `/opt/resvg`).
 pub fn render_svg_resvg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaImage, RasterError> {
+    render_resvg_region(svg_bytes, expected, None).map(|(image, _, _)| image)
+}
+
+/// Allocate a verified region of the original parsed viewport. Do not rebuild
+/// a tighter viewBox: that changes float rounding and minimum-stroke sampling.
+pub fn render_svg_bounded(
+    svg_bytes: &[u8],
+    expected: (u32, u32),
+    backend: RenderBackend,
+    hint: Option<[f64; 4]>,
+) -> Result<(RgbaImage, [u32; 2], &'static str), RasterError> {
+    match backend {
+        RenderBackend::Resvg => render_resvg_region(svg_bytes, expected, hint),
+        #[cfg(feature = "thorvg")]
+        RenderBackend::Thorvg => Ok((
+            crate::thorvg::render_svg(svg_bytes, expected)?,
+            [0, 0],
+            "backend_guard",
+        )),
+    }
+}
+
+fn render_resvg_region(
+    svg_bytes: &[u8],
+    expected: (u32, u32),
+    hint: Option<[f64; 4]>,
+) -> Result<(RgbaImage, [u32; 2], &'static str), RasterError> {
     let mut options = resvg::usvg::Options {
         resources_dir: None,
         ..resvg::usvg::Options::default()
@@ -79,11 +106,16 @@ pub fn render_svg_resvg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaIm
             expected.1
         )));
     }
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
+    let (region, reason) = hint
+        .map(|hint| crate::region::select(&tree, [expected.0, expected.1], hint))
+        .unwrap_or(([0, 0, expected.0, expected.1], "no_measured_bounds"));
+    let width = region[2] - region[0];
+    let height = region[3] - region[1];
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| RasterError::Raster("cannot allocate pixmap".to_string()))?;
     resvg::render(
         &tree,
-        resvg::usvg::Transform::default(),
+        resvg::usvg::Transform::from_translate(-(region[0] as f32), -(region[1] as f32)),
         &mut pixmap.as_mut(),
     );
     let mut pixels = pixmap.data().to_vec();
@@ -91,7 +123,11 @@ pub fn render_svg_resvg(svg_bytes: &[u8], expected: (u32, u32)) -> Result<RgbaIm
     // through `PremultipliedColorU8::demultiply` before writing PNG; replicate
     // that exact rounding so straight-alpha parity holds for every pixel.
     demultiply_u8(&mut pixels);
-    Ok(RgbaImage::new(size.width(), size.height(), pixels))
+    Ok((
+        RgbaImage::new(width, height, pixels),
+        [region[0], region[1]],
+        reason,
+    ))
 }
 
 fn demultiply_u8(pixels: &mut [u8]) {

@@ -100,6 +100,36 @@ pub struct ComponentTask {
     pub member: String,
     #[serde(default)]
     pub state_signature: Option<String>,
+    /// Probe registration-space bounds, validated against the prepared artwork
+    /// before allocating a smaller raster. Absent on legacy manifests.
+    #[serde(default)]
+    pub raster_bounds: Option<RasterBounds>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RasterBounds {
+    pub policy: String,
+    pub bounds: Option<[f64; 4]>,
+}
+
+impl RasterBounds {
+    pub fn validate(&self) -> Result<(), crate::error::RasterError> {
+        if self.policy != crate::region::POLICY
+            || self.bounds.is_some_and(|b| {
+                !b.iter().all(|v| v.is_finite())
+                    || b[2] <= 0.0
+                    || b[3] <= 0.0
+                    || !(b[0] + b[2]).is_finite()
+                    || !(b[1] + b[3]).is_finite()
+            })
+        {
+            return Err(crate::error::RasterError::invalid(
+                "invalid component raster bounds",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

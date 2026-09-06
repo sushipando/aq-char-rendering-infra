@@ -9,6 +9,13 @@ The dev stack is deployed. Local changes do not reach AWS until the repository
 owner runs the deployment script. `cdk synth` is read-only, but `cdk bootstrap`
 and `cdk deploy` create or change billable AWS resources.
 
+Component raster tasks now carry measured bounds and use guarded prepared-tree
+allocation to avoid empty page pixels without changing the shared sampling
+grid. Proven invisible artwork no longer creates phantom framing margins;
+uncertain faint artwork keeps the conservative fallback. This is automatic
+after deployment. See [audit item 2](docs/render-speed-quality-audit-2026-09-06.md#implementation-addendum-measured-component-bounds-and-invisible-framing)
+for validation, limitations, cache versioning, and local replay instructions.
+
 ## Development environment
 
 | Setting | Value |

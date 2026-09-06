@@ -484,6 +484,38 @@ fn local_raster_reuses_no_cc_cache_on_second_run() {
 }
 
 #[test]
+fn measured_bounds_have_separate_cache_identity_and_are_validated_before_hits() {
+    let root = unique_dir("bounds-cache");
+    let mut manifest = no_cc_manifest(vec![default_task()], 512, 256);
+    populate(&root, &manifest);
+    assert!(run(&root, 0).status.success());
+    manifest["component_tasks"][0]["raster_bounds"] =
+        json!({"policy":aqw_component_raster::region::POLICY,"bounds":[-6.0,-8.0,20.0,10.0]});
+    populate(&root, &manifest);
+    let first_bounded = run(&root, 0);
+    assert!(
+        first_bounded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_bounded.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first_bounded.stderr).contains("\"cache_hit\":false"));
+    let cached = run(&root, 0);
+    assert!(cached.status.success());
+    assert!(String::from_utf8_lossy(&cached.stderr).contains("\"cache_hit\":true"));
+    for bad_hint in [
+        json!({"policy":"unknown","bounds":[0,0,20,10]}),
+        json!({"policy":aqw_component_raster::region::POLICY,"bounds":[0,0,-1,10]}),
+        json!({"policy":aqw_component_raster::region::POLICY,"bounds":[0,0,0,10]}),
+        json!({"policy":aqw_component_raster::region::POLICY,"bounds":[0,0,20]}),
+    ] {
+        manifest["component_tasks"][0]["raster_bounds"] = bad_hint;
+        populate(&root, &manifest);
+        assert!(!run(&root, 0).status.success());
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn local_raster_can_bypass_no_cc_cache() {
     let root = unique_dir("cache-disabled");
     let mut manifest = no_cc_manifest(vec![default_task()], 512, 256);

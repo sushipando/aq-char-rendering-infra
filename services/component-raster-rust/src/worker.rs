@@ -9,7 +9,7 @@ use crate::compositor::RgbaImage;
 use crate::contract::{PrepareManifest, RasterEvent, RasterResult};
 use crate::error::RasterError;
 use crate::import::{import_ffdec_symbol, AuthoredColorTransform};
-use crate::raster::{downsample_component_to_output_grid, encode_rgba8, render_svg};
+use crate::raster::{downsample_component_to_output_grid, encode_rgba8, render_svg_bounded};
 use crate::storage::{Sink, Source};
 use crate::telemetry::{log_raster_profile, sha256_hex, RasterStats, RasterTimings};
 
@@ -205,6 +205,9 @@ pub async fn run_raster_task(
     let bundle_key = task.bundle_key.clone();
     let member = task.member.clone();
     let task_id = task.task_id.clone();
+    if let Some(bounds) = &task.raster_bounds {
+        bounds.validate()?;
+    }
 
     // ---- content-addressed cache --------------------------------------------
     // Appearance-independent parts (no color/placement customization) can be
@@ -232,6 +235,9 @@ pub async fn run_raster_task(
     } else {
         None
     };
+    let cache_key = cache_key
+        .map(|key| crate::cache::bounds_key(&key, &task.raster_bounds))
+        .transpose()?;
     let mut cache_hit = false;
     if let Some(key) = &cache_key {
         if let Some((cached_meta, cached_png)) = crate::cache::read_cache(source, key).await? {
@@ -371,7 +377,7 @@ pub async fn run_raster_task(
             (first, second)
         })
         .collect();
-    let component = build_component_svg(
+    let mut component = build_component_svg(
         &imported,
         matrix,
         darken,
@@ -382,6 +388,9 @@ pub async fn run_raster_task(
         fields,
         &all_color_rules,
     );
+    if component.visible && crate::visibility::proven_invisible(&component.root) {
+        component.visible = false;
+    }
     let svg_bytes = crate::svg::serialize(&crate::svg::Document {
         root: component.root.clone(),
         namespaces: component.namespaces.clone(),
@@ -396,9 +405,9 @@ pub async fn run_raster_task(
     let filter_count_value = filter_count(&component.root);
     let svg_build_ms = elapsed_ms(svg_started);
 
-    let [left, top, right, bottom] = component.page;
-    let page_width = (right - left).max(1) as u32;
-    let page_height = (bottom - top).max(1) as u32;
+    let [mut left, mut top, right, bottom] = component.page;
+    let mut page_width = (right - left).max(1) as u32;
+    let mut page_height = (bottom - top).max(1) as u32;
 
     let mut result = RasterResult {
         task_id: task_id.clone(),
@@ -449,7 +458,35 @@ pub async fn run_raster_task(
 
     if component.visible {
         let rasterize_started = Instant::now();
-        let rendered = render_svg(&svg_bytes, (page_width, page_height), raster_backend)?;
+        let hint = task
+            .raster_bounds
+            .as_ref()
+            .and_then(|h| h.bounds)
+            .map(|bounds| {
+                let b = crate::import::transformed_bounds(bounds, matrix);
+                let scale = raster_size as f64 / viewbox[2].max(viewbox[3]);
+                [
+                    (b[0] - viewbox[0]) * scale - left as f64,
+                    (b[1] - viewbox[1]) * scale - top as f64,
+                    b[2] * scale,
+                    b[3] * scale,
+                ]
+            });
+        let (rendered, offset, region_reason) =
+            render_svg_bounded(&svg_bytes, (page_width, page_height), raster_backend, hint)?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"component_raster_region", "job_id":event.job_id,
+            "task_id":task_id, "policy":crate::region::POLICY, "reason":region_reason,
+            "original_page_width":page_width, "original_page_height":page_height,
+            "allocated_width":rendered.width, "allocated_height":rendered.height,
+            "original_page_pixels":page_width as u64 * page_height as u64,
+            "allocated_pixels":rendered.width as u64 * rendered.height as u64})
+        );
+        left += offset[0] as i64;
+        top += offset[1] as i64;
+        page_width = rendered.width;
+        page_height = rendered.height;
         timings.rasterize_ms = elapsed_ms(rasterize_started);
         result.rasterize_ms = crate::telemetry::rounded2(timings.rasterize_ms);
 

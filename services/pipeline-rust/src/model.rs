@@ -8,7 +8,7 @@ pub const VECTOR_SCHEMA: u32 = 6;
 pub const FFDEC_VERSION: &str = "26.2.1";
 // Bump whenever effective-export corrections or the pinned renderer change.
 pub const EXPORT_POLICY: &str = "rust-effective-svg-v2-timelines";
-pub const BOUNDS_POLICY: &str = "resvg-0.48.1-aqw-v1-cells-v1";
+pub const BOUNDS_POLICY: &str = "resvg-0.48.1-aqw-v1-cells-v2-visibility";
 // Final-container changes must not invalidate immutable intermediate caches.
 pub const FINALIZE_POLICY: &str = "webp-adjacent-runs-v1";
 
@@ -247,6 +247,9 @@ pub struct BoundsResult {
     /// Registration-space x, y, width, height. Uncertain results MUST have
     /// a conservative bound; only proven invisible states may omit it.
     pub bounds: Option<[f64; 4]>,
+    /// Registration-space declared page for later alpha-generating authored
+    /// transforms that can invalidate a raw-SVG visibility/bounds observation.
+    pub declared_bounds: Option<[f64; 4]>,
     pub resolution_used: u32,
     pub fallback_reason: Option<String>,
 }
@@ -268,6 +271,12 @@ impl BoundsResult {
             ensure!(
                 b.iter().all(|v| v.is_finite()) && b[2] > 0.0 && b[3] > 0.0,
                 "invalid bounds geometry"
+            );
+        }
+        if let Some(b) = self.declared_bounds {
+            ensure!(
+                b.iter().all(|v| v.is_finite()) && b[2] > 0.0 && b[3] > 0.0,
+                "invalid declared bounds geometry"
             );
         }
         ensure!(

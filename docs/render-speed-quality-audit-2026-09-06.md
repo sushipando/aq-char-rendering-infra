@@ -174,6 +174,83 @@ The August 30 `9478ffa` fix documented this same class of phantom margin for Mig
 
 Scratch reproduction: `/private/tmp/aqw-bounds-audit-2026-09-06/fully-invisible.svg`, inspected with the already-built `aqw-render-pipeline probe-svg` command. The relevant source behavior was also verified directly; no binary was rebuilt or source edited.
 
+### Implementation addendum: measured component bounds and invisible framing
+
+Implemented locally after the audit on September 6; not deployed. New
+`PrepareFinish` tasks carry `raster_bounds` in FFDec registration space, with
+the `prepared-tree-region-v1` policy. Legacy component manifests without this
+field remain readable and retain the original allocation path.
+
+The raster worker imports/customizes the SVG and calibrates minimum strokes
+as before. It parses that **same prepared viewport once**, then unions the probe
+hint with conservative prepared-tree stroke/filter extents and the existing
+24-raster-pixel margin. The thumbnail alone never authorizes clipping. It does
+not rebuild a smaller viewBox, change global scale, or recalibrate strokes on a
+different page. Integer crop offsets are carried into alpha cropping and the
+existing output-grid downsampling.
+
+The crop is guarded against the pinned resvg implementation's canvas-dependent
+layer allocation limits. Every isolated surface must retain its dimensions and
+local transform, and path/gradient sampling transforms must remain identical.
+If moving the page origin would change those calculations, the worker tries
+candidates retaining one or both original origins. Unsupported masks, clip
+paths, patterns, text/images, and `feImage` subroots conservatively retain the
+old page. So do changed filter caps and crops saving less than 10% of the page.
+Authored filters are not rewritten or arbitrarily shrunk; that remains item 3.
+
+The saved `PetKittenBOOMBlack` fixture, with its frozen 4096-raster/2048-output
+placement and authored colors, now allocates **1427×2139 = 3,052,353 pixels**,
+instead of **4096×2139 = 8,761,344 pixels**: **65.16% fewer page pixels**.
+The worker's final PNG bytes, placement, dimensions, and downsampled pixels
+match exactly. This is a guarded 2.87× page-area reduction, not the original
+8× estimate and not an AWS latency claim. The larger-than-estimated crop retains
+full prepared effect bounds and an original origin needed for sampling parity.
+Local debug replay timings varied substantially and are not a performance
+forecast.
+
+Bounds probing now uses a bounded, namespace-aware DOM/reference traversal to
+prove structural invisibility: unreachable definitions do not count as painted
+artwork; reachable `<use>` targets are resolved; zero group opacity is applied
+after its own filters; an ancestor filter can still generate alpha. Ambiguous
+references, cycles, CSS/style overrides, and unsupported constructs do not
+produce a proof. A thumbnail miss or tiny/faint geometry still retries and
+retains the conservative page. The final prepared component can also skip
+rasterization when the same structural proof succeeds.
+
+The probe retains the declared registration-space page separately. Positive
+authored alpha offsets can invalidate raw-SVG bounds/visibility, so those parts
+union the declared page with any measured/padded bounds for framing and the
+allocation hint. An end-to-end test
+checks that an invisible 1431×1566 cape frames exactly like an absent cape,
+while an unresolved faint cape still enlarges the conservative canvas.
+
+`component_raster_region` logs the policy, selected/fallback reason, original
+page dimensions/pixels, and allocated dimensions/pixels. Bounds policy is now
+`resvg-0.48.1-aqw-v1-cells-v2-visibility`; component cache schema is `3`, scoped
+to the bounds hint and region policy. Task and final-render identities include
+the changed policy/inputs. Existing source/vector exports and animation metadata
+remain reusable; no cached objects are deleted. This is automatic after the
+owner deploys, with no new request flag and no architecture/dependency changes.
+
+Validation includes pixel-exact filtered/tinted/rotated/mirrored/gradient
+fixtures, deliberately incomplete thumbnail bounds, faint remote marks,
+alpha-generating filters, guarded subroots/filter-cap changes, invalid hints,
+legacy manifests, cold/warm cache separation, framing, and the saved pet replay.
+The raster and pipeline test suites pass. Strict raster Clippy passes; strict
+pipeline Clippy still reports pre-existing lints in `swf.rs`, `webp.rs`, and an
+`export.rs` test, unrelated to this implementation.
+
+```sh
+cargo test --manifest-path services/component-raster-rust/Cargo.toml
+cargo test --manifest-path services/pipeline-rust/Cargo.toml
+
+# Frozen local SVG and the matching saved prepare manifest; no AWS access.
+AQW_TEST_REGION_SVG=/path/to/pet.svg \
+AQW_TEST_REGION_MANIFEST=/path/to/manifest.json \
+cargo test --manifest-path services/pipeline-rust/Cargo.toml \
+  --test oversized_region -- --ignored --nocapture
+```
+
 ## 3. Reduce filter work while preserving the effects
 
 The dragon is expensive because many filtered surfaces are rendered repeatedly, not because its SVG is especially large on disk. The September 5 [Annie investigation](annie-dragon-raster-investigation.md) counted 69 authored Gaussian blurs and 23 authored filters, each with a 300%×300% region. The worker also adds color filters. A filter rectangle can include nine times the object's bounding-box area before clipping, even where most pixels are transparent.

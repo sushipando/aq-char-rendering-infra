@@ -186,6 +186,7 @@ pub fn probe(bytes: &[u8], task: &ProbeTask) -> Result<BoundsResult> {
         config: task.config.clone(),
         visibility: Visibility::ConfirmedInvisible,
         bounds: None,
+        declared_bounds: None,
         resolution_used: 0,
         fallback_reason: None,
     };
@@ -224,6 +225,18 @@ pub fn probe(bytes: &[u8], task: &ProbeTask) -> Result<BoundsResult> {
                     .all(|(a, b)| a.is_finite() && (a - b).abs() < 1e-5),
             "unsupported FFDec viewBox"
         );
+    }
+    // The declared page is in SVG units, not rounded thumbnail cells.
+    result.declared_bounds = Some([
+        -wrapper[4] / wrapper[0],
+        -wrapper[5] / wrapper[3],
+        width / wrapper[0],
+        height / wrapper[3],
+    ]);
+    if aqw_component_raster::visibility::proven_invisible(&document.root) {
+        result.fallback_reason = Some("proven_invisible_render_tree".into());
+        result.validate(task)?;
+        return Ok(result);
     }
     // usvg does not resolve arbitrary network resources; no external resource
     // directory is configured. Image data embedded by FFDec is supported.
@@ -462,11 +475,34 @@ mod tests {
 
     #[test]
     fn empty_thumbnail_is_not_confirmed_invisible() {
-        let bytes = svg(r#"<rect width="1" height="1" opacity="0"/>"#);
+        let bytes = svg(r#"<rect width=".000001" height=".000001" opacity="0.000001"/>"#);
         let result = probe(&bytes, &task(&bytes)).unwrap();
         assert_eq!(result.visibility, Visibility::Uncertain);
         assert!(result.bounds.is_some());
         assert_eq!(result.resolution_used, 1024);
+    }
+
+    #[test]
+    fn proven_invisible_artwork_does_not_restore_the_header() {
+        let bytes = svg(r#"<g opacity="0"><rect width="900" height="900"/></g>"#);
+        let result = probe(&bytes, &task(&bytes)).unwrap();
+        assert_eq!(result.visibility, Visibility::ConfirmedInvisible);
+        assert_eq!(result.bounds, None);
+        assert_eq!(result.resolution_used, 0);
+        assert_eq!(
+            result.declared_bounds,
+            Some([-100.0, -50.0, 2048.0, 1024.0])
+        );
+    }
+
+    #[test]
+    fn ancestor_filter_can_make_an_invisible_child_visible() {
+        let bytes = svg(
+            r##"<defs><filter id="f"><feFlood flood-color="red"/></filter></defs><g filter="url(#f)"><rect x="100" y="100" width="100" height="100" opacity="0"/></g>"##,
+        );
+        let result = probe(&bytes, &task(&bytes)).unwrap();
+        assert_ne!(result.visibility, Visibility::ConfirmedInvisible);
+        assert!(result.bounds.is_some());
     }
 
     #[test]

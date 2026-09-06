@@ -25,6 +25,24 @@ pub fn batches(count: usize, size: usize) -> Vec<Value> {
         .collect()
 }
 
+/// Positive authored alpha offsets can turn transparent input into paint.
+/// Those appearances must retain the declared page for framing and allocation.
+fn state_bounds(result: &BoundsResult, part: &Value) -> Option<[f64; 4]> {
+    let creates_alpha = part["placement_colors"].as_object().is_some_and(|colors| {
+        colors
+            .values()
+            .any(|c| c["alpha_add"].as_i64().unwrap_or(0) > 0)
+    });
+    if creates_alpha {
+        match (result.declared_bounds, result.bounds) {
+            (Some(declared), Some(measured)) => Some(bounds::union(declared, measured)),
+            (declared, measured) => declared.or(measured),
+        }
+    } else {
+        result.bounds
+    }
+}
+
 /// Group logical animation frames by their exact ordered component recipe.
 /// Duration is intentionally not part of the key: it changes playback timing,
 /// not the pixels produced by the component compositor.
@@ -252,7 +270,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         for index in 0..count {
             let source = select(&layer.symbol_key, index)?;
             let hash = &symbols[&layer.symbol_key].schedule[source];
-            if let Some(b) = results[hash].bounds {
+            if let Some(b) = state_bounds(&results[hash], &parts[&layer.symbol_key]) {
                 let b = transformed_bounds(b, layer.matrix);
                 tight = Some(tight.map(|a| bounds::union(a, b)).unwrap_or(b));
             }
@@ -304,11 +322,13 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         for (layer_index, layer) in layers.iter().enumerate() {
             let source = select(&layer.symbol_key, index)?;
             let hash = &symbols[&layer.symbol_key].schedule[source];
+            let raster_bounds = json!({"policy":aqw_component_raster::region::POLICY,"bounds":state_bounds(&results[hash], &parts[&layer.symbol_key])});
             let identity = crate::digest(
                 &json!({"renderer_version":config.renderer_version,"raster_size":settings["raster_size"],"output_size":output,"viewbox":viewbox,"facing":settings["facing"],"weapon_type":prepared["weapon_type"],"colors":colors,"symbol_key":layer.symbol_key,"layer_name":layer.name,"layer_index":layer_index,"matrix":layer.matrix,"darken":layer.darken,"state_signature":hash,"part":crate::digest(&parts[&layer.symbol_key])?}),
             )?;
+            let identity = crate::digest(&(&identity, &raster_bounds))?;
             if seen.insert(identity.clone()) {
-                tasks.push(json!({"task_id":identity,"symbol_key":layer.symbol_key,"layer_name":layer.name,"layer_index":layer_index,"matrix":layer.matrix,"darken":layer.darken,"svg_key":plan.states[hash].state.svg_key,"source_frame":source+1,"state_signature":hash}));
+                tasks.push(json!({"task_id":identity,"symbol_key":layer.symbol_key,"layer_name":layer.name,"layer_index":layer_index,"matrix":layer.matrix,"darken":layer.darken,"svg_key":plan.states[hash].state.svg_key,"source_frame":source+1,"state_signature":hash,"raster_bounds":raster_bounds}));
             }
             ids.push(identity);
         }
@@ -363,6 +383,28 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
 mod tests {
     use super::{component_compositions, composition_batches};
     use serde_json::json;
+
+    #[test]
+    fn authored_alpha_offsets_keep_declared_framing() {
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000"><g transform="matrix(1 0 0 1 0 0)" opacity="0"><rect width="10" height="10"/></g></svg>"#;
+        let task = crate::model::ProbeTask::new(
+            crate::model::StateRef::new(bytes),
+            crate::model::ProbeConfig::new(1.0),
+        )
+        .unwrap();
+        let mut bounds = crate::bounds::probe(bytes, &task).unwrap();
+        assert_eq!(super::state_bounds(&bounds, &json!({})), None);
+        assert_eq!(
+            super::state_bounds(
+                &bounds,
+                &json!({"placement_colors":{"1,2":{"alpha_add":1}}})
+            ),
+            Some([0.0, 0.0, 1000.0, 1000.0])
+        );
+        bounds.bounds = Some([-5.0, -5.0, 1010.0, 1010.0]);
+        assert_eq!(super::state_bounds(&bounds, &json!({"placement_colors":{"1,2":{"alpha_add":1}}})), bounds.bounds,
+            "retain measured filter extent and probe padding outside the declared page");
+    }
 
     #[test]
     fn groups_exact_recipes_globally_without_using_duration() {

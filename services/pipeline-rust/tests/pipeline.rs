@@ -212,6 +212,13 @@ async fn global_dedup_barrier_cache_and_direct_component_contract() -> Result<()
         .unwrap()
         .iter()
         .all(|task| task.get("svg_key").is_some() && task.get("bundle_key").is_none()));
+    for task in manifest["component_tasks"].as_array().unwrap() {
+        let hint: aqw_component_raster::contract::RasterBounds = serde_json::from_value(task["raster_bounds"].clone())?;
+        hint.validate()?;
+        let probe_task = tasks.iter().find(|p| p.state.sha256 == task["state_signature"].as_str().unwrap()).unwrap();
+        let measured: BoundsResult = store::read(&store, "work", &probe_task.result_key).await?;
+        assert_eq!(hint.bounds, measured.bounds);
+    }
     let raster_store = aqw_component_raster::storage::FsStore::new(temporary.path().into());
     for index in 0..4 {
         let event = serde_json::from_value(
@@ -241,6 +248,45 @@ async fn global_dedup_barrier_cache_and_direct_component_contract() -> Result<()
     )
     .await?;
     assert_eq!(complete["states"].as_object().unwrap().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invisible_cape_has_no_phantom_canvas_but_faint_cape_stays_conservative() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = FsStore(temporary.path().into());
+    let (request, _) = synthetic(&store).await?;
+    let mut source: SourceManifest = store::read(&store, "work", "vector-manifests/fixture.json").await?;
+    let mut input: Value = store::read(&store, "work", "jobs/input.json").await?;
+    let mut canvases = Vec::new();
+    for mode in ["invisible", "absent", "faint"] {
+        let body = if mode == "faint" { r#"<rect width=".000001" height=".000001" opacity=".000001"/>"# } else { r#"<g opacity="0"><rect width="1400" height="1500"/></g>"# };
+        let bytes = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="1431" height="1566"><g transform="matrix(1 0 0 1 0 0)">{body}</g></svg>"#).into_bytes();
+        let state = StateRef::new(&bytes);
+        source.symbols.get_mut("cape").unwrap().schedule.fill(state.sha256.clone());
+        source.states.insert(state.sha256.clone(), state.clone());
+        store.put("work", &state.svg_key, bytes, "image/svg+xml", true).await?;
+        store::write(&store, "work", "source.json", &source, false).await?;
+        if mode == "absent" { input["aliases"].as_object_mut().unwrap().remove("cape"); }
+        else { input["aliases"]["cape"] = "cape".into(); }
+        store::write(&store, "work", "jobs/input.json", &input, false).await?;
+        let planned = bounds::plan(&store, "work", JOB, "jobs/input.json", BTreeMap::from([(0,"source.json".into())]), ProbeConfig::new(1.0), bounds::PlanOptions::new(true, bounds::BoundsMode::Inline)).await?;
+        let tasks: Vec<ProbeTask> = store::read(&store, "work", planned["tasks_key"].as_str().unwrap()).await?;
+        for task in tasks { bounds::run_probe(&store, "work", &task).await?; }
+        let prepared = finish::finish(&store, &config(), &json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]})).await?;
+        let manifest: Value = store::read(&store, "work", prepared["manifest_key"].as_str().unwrap()).await?;
+        canvases.push(manifest["viewbox"].clone());
+        if mode == "invisible" {
+            let (index, task) = manifest["component_tasks"].as_array().unwrap().iter().enumerate().find(|(_,t)| t["symbol_key"] == "cape").unwrap();
+            assert!(task["raster_bounds"]["bounds"].is_null());
+            let raster = aqw_component_raster::storage::FsStore::new(temporary.path().into());
+            let result = aqw_component_raster::worker::run_raster_task(&serde_json::from_value(json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"task_index":index}))?, &raster, &raster).await?;
+            assert!(result.empty);
+            assert_eq!(result.rasterize_ms, 0.0);
+        }
+    }
+    assert_eq!(canvases[0], canvases[1], "invisible artwork must not enlarge the canvas");
+    assert!(canvases[2][2].as_f64().unwrap() > canvases[0][2].as_f64().unwrap(), "unresolved faint artwork must retain conservative framing");
     Ok(())
 }
 
