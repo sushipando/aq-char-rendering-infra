@@ -7,6 +7,7 @@ Idea 2 uses the existing compose Map and finalizer Lambda. The request selects `
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `output_format` | `webp` | Selects final format and intermediate representation. |
+| `rgba_compression` | `zstd` | Lossless intermediate compression; `none` keeps the raw handoff. |
 | `avif_quality` | `70` | Integer 0–100; higher retains more detail and generally increases bytes. |
 | `avif_speed` | `8` | Integer 0–10; higher trades compression efficiency for faster encoding. |
 | `webp_lossless` | false/null | Existing toggle applies to either format. AVIF ignores lossy quality when enabled. |
@@ -19,12 +20,12 @@ The pinned native helper uses libavif 1.4.2 and its pinned libaom 3.14.1 depende
 ## Frame handoff and validation
 
 * WebP follows the existing per-composition PNG → cwebp → WebP-mux path.
-* AVIF composition skips both PNG compression and cwebp, uploading tightly packed original RGBA8 once per unique composition. Schema-2 records use `rgba_key`, never `webp_key`. Logical frames still share composition objects.
+* AVIF composition skips both PNG compression and cwebp, uploading original RGBA8 once per unique composition, with optional lossless zstd compression. Schema-2 records use `rgba_key`, never `webp_key`. Logical frames still share composition objects.
 * Finalization verifies every logical frame's identity, dimensions, placement, byte count, and timing. It checks downloaded RGBA checksums and lengths. Missing, duplicated, swapped-format, or conflicting records fail before publication.
-* At most two raw downloads are in flight; pipe backpressure bounds input buffering. The finalizer does not accumulate the raw animation in RAM or `/tmp`. Nonadjacent reuse may download an object again. Adjacent repetitions of the same object merge, except tiny durations. Fully static animations retain two samples because libavif otherwise emits a still container and loses animation timing.
+* At most two downloads are in flight; zstd payloads remain compressed until streamed into the encoder, and pipe backpressure bounds input buffering. The finalizer does not accumulate the raw animation in RAM or `/tmp`. Nonadjacent reuse may download an object again. Adjacent repetitions of the same object merge, except tiny durations. Fully static animations retain two samples because libavif otherwise emits a still container and loses animation timing.
 * The helper checks the finished container's dimensions, color layout, sample count, durations, and infinite loop before reporting success. Only then does Rust publish `image/avif` and final-cache metadata. Decoder regression tests independently check actual pixels.
 
-Raw intermediates are larger: one 2048×2048 RGBA frame is 16 MiB. They stay in the work bucket under its existing lifecycle rules; they are not the Discord attachment. This trades intermediate S3 traffic for less compose CPU and avoids transcoding already-lossy WebP. Output size is not capped at 10 MB, and true lossless AVIF can exceed that substantially. AWS latency, memory use, transferred bytes, and final bytes must be measured together. Mac correctness tests are not AWS performance forecasts. The attempted local ARM64 image build was stopped at the owner’s request; container compilation and runtime packaging remain for the owner to verify.
+One uncompressed 2048×2048 RGBA frame is 16 MiB; new requests default to zstd level 1 for smaller intermediate transfers. See [handoff compression](rgba-handoff-compression.md) for memory tradeoffs and comparison commands. They stay in the work bucket under its existing lifecycle rules; they are not the Discord attachment. This trades intermediate S3 traffic for less compose CPU and avoids transcoding already-lossy WebP. Output size is not capped at 10 MB, and true lossless AVIF can exceed that substantially. AWS latency, memory use, transferred bytes, and final bytes must be measured together. Mac correctness tests are not AWS performance forecasts. The attempted local ARM64 image build was stopped at the owner’s request; container compilation and runtime packaging remain for the owner to verify.
 
 The final key uses `.avif`, the correct content type, and the existing render cache-control/content-disposition behavior. Format, quality, speed, lossless choice, and AVIF encoder policy participate in final identity. Vector/bounds/component reuse remains independent of the final encoding path. Adding normalized output settings changes final-cache identities for this release.
 

@@ -113,6 +113,7 @@ def parser() -> argparse.ArgumentParser:
         help="slot for --item-id when it cannot be inferred",
     )
     result.add_argument("--format", dest="output_format", choices=("webp", "avif"), default="webp")
+    result.add_argument("--rgba-compression", choices=("zstd", "none"), default="zstd", help="AVIF intermediate compression; zstd level 1 is lossless")
     result.add_argument("--avif-quality", type=int, choices=range(101), default=70, metavar="0..100")
     result.add_argument("--avif-speed", type=int, choices=range(11), default=8, metavar="0..10")
     result.add_argument(
@@ -263,6 +264,7 @@ def queue_one(
             output_size=args.output_size,
             padding=args.padding,
             output_format=args.output_format,
+            rgba_compression=args.rgba_compression,
             avif_quality=args.avif_quality,
             avif_speed=args.avif_speed,
             webp_quality=args.webp_quality,

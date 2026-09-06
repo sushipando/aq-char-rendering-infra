@@ -398,7 +398,7 @@ def test_avif_controls_round_trip(lossless):
     assert JobRequest.from_dict(parsed.to_dict()) == parsed
 
 
-@pytest.mark.parametrize("field,value", [("output_format", "png"), ("avif_quality", 101), ("avif_quality", 1.5), ("avif_speed", 11)])
+@pytest.mark.parametrize("field,value", [("rgba_compression", "png"), ("output_format", "png"), ("avif_quality", 101), ("avif_quality", 1.5), ("avif_speed", 11)])
 def test_invalid_avif_controls(field, value):
     payload = request_payload()
     payload["render"][field] = value

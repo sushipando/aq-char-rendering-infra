@@ -199,6 +199,7 @@ class RenderSettings:
     output_size: int = 2048
     padding: int = 0
     output_format: str = "webp"
+    rgba_compression: str = "zstd"
     avif_quality: int = 70
     avif_speed: int = 8
     webp_quality: float = 85.0
@@ -228,6 +229,7 @@ class RenderSettings:
             "max_size",
             "padding",
             "output_format",
+            "rgba_compression",
             "avif_quality",
             "avif_speed",
             "webp_quality",
@@ -280,6 +282,7 @@ class RenderSettings:
             output_size=output_size,
             padding=padding,
             output_format=_choice(payload.get("output_format", "webp"), "render.output_format", {"webp", "avif"}),
+            rgba_compression=_choice(payload.get("rgba_compression", "zstd"), "render.rgba_compression", {"none", "zstd"}),
             avif_quality=_integer(payload.get("avif_quality", 70), "render.avif_quality", 0, 100),
             avif_speed=_integer(payload.get("avif_speed", 8), "render.avif_speed", 0, 10),
             webp_quality=_number(payload.get("webp_quality", 85), "render.webp_quality", 0, 100),

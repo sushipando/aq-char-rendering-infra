@@ -86,6 +86,7 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
             "max_size",
             "padding",
             "output_format",
+            "rgba_compression",
             "avif_quality",
             "avif_speed",
             "webp_quality",
@@ -112,7 +113,7 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
                 .or_insert(default.clone());
         }
     }
-    let base = json!({"base_items":false,"show_hidden":false,"facing":"right","override":null,"complete_loop":true,"max_frames":360,"subframe_start":1,"zoom":2.0,"raster_size":2048,"output_size":render["raster_size"].as_u64().unwrap_or(2048),"padding":0,"output_format":"webp","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":null,"raster_backend":"resvg"});
+    let base = json!({"base_items":false,"show_hidden":false,"facing":"right","override":null,"complete_loop":true,"max_frames":360,"subframe_start":1,"zoom":2.0,"raster_size":2048,"output_size":render["raster_size"].as_u64().unwrap_or(2048),"padding":0,"output_format":"webp","rgba_compression":"zstd","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":null,"raster_backend":"resvg"});
     for (key, default) in base.as_object().unwrap() {
         render
             .as_object_mut()
@@ -160,6 +161,7 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
     integer(render, "max_frames", 1, 2000)?;
     integer(render, "subframe_start", 1, 10000)?;
     ensure!(matches!(render["output_format"].as_str(), Some("webp" | "avif")), "invalid output_format");
+    ensure!(matches!(render["rgba_compression"].as_str(), Some("none" | "zstd")), "invalid rgba_compression");
     integer(render, "avif_quality", 0, 100)?;
     integer(render, "avif_speed", 0, 10)?;
     integer(render, "webp_method", 0, 6)?;
@@ -279,7 +281,7 @@ mod tests {
             assert_eq!(parsed["render"]["avif_speed"], 8);
             assert_eq!(parsed["render"]["webp_lossless"], lossless);
         }
-        for (field, bad) in [("output_format",json!("png")), ("avif_quality",json!(101)),
+        for (field, bad) in [("output_format",json!("png")), ("rgba_compression",json!("png")), ("avif_quality",json!(101)),
             ("avif_quality",json!(1.5)), ("avif_speed",json!(11))] {
             let mut value = sample(); value["render"][field] = bad;
             assert!(request(value, None).is_err());
@@ -296,9 +298,9 @@ mod tests {
 
     #[test]
     fn sparse_admission_check_is_independent_of_fleet_defaults() {
-        let sparse = json!({"schema_version":1,"job_id":"45cfafbd-5089-4f6d-850a-caa798ec1fcb","created_at":"2026-09-05T00:00:00Z","discord":{"user_id":"1","channel_id":"2"},"render":{"username":"alina","max_frames":8,"raster_size":512,"output_size":256,"output_format":"webp","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":null,"raster_backend":"resvg"},"appearance":null});
+        let sparse = json!({"schema_version":1,"job_id":"45cfafbd-5089-4f6d-850a-caa798ec1fcb","created_at":"2026-09-05T00:00:00Z","discord":{"user_id":"1","channel_id":"2"},"render":{"username":"alina","max_frames":8,"raster_size":512,"output_size":256,"output_format":"webp","rgba_compression":"zstd","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":null,"raster_backend":"resvg"},"appearance":null});
         let admitted = request(sparse.clone(), None).unwrap();
-        let fleet = json!({"complete_loop":true,"max_frames":120,"subframe_start":1,"zoom":1.0,"raster_size":2048,"output_size":2048,"padding":0,"output_format":"webp","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":false,"raster_backend":"resvg"});
+        let fleet = json!({"complete_loop":true,"max_frames":120,"subframe_start":1,"zoom":1.0,"raster_size":2048,"output_size":2048,"padding":0,"output_format":"webp","rgba_compression":"zstd","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":false,"raster_backend":"resvg"});
         let execution = request(sparse.clone(), Some(&fleet)).unwrap();
         assert_eq!(
             request(admitted.clone(), None).unwrap(),

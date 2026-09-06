@@ -25,6 +25,7 @@ futures = "0.3"
 thiserror = "2"
 async-trait = "0.1"
 wide = "1.7"
+zstd = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = 3

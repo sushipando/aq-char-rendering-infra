@@ -409,6 +409,9 @@ pub async fn run_chunk(
     let raw_rgba = match settings.output_format.as_str() {
         "webp" => false, "avif" => true, _ => return Err(invalid("Unsupported output format")),
     };
+    let mut rgba_compressor = if raw_rgba && settings.rgba_compression.as_deref() == Some("zstd") {
+        Some(zstd::bulk::Compressor::new(1)?)
+    } else { None };
     let mut records: Vec<FrameRecord> = Vec::with_capacity(logical_frames_emitted);
     let mut frame_canvases: HashSet<[i64; 2]> = HashSet::new();
     let mut composite_total = 0.0;
@@ -458,20 +461,36 @@ pub async fn run_chunk(
         if raw_rgba {
             let prefix = event.benchmark_output_prefix.clone()
                 .unwrap_or_else(|| format!("jobs/{}/component", event.job_id));
-            let key = format!("{prefix}/rgba-frames/{frame_number:06}.rgba");
-            let sha256 = sha256_hex(&canvas.pixels);
+            let compression_started = Instant::now();
+            let raw = canvas.pixels;
+            let raw_hash = sha256_hex(&raw);
+            let (payload, compression, raw_sha256) = match settings.rgba_compression.as_deref().unwrap_or("none") {
+                "zstd" => {
+                    let compressed = rgba_compressor.as_mut().unwrap().compress(&raw)?;
+                    if compressed.len() < raw.len() {
+                        (compressed, Some("zstd".to_owned()), Some(raw_hash.clone()))
+                    } else { (raw, None, None) }
+                }
+                "none" => (raw, None, None),
+                _ => return Err(invalid("Unsupported RGBA compression")),
+            };
+            let suffix = if compression.is_some() { "rgba.zst" } else { "rgba" };
+            let key = format!("{prefix}/rgba-frames/{frame_number:06}.{suffix}");
+            let sha256 = if compression.is_some() { sha256_hex(&payload) } else { raw_hash };
+            encode_total += elapsed_ms(compression_started);
             for &logical_frame in &composition.logical_frames {
                 let frame = &prepared.component_frames[logical_frame as usize - 1];
                 records.push(FrameRecord {
                     frame: logical_frame, webp_key: String::new(), rgba_key: Some(key.clone()),
+                    rgba_compression: compression.clone(), raw_sha256: raw_sha256.clone(),
                     x: 0, y: 0, width: frame_canvas[0], height: frame_canvas[1],
                     canvas_width: frame_canvas[0], canvas_height: frame_canvas[1],
                     duration: frame_duration(frame, &prepared.frame_durations, logical_frame),
-                    sha256: sha256.clone(), bytes: canvas.pixels.len(),
+                    sha256: sha256.clone(), bytes: payload.len(),
                 });
             }
             let upload_started = Instant::now();
-            sink.put_rgba(frame_number, &key, &canvas.pixels).await?;
+            sink.put_rgba(frame_number, &key, &payload).await?;
             upload_total += elapsed_ms(upload_started);
             continue;
         }
@@ -544,6 +563,8 @@ pub async fn run_chunk(
                 frame: logical_frame,
                 webp_key: webp_key.clone(),
                 rgba_key: None,
+                rgba_compression: None,
+                raw_sha256: None,
                 x: 0,
                 y: 0,
                 width: frame_canvas[0],
@@ -689,6 +710,7 @@ mod tests {
             frame_durations: vec![40, 50, 60],
             settings: ManifestSettings {
                 output_format: "webp".into(),
+                rgba_compression: None,
                 raster_size: 256,
                 output_size: 256,
                 webp_quality: 85.0,

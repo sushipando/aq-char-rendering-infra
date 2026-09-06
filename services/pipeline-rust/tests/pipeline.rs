@@ -477,16 +477,20 @@ async fn incident_ground_cold_export_and_warm_cache() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires AQW_TEST_CWEBP, CHAR_RENDER_WEBPMUX and AQW_TEST_PYTHON with Pillow"]
 async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
-    full_pipeline_format("webp").await
+    full_pipeline_format("webp", "none").await.map(|_| ())
 }
 
 #[tokio::test]
 #[ignore = "requires CHAR_RENDER_AVIF_RGBA and AQW_TEST_PYTHON with Pillow AVIF support"]
 async fn full_rust_pipeline_encodes_and_validates_avif() -> Result<()> {
-    full_pipeline_format("avif").await
+    let raw = full_pipeline_format("avif", "none").await?;
+    let compressed = full_pipeline_format("avif", "zstd").await?;
+    assert_eq!(raw, compressed, "transport compression must not change final AVIF bytes");
+    Ok(())
 }
 
-async fn full_pipeline_format(format: &str) -> Result<()> {
+async fn full_pipeline_format(format: &str, compression: &str) -> Result<Vec<Vec<u8>>> {
+    let mut outputs = Vec::new();
     for frame_count in [1, 8] {
         let temporary = tempfile::tempdir()?;
         let store = FsStore(temporary.path().into());
@@ -501,6 +505,7 @@ async fn full_pipeline_format(format: &str) -> Result<()> {
         store::write(&store, "work", "jobs/input.json", &input, false).await?;
         if format == "avif" {
             request["render"]["output_format"] = "avif".into();
+            request["render"]["rgba_compression"] = compression.into();
             request["render"]["webp_lossless"] = true.into();
             let mut input: Value = store::read(&store, "work", "jobs/input.json").await?;
             input["settings"] = request["render"].clone();
@@ -563,6 +568,7 @@ async fn full_pipeline_format(format: &str) -> Result<()> {
         assert!(finalized["physical_frame_count"].as_u64().unwrap() <= frame_count);
         assert!(finalized["bytes"].as_u64().unwrap() > 0);
         let image_path = temporary.path().join("work").join(finalized["final_key"].as_str().unwrap());
+        outputs.push(tokio::fs::read(&image_path).await?);
         let metadata_check = tokio::process::Command::new(std::env::var("AQW_TEST_PYTHON")?)
             .arg("-c").arg(r#"
 import sys, xml.etree.ElementTree as ET
@@ -584,7 +590,18 @@ assert d.find('a:items/r:Seq/r:li[a:slot="Rune"]/a:name',ns).text=='Rune & Stars
                 assert_eq!(batch["schema_version"], 2);
                 for frame in batch["frames"].as_array().unwrap() {
                     assert!(frame.get("webp_key").is_none());
-                    records.push(frame.clone());
+                    let mut checked = frame.clone();
+                    if compression == "zstd" {
+                        assert_eq!(frame["rgba_compression"], "zstd");
+                        let payload = store.get("work",frame["rgba_key"].as_str().unwrap()).await?.unwrap();
+                        let size = (frame["width"].as_u64().unwrap()*frame["height"].as_u64().unwrap()*4) as usize;
+                        assert!(payload.len() < size);
+                        let raw = zstd::bulk::decompress(&payload,size)?;
+                        let verify_key = format!("verify-raw/{}.rgba", frame["frame"]);
+                        store.put("work", &verify_key, raw, "application/octet-stream", false).await?;
+                        checked["rgba_key"] = verify_key.into();
+                    }
+                    records.push(checked);
                 }
             }
             records.sort_by_key(|f| f["frame"].as_u64().unwrap());
@@ -641,7 +658,7 @@ assert logical==len(expected)
         .await
         .is_err());
     }
-    Ok(())
+    Ok(outputs)
 }
 
 async fn assert_same_webp_timeline(reference: &std::path::Path, candidate: &std::path::Path) -> Result<()> {
@@ -715,6 +732,11 @@ async fn adjacent_runs_preserve_decoded_pixels_timing_and_static_animation() -> 
             assert_eq!(result["physical_frame_count"],expected_count);
             assert_eq!(result["duration_ms"],durations.iter().map(|d|*d as u64).sum::<u64>());
             let candidate = case_root.join("work/renders/merged.webp");
+            // Compare the same metadata overhead on both containers; the tiny
+            // fixture's XMP can exceed the compressed pixel data by itself.
+            let manifest: Value = store::read(&store,"work","prepare.json").await?;
+            let baseline_with_metadata = pipeline::webp::with_xmp(&tokio::fs::read(&baseline).await?, &pipeline::metadata::packet(&manifest)?)?;
+            tokio::fs::write(&baseline, baseline_with_metadata).await?;
             assert_same_webp_timeline(&baseline,&candidate).await?;
             if expected_count < records.len() { assert!(std::fs::metadata(&candidate)?.len() < std::fs::metadata(&baseline)?.len()); }
         }

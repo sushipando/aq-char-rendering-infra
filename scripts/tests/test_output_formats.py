@@ -14,7 +14,9 @@ class OutputFormatTests(unittest.TestCase):
     def test_submission_format_quality_and_shared_lossless_flags(self):
         defaults = submit.parser().parse_args(["Annie"])
         self.assertEqual(defaults.output_format, "webp")
-        args = submit.parser().parse_args(["Annie", "--format", "avif", "--avif-quality", "63", "--avif-speed", "8", "--lossless"])
+        args = submit.parser().parse_args(["Annie", "--format", "avif", "--avif-quality", "63", "--avif-speed", "8", "--lossless", "--rgba-compression", "none"])
+        self.assertEqual(defaults.rgba_compression, "zstd")
+        self.assertEqual(args.rgba_compression, "none")
         self.assertEqual((args.output_format, args.avif_quality, args.avif_speed, args.webp_lossless), ("avif", 63, 8, True))
 
     def test_cdn_checks_format_and_mime_type(self):

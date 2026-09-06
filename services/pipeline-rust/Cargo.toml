@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images", "svgz", "simd-blur"] }
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 aqw-component-compose = { path = "../component-compose-rust" }

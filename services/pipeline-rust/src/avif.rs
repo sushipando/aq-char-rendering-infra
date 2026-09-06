@@ -8,6 +8,8 @@ use anyhow::{ensure, Context, Result};
 use futures::{stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::{
     collections::BTreeMap,
     process::Stdio,
@@ -22,6 +24,10 @@ pub const POLICY: &str = "avif-rgba-v1-libavif1.4.2-aom3.14.1-444-alpha100-lag0-
 struct Frame {
     frame: usize,
     rgba_key: String,
+    #[serde(default)]
+    rgba_compression: Option<String>,
+    #[serde(default)]
+    raw_sha256: Option<String>,
     x: u32,
     y: u32,
     width: u32,
@@ -52,7 +58,14 @@ fn schedule(batches: &[Value], count: usize, durations: &[u32]) -> Result<Vec<Fr
                 (1..=count).contains(&frame.frame),
                 "RGBA frame out of range"
             );
-            let identity = (frame.sha256.clone(), frame.bytes, frame.width, frame.height);
+            let identity = (
+                frame.sha256.clone(),
+                frame.bytes,
+                frame.width,
+                frame.height,
+                frame.rgba_compression.clone(),
+                frame.raw_sha256.clone(),
+            );
             if let Some(previous) = identities.insert(frame.rgba_key.clone(), identity.clone()) {
                 ensure!(previous == identity, "conflicting RGBA object metadata");
             }
@@ -77,7 +90,7 @@ fn schedule(batches: &[Value], count: usize, durations: &[u32]) -> Result<Vec<Fr
                 && frame.y == 0
                 && [frame.width, frame.height] == canvas
                 && [frame.canvas_width, frame.canvas_height] == canvas
-                && frame.bytes == size,
+                && (1..=size).contains(&frame.bytes),
             "RGBA must be tightly packed full-canvas straight-alpha RGBA8"
         );
         ensure!(
@@ -90,6 +103,20 @@ fn schedule(batches: &[Value], count: usize, durations: &[u32]) -> Result<Vec<Fr
                 && frame.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid RGBA identity"
         );
+        match frame.rgba_compression.as_deref().unwrap_or("none") {
+            "none" => ensure!(
+                frame.bytes == size && frame.raw_sha256.is_none(),
+                "invalid uncompressed RGBA identity"
+            ),
+            "zstd" => ensure!(
+                frame
+                    .raw_sha256
+                    .as_ref()
+                    .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())),
+                "missing original RGBA checksum"
+            ),
+            _ => anyhow::bail!("unsupported RGBA compression"),
+        }
         // Merge only the same verified object; distinct alias keys are still
         // fetched and checked. Keep tiny durations separate for player behavior.
         if let Some(previous) = runs.last_mut() {
@@ -112,6 +139,44 @@ fn schedule(batches: &[Value], count: usize, durations: &[u32]) -> Result<Vec<Fr
         runs.push(tail);
     }
     Ok(runs)
+}
+
+/// Stream decompression straight into the encoder pipe. Keep downloaded frames
+/// compressed; no additional full RGBA frame is allocated in Rust for zstd.
+async fn write_pixels(
+    input: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &Frame,
+    bytes: &[u8],
+) -> Result<f64> {
+    if frame.rgba_compression.as_deref() != Some("zstd") {
+        input.write_all(bytes).await?;
+        return Ok(0.0);
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(bytes)?;
+    // Level 1 uses a much smaller window. Bound even malformed object headers.
+    decoder.window_log_max(23)?;
+    let expected = frame.width as usize * frame.height as usize * 4;
+    let mut buffer = [0u8; 65536];
+    let mut total = 0;
+    let mut hash = Sha256::new();
+    let mut elapsed = 0.0;
+    loop {
+        let started = Instant::now();
+        let count = decoder.read(&mut buffer)?;
+        total += count;
+        ensure!(total <= expected, "decompressed RGBA exceeds canvas size");
+        hash.update(&buffer[..count]);
+        elapsed += started.elapsed().as_secs_f64() * 1000.0;
+        if count == 0 {
+            break;
+        }
+        input.write_all(&buffer[..count]).await?;
+    }
+    ensure!(
+        total == expected && Some(hex::encode(hash.finalize())) == frame.raw_sha256,
+        "decompressed RGBA length/checksum mismatch"
+    );
+    Ok(elapsed)
 }
 
 pub async fn finalize(
@@ -170,6 +235,8 @@ pub async fn finalize(
     .context("start AVIF sequence encoder")?;
     let mut input = child.stdin.take().context("missing encoder stdin")?;
     let mut download_ms = 0.0;
+    let mut decompression_ms = 0.0;
+    let mut download_bytes = 0usize;
     let encoding = async {
         for n in [
             width,
@@ -196,18 +263,15 @@ pub async fn finalize(
                     bytes.len() == frame.bytes && crate::sha256(&bytes) == frame.sha256,
                     "RGBA checksum/length mismatch"
                 );
-                Ok::<_, anyhow::Error>((
-                    frame.duration,
-                    bytes,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                ))
+                Ok::<_, anyhow::Error>((frame, bytes, start.elapsed().as_secs_f64() * 1000.0))
             })
             .buffered(2);
         while let Some(frame) = downloads.next().await {
-            let (duration, bytes, elapsed) = frame?;
+            let (frame, bytes, elapsed) = frame?;
             download_ms += elapsed;
-            input.write_all(&duration.to_le_bytes()).await?;
-            input.write_all(&bytes).await?;
+            download_bytes += bytes.len();
+            input.write_all(&frame.duration.to_le_bytes()).await?;
+            decompression_ms += write_pixels(&mut input, frame, &bytes).await?;
         }
         input.shutdown().await?;
         drop(input);
@@ -260,7 +324,7 @@ pub async fn finalize(
         "finalize_profile",
         json!({"job_id":job,"output_format":"avif","finalize_policy":POLICY,
         "frame_count":count,"physical_frame_count":runs.len(),"rgba_download_sum_ms":download_ms,
-        "output_bytes":result["bytes"],"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
+        "rgba_download_bytes":download_bytes,"rgba_decompression_ms":decompression_ms,"output_bytes":result["bytes"],"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(result)
 }
@@ -272,6 +336,42 @@ mod tests {
         json!({"schema_version":2,"frames":(1..=3).map(|frame| json!({"frame":frame,"rgba_key":"a.rgba","x":0,"y":0,
             "width":8,"height":6,"canvas_width":8,"canvas_height":6,"duration":42,"sha256":"a".repeat(64),"bytes":192})).collect::<Vec<_>>()})
     }
+    #[tokio::test]
+    async fn streaming_zstd_checks_size_hash_and_corruption() {
+        let raw = vec![37u8; 192];
+        let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+        let mut value = batch()["frames"][0].clone();
+        value["rgba_compression"] = "zstd".into();
+        value["raw_sha256"] = crate::sha256(&raw).into();
+        value["sha256"] = crate::sha256(&compressed).into();
+        value["bytes"] = compressed.len().into();
+        let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+        write_pixels(&mut tokio::io::sink(), &frame, &compressed)
+            .await
+            .unwrap();
+        assert!(write_pixels(&mut tokio::io::sink(), &frame, b"corrupt")
+            .await
+            .is_err());
+        for size in [191, 193, 100000] {
+            let bad = zstd::bulk::compress(&vec![37; size], 1).unwrap();
+            assert!(write_pixels(&mut tokio::io::sink(), &frame, &bad)
+                .await
+                .is_err());
+        }
+        let wrong = zstd::bulk::compress(&vec![38; 192], 1).unwrap();
+        assert!(write_pixels(&mut tokio::io::sink(), &frame, &wrong)
+            .await
+            .is_err());
+        assert!(schedule(
+            &[json!({"schema_version":2,"frames":[value.clone()]})],
+            1,
+            &[42]
+        )
+        .is_ok());
+        value["raw_sha256"] = Value::Null;
+        assert!(schedule(&[json!({"schema_version":2,"frames":[value]})], 1, &[42]).is_err());
+    }
+
     #[test]
     fn validates_raw_schedule_before_merging() {
         let b = batch();
