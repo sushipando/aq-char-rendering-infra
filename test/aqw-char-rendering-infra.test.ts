@@ -108,15 +108,23 @@ test('bounds use the request-selected Inline or Distributed Map with an empty fa
   expect(states.SelectBoundsProbeMode.Default).toBe('ProbeUniqueStatesDistributed');
 
   const inline = states.ProbeUniqueStatesInline;
-  expect(inline.ItemsPath).toBe('$.bounds.inline_tasks');
+  expect(inline.ItemsPath).toBe('$.bounds.inline_task_indices');
+  expect(inline.ItemSelector).toEqual({
+    'job_id.$': '$.prepare.job_id',
+    'tasks_key.$': '$.bounds.tasks_key',
+    'task_index.$': '$$.Map.Item.Value',
+  });
   expect(inline.MaxConcurrency).toBe(40);
   expect(inline.ItemProcessor.ProcessorConfig).toEqual({ Mode: 'INLINE' });
   expect(inline.ResultPath).toBeNull();
   expect(inline.Next).toBe('PrepareFinish');
-  expect(inline.ItemProcessor.States.ProbeUniqueStateInline.Parameters).toMatchObject({
+  const inlineTask = inline.ItemProcessor.States.ProbeUniqueStateInline;
+  expect(inlineTask.Parameters).toEqual({
     phase: 'probe',
-    'task.$': '$',
+    'task_ref.$': '$',
   });
+  expect(inlineTask.ResultSelector).toEqual({ ack: 0 });
+  expect(inlineTask.OutputPath).toBe('$.ack');
 
   const distributed = states.ProbeUniqueStatesDistributed;
   expect(distributed.ItemReader).toMatchObject({ ReaderConfig: { InputType: 'JSON' }, Parameters: { 'Key.$': '$.bounds.tasks_key' } });

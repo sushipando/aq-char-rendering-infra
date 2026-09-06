@@ -9,7 +9,7 @@ import boto3
 
 from aqw_char_renderer.config import RuntimeConfig
 from aqw_char_renderer.contracts import JobRequest
-from aqw_char_renderer.jobs import JobStore
+from aqw_char_renderer.jobs import JobStore, discord_notification_pending
 from aqw_char_renderer.structured_logging import log_event
 
 
@@ -77,8 +77,8 @@ def complete_success(
         },
     )
     current = jobs.get(request.job_id) or {}
-    if not current.get("result_enqueued_at"):
-        _publish(config, payload)
+    if discord_notification_pending(current):
+        _publish(config, current["result_payload"])
         jobs.mark_result_enqueued(request.job_id)
     log_event(
         "job_succeeded", job_id=request.job_id, cache_hit=result.get("cache_hit"), released=released
@@ -131,8 +131,8 @@ def failure_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         attributes={"error_code": code, "result_payload": payload},
     )
     current = jobs.get(request.job_id) or {}
-    if not current.get("result_enqueued_at"):
-        _publish(config, payload)
+    if discord_notification_pending(current):
+        _publish(config, current["result_payload"])
         jobs.mark_result_enqueued(request.job_id)
     log_event("job_failed", job_id=request.job_id, error_code=code, released=released)
     return {"job_id": request.job_id, "status": "FAILED", "released": released}

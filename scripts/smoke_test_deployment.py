@@ -264,16 +264,13 @@ def main() -> int:
     else:
         raise TimeoutError(f"Timed out waiting for terminal job state for {job_id}")
 
-    # The Discord bot is a competing consumer on the shared result queue, so
-    # a smoke process cannot reliably receive its own message. Completion
-    # atomically persists the exact payload in the job record before enqueueing
-    # it; use that durable copy and verify that queue publication was recorded.
+    # CLI jobs never notify Discord. Completion atomically persists the payload
+    # with the terminal status; smoke tests validate that durable result, not
+    # result-queue publication (which is only for Discord-origin jobs).
     terminal = jobs.get(job_id) or {}
     payload = terminal.get("result_payload")
     if not isinstance(payload, dict):
         raise TypeError(f"Job has no persisted result payload: {json.dumps(terminal, default=str)}")
-    if not terminal.get("result_enqueued_at"):
-        raise RuntimeError("Job completed without recording result-queue publication")
     if payload.get("status") != "SUCCEEDED":
         raise RuntimeError(f"Render failed: {json.dumps(payload, sort_keys=True, default=str)}")
     result = payload.get("result")

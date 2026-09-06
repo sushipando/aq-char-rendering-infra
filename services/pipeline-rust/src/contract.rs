@@ -15,7 +15,7 @@ pub fn integer(value: &Value, name: &str, min: u64, max: u64) -> Result<u64> {
     ensure!((min..=max).contains(&n), "{name} out of range");
     Ok(n)
 }
-fn keys(value: &Value, allowed: &[&str]) -> Result<()> {
+pub(crate) fn keys(value: &Value, allowed: &[&str]) -> Result<()> {
     let object = value.as_object().context("expected object")?;
     ensure!(
         object.keys().all(|key| allowed.contains(&key.as_str())),

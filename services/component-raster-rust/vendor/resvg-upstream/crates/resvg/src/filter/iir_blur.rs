@@ -108,23 +108,24 @@ fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
     // Filter vertically along each column.
     let (lambda_y, dnu_y) = if d.sigma_y > 0.0 {
         let (lambda, dnu) = gen_coefficients(d.sigma_y, d.steps);
-        for x in 0..d.width {
-            for _ in 0..d.steps {
-                let idx = x;
-
-                // Filter downwards.
-                let mut y = d.width;
-                while y < buf.len() {
-                    buf[idx + y] += dnu * buf[idx + y - d.width];
-                    y += d.width;
+        // Columns are independent. Visit adjacent columns together for
+        // contiguous memory access, retaining each column's down/up
+        // recurrence and step order (including f64 rounding).
+        for _ in 0..d.steps {
+            // Filter downwards.
+            for row in 1..d.height {
+                let current = row * d.width;
+                let previous = current - d.width;
+                for x in 0..d.width {
+                    buf[current + x] += dnu * buf[previous + x];
                 }
-
-                y = buf.len() - d.width;
-
-                // Filter upwards.
-                while y > 0 {
-                    buf[idx + y - d.width] += dnu * buf[idx + y];
-                    y -= d.width;
+            }
+            // Filter upwards.
+            for row in (1..d.height).rev() {
+                let current = row * d.width;
+                let previous = current - d.width;
+                for x in 0..d.width {
+                    buf[previous + x] += dnu * buf[current + x];
                 }
             }
         }
@@ -144,3 +145,7 @@ fn gen_coefficients(sigma: f64, steps: usize) -> (f64, f64) {
     let dnu = (1.0 + 2.0 * lambda - (1.0 + 4.0 * lambda).sqrt()) / (2.0 * lambda);
     (lambda, dnu)
 }
+
+#[cfg(test)]
+#[path = "iir_blur_tests.rs"]
+mod tests;

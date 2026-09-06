@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from boto3.dynamodb.types import TypeDeserializer
 from botocore.exceptions import ClientError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -193,6 +194,25 @@ class RestartTests(unittest.TestCase):
         self.jobs.release.assert_not_called()
         self.sfn.start_execution.assert_not_called()
         self.sfn.redrive_execution.assert_not_called()
+
+    def test_restart_of_discord_job_is_admitted_as_cli_without_changing_inputs(self):
+        self.jobs.get.return_value["request_origin"] = "discord"
+        original, _ = self.load()
+        fresh = restart.fresh_request(original, self.args)
+        dynamodb, sqs = MagicMock(), MagicMock()
+        with patch.object(
+            submit.boto3, "client",
+            side_effect=lambda name: {"dynamodb": dynamodb, "sqs": sqs}[name],
+        ):
+            restart.enqueue_request(OUTPUTS, fresh, 2)
+        raw = dynamodb.transact_write_items.call_args.kwargs["TransactItems"][0]["Put"]["Item"]
+        admitted = {key: TypeDeserializer().deserialize(value) for key, value in raw.items()}
+        self.assertEqual(admitted["request_origin"], "cli")
+        self.assertEqual(admitted["user_id"], original.discord.user_id)
+        self.assertEqual(admitted["request"], fresh.to_dict())
+        self.assertEqual(
+            json.loads(sqs.send_message.call_args.kwargs["MessageBody"]), fresh.to_dict()
+        )
 
     def test_enqueue_failure_releases_only_new_admission(self):
         fresh = restart.fresh_request(self.original, self.args)

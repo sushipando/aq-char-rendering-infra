@@ -7,6 +7,14 @@ use anyhow::{ensure, Context, Result};
 use aws_sdk_sfn::error::ProvideErrorMetadata;
 use serde_json::{json, Value};
 
+fn discord_notification_pending(record: &Value) -> bool {
+    // Origin belongs to the admission record, never to copied render inputs
+    // or a result payload. Unmarked legacy jobs are silent too.
+    record["request_origin"] == "discord"
+        && record["result_enqueued_at"].is_null()
+        && !record["result_payload"].is_null()
+}
+
 pub struct Control {
     pub config: Config,
     pub jobs: Jobs,
@@ -32,7 +40,7 @@ impl Control {
 
     pub async fn publish_pending(&self, job: &str) -> Result<()> {
         let current = self.jobs.get(job).await?.context("missing completed job")?;
-        if current["result_enqueued_at"].is_null() && !current["result_payload"].is_null() {
+        if discord_notification_pending(&current) {
             // Always publish the terminal transaction's winning payload, not
             // a losing completion attempt's transient local result.
             self.sqs
@@ -209,7 +217,7 @@ impl Control {
             let mut requeued = Vec::new();
             for record in self.jobs.scan(200).await? {
                 let job = string(&record, "job_id")?;
-                if !record["result_payload"].is_null() && record["result_enqueued_at"].is_null() {
+                if discord_notification_pending(&record) {
                     self.publish_pending(job).await?;
                     requeued.push(job.to_string());
                 }
@@ -350,5 +358,46 @@ impl Control {
         Ok(
             json!({"render_enabled":false,"disabled_event_source_mappings":disabled,"throttled_functions":names,"stopped_executions":stopped}),
         )
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn only_discord_origin_can_publish_any_terminal_result() {
+        for status in ["SUCCEEDED", "CACHE_HIT", "FAILED", "TIMED_OUT", "ABORTED"] {
+            for origin in [
+                json!("discord"),
+                json!("cli"),
+                Value::Null,
+                json!("unknown"),
+                json!(true),
+            ] {
+                let mut record = json!({
+                    "status": status,
+                    "slot_released": true,
+                    "request_origin": origin,
+                    "user_id": "123", "channel_id": "456",
+                    // Copied inputs and payloads cannot authorize notification.
+                    "request": {"request_origin": "discord"},
+                    "result_payload": {"request_origin": "discord", "status": status}
+                });
+                assert_eq!(discord_notification_pending(&record), origin == "discord");
+                record.as_object_mut().unwrap().remove("request_origin");
+                assert!(!discord_notification_pending(&record));
+            }
+        }
+    }
+
+    #[test]
+    fn reconciler_only_retries_unpublished_discord_results() {
+        let mut record = json!({"request_origin": "discord"});
+        assert!(!discord_notification_pending(&record));
+        record["result_payload"] = json!({"status": "SUCCEEDED"});
+        assert!(discord_notification_pending(&record));
+        record["result_enqueued_at"] = json!("2026-09-06T00:00:00Z");
+        assert!(!discord_notification_pending(&record));
     }
 }

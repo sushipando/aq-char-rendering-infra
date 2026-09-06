@@ -5,7 +5,7 @@ Discord bot uses: it fetches the character's equipped flashvars, seeds any
 missing source assets, reserves a per-user slot, enqueues the render job, and
 polls the job table until each job reaches a terminal state. It prints one
 compact result row per character and (optionally) verifies the delivered WebP
-on CloudFront.
+on CloudFront. CLI successes and failures never post to Discord.
 
 Examples:
     # The short wrapper supplies uv and the dev AWS profile/Region.
@@ -281,7 +281,7 @@ def queue_one(
 def enqueue_request(
     outputs: dict[str, str], request: JobRequest, maximum_active: int
 ) -> tuple[str, dict[str, Any]]:
-    """Shared normal admission/SQS path for fresh renders and restarts."""
+    """Shared CLI admission/SQS path; fresh renders and restarts never notify Discord."""
     jobs = JobStore(outputs["JobTableName"])
     jobs.acquire(request, maximum_active)
     job_id = request.job_id

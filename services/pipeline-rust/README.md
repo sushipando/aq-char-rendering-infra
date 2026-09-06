@@ -58,11 +58,20 @@ selects only results that are still missing after prefetch. Each request
 explicitly selects `bounds_mode` as `inline` or `distributed`; missing fields
 are hydrated to `inline` for older clients. The planner never changes that
 selection based on task count. Inline Map runs at most 40 probes concurrently
-and processes any remaining probes in later waves, subject to a conservative
-state-payload guard. Distributed mode uses the S3 JSON ItemReader and Standard
+and processes any remaining probes in later waves. Full task descriptors stay
+in an immutable `jobs/<job>/prepare/bounds-tasks/<sha256>.json` S3 snapshot;
+the workflow carries only `inline_task_indices` plus the snapshot key. Each
+invocation loads and validates the snapshot, selects exactly one task, probes
+that SVG, and returns a scalar acknowledgement. Snapshot hashes keep indices
+stable when a planning retry finds more completed probes. A conservative
+state-payload guard applies to the compact index list, not full descriptors.
+Distributed mode uses the same snapshot with the S3 JSON ItemReader and Standard
 SQS callback children, keeping the task list out of workflow payloads. Both
 paths form a completion barrier; an empty task list bypasses both Maps. Finish
 verifies every required result again before calculating the shared canvas.
+Legacy direct events with full tasks and exporter SQS messages remain supported.
+Deploy both the workflow definition and Rust pipeline image for the new handoff;
+no request toggles, cache identities, or ARM64 settings change.
 Raster tasks reference one `svg_key` and verified hash, not a duplicate-frame
 archive; the raster worker still accepts legacy `bundle_key` tasks.
 

@@ -4,7 +4,7 @@ use aqw_render_pipeline::{
     config::Config,
     contract::string,
     control::Control,
-    model::{ProbeConfig, ProbeTask},
+    model::ProbeConfig,
     store::{self, Store},
 };
 use lambda_runtime::{service_fn, LambdaEvent};
@@ -179,21 +179,11 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                         )
                         .await
                     } else {
-                        async {
-                            anyhow::ensure!(
-                                payload["phase"] == "probe",
-                                "invalid direct bounds event"
-                            );
-                            let task: ProbeTask = serde_json::from_value(payload["task"].clone())?;
-                            Ok(serde_json::to_value(
-                                pipeline::bounds::run_probe(
-                                    store.as_ref(),
-                                    &control.config.work_bucket,
-                                    &task,
-                                )
-                                .await?,
-                            )?)
-                        }
+                        pipeline::bounds::run_inline_probe(
+                            store.as_ref(),
+                            &control.config.work_bucket,
+                            &payload,
+                        )
                         .await
                     }
                 }

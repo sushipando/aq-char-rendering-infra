@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from boto3.dynamodb.types import TypeSerializer
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from test_contracts_and_core import request_payload
 
 from aqw_char_renderer.contracts import JobRequest
@@ -40,6 +40,13 @@ def test_acquire_is_one_transaction_for_unique_job_and_user_counter() -> None:
     assert len(transaction) == 2
     assert transaction[0]["Put"]["ConditionExpression"] == "attribute_not_exists(PK)"
     assert "active_count < :limit" in transaction[1]["Update"]["ConditionExpression"]
+    admitted = {
+        key: TypeDeserializer().deserialize(value)
+        for key, value in transaction[0]["Put"]["Item"].items()
+    }
+    assert admitted["request_origin"] == "cli"
+    assert admitted["request"] == request.to_dict()
+    assert "request_origin" not in admitted["request"]
 
 
 def test_release_is_atomic_and_does_not_send_unused_expression_values() -> None:

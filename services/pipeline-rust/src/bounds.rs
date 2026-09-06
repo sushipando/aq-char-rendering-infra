@@ -8,7 +8,8 @@ use anyhow::{ensure, Context, Result};
 use aqw_component_raster::svg;
 use futures::{stream, StreamExt, TryStreamExt};
 use resvg::{tiny_skia, usvg};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::{
     model::*,
@@ -57,7 +58,87 @@ impl BoundsMode {
 
 // Step Functions caps state input/output at 256 KiB. Leave room for the
 // request, prepare result, and source-export results surrounding this field.
-const INLINE_TASK_PAYLOAD_LIMIT_BYTES: usize = 160 * 1024;
+const INLINE_INDEX_PAYLOAD_LIMIT_BYTES: usize = 160 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeTaskReference {
+    job_id: String,
+    tasks_key: String,
+    task_index: usize,
+}
+
+fn tasks_key(job_id: &str, bytes: &[u8]) -> String {
+    format!(
+        "jobs/{job_id}/prepare/bounds-tasks/{}.json",
+        crate::sha256(bytes)
+    )
+}
+
+async fn referenced_task(
+    store: &dyn Store,
+    bucket: &str,
+    reference: ProbeTaskReference,
+) -> Result<ProbeTask> {
+    let started = Instant::now();
+    ensure!(
+        uuid::Uuid::parse_str(&reference.job_id)?.to_string() == reference.job_id,
+        "invalid bounds reference job id"
+    );
+    store::validate_key(&reference.tasks_key)?;
+    ensure!(
+        reference
+            .tasks_key
+            .starts_with(&format!("jobs/{}/prepare/bounds-tasks/", reference.job_id)),
+        "bounds task dataset belongs to another job"
+    );
+    let bytes = store
+        .get(bucket, &reference.tasks_key)
+        .await?
+        .context("missing bounds task dataset")?;
+    ensure!(
+        reference.tasks_key == tasks_key(&reference.job_id, &bytes),
+        "bounds task dataset checksum mismatch"
+    );
+    let tasks: Vec<ProbeTask> =
+        serde_json::from_slice(&bytes).context("invalid bounds task dataset")?;
+    let task = tasks
+        .into_iter()
+        .nth(reference.task_index)
+        .context("bounds task index out of range")?;
+    task.validate()?;
+    ensure!(
+        task.job_id
+            .as_deref()
+            .is_none_or(|job| job == reference.job_id),
+        "bounds task belongs to another job"
+    );
+    crate::log(
+        "bounds_task_load",
+        json!({
+            "job_id":reference.job_id,"task_index":reference.task_index,
+            "dataset_bytes":bytes.len(),"total_ms":started.elapsed().as_secs_f64()*1000.0
+        }),
+    );
+    Ok(task)
+}
+
+/// Direct Inline Map invocation. Legacy full tasks remain readable for
+/// executions already in flight; SQS continues using its existing contract.
+pub async fn run_inline_probe(store: &dyn Store, bucket: &str, event: &Value) -> Result<Value> {
+    crate::contract::keys(event, &["phase", "task", "task_ref"])?;
+    ensure!(event["phase"] == "probe", "invalid direct bounds event");
+    let task = match (event.get("task"), event.get("task_ref")) {
+        (Some(task), None) => serde_json::from_value(task.clone())?,
+        (None, Some(reference)) => {
+            referenced_task(store, bucket, serde_json::from_value(reference.clone())?).await?
+        }
+        _ => anyhow::bail!("bounds event must contain exactly one task or task_ref"),
+    };
+    run_probe(store, bucket, &task).await?;
+    // Results are durable in S3. Do not accumulate bounds records in Map output.
+    Ok(json!(0))
+}
 
 fn dimension(value: Option<&str>) -> Result<f64> {
     let raw = value.context("SVG dimension missing")?.trim();
@@ -411,20 +492,25 @@ pub async fn plan(
         .try_collect()
         .await?;
     let missing: Vec<_> = checks.into_iter().flatten().collect();
-    let inline_tasks = match mode {
+    let inline_task_indices = match mode {
         BoundsMode::Inline => {
-            let encoded_size = serde_json::to_vec(&missing)?.len();
+            let indices: Vec<usize> = (0..missing.len()).collect();
+            let encoded_size = serde_json::to_vec(&indices)?.len();
             ensure!(
-                encoded_size <= INLINE_TASK_PAYLOAD_LIMIT_BYTES,
-                "inline bounds task payload is {encoded_size} bytes, above the safe {}-byte limit; resubmit with --bounds-mode distributed",
-                INLINE_TASK_PAYLOAD_LIMIT_BYTES
+                encoded_size <= INLINE_INDEX_PAYLOAD_LIMIT_BYTES,
+                "inline bounds task index payload is {encoded_size} bytes, above the safe {}-byte limit; resubmit with --bounds-mode distributed",
+                INLINE_INDEX_PAYLOAD_LIMIT_BYTES
             );
-            serde_json::to_value(&missing)?
+            serde_json::to_value(indices)?
         }
         BoundsMode::Distributed => serde_json::Value::Null,
     };
     let plan_key = format!("jobs/{job_id}/prepare/bounds-plan.json");
-    let tasks_key = format!("jobs/{job_id}/prepare/bounds-tasks.json");
+    // A retry can find more completed probes and select a different missing
+    // subset. Content-addressed snapshots keep existing indices stable.
+    let task_bytes = serde_json::to_vec(&missing)?;
+    let task_dataset_bytes = task_bytes.len();
+    let tasks_key = tasks_key(job_id, &task_bytes);
     let plan = BoundsPlan {
         schema_version: 1,
         job_id: job_id.into(),
@@ -432,14 +518,16 @@ pub async fn plan(
         source_manifests: source_keys,
         states,
     };
-    store::write(store, bucket, &tasks_key, &missing, false).await?;
+    store
+        .put(bucket, &tasks_key, task_bytes, "application/json", true)
+        .await?;
     store::write(store, bucket, &plan_key, &plan, false).await?;
     crate::log(
         "plan_bounds",
-        json!({"job_id":job_id,"cache_enabled":cache_enabled,"bounds_mode":mode.as_str(),"exported_frames":exported_frames,"unique_states":plan.states.len(),"cache_hits":if cache_enabled {plan.states.len()-missing.len()} else {0},"ready_results":plan.states.len()-missing.len(),"missing_states":missing.len(),"total_ms":started.elapsed().as_secs_f64()*1000.0}),
+        json!({"job_id":job_id,"cache_enabled":cache_enabled,"bounds_mode":mode.as_str(),"exported_frames":exported_frames,"unique_states":plan.states.len(),"cache_hits":if cache_enabled {plan.states.len()-missing.len()} else {0},"ready_results":plan.states.len()-missing.len(),"missing_states":missing.len(),"task_dataset_bytes":task_dataset_bytes,"total_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(
-        json!({"plan_key":plan_key,"tasks_key":tasks_key,"task_count":missing.len(),"bounds_mode":mode.as_str(),"inline_tasks":inline_tasks}),
+        json!({"plan_key":plan_key,"tasks_key":tasks_key,"task_count":missing.len(),"bounds_mode":mode.as_str(),"inline_task_indices":inline_task_indices}),
     )
 }
 

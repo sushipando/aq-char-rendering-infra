@@ -18,6 +18,15 @@ _DESERIALIZER = TypeDeserializer()
 TERMINAL_STATUSES = frozenset({"CACHE_HIT", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
 
 
+def discord_notification_pending(record: Mapping[str, Any]) -> bool:
+    """Only explicit Discord admissions may publish to the bot result queue."""
+    return (
+        record.get("request_origin") == "discord"
+        and record.get("result_payload") is not None
+        and record.get("result_enqueued_at") is None
+    )
+
+
 def _dynamodb_value(value: Any) -> Any:
     if isinstance(value, float):
         return Decimal(str(value))
@@ -48,6 +57,12 @@ class JobStore:
         self.client = client or boto3.client("dynamodb")
 
     def acquire(self, request: JobRequest, maximum_active: int) -> None:
+        """Admit an operator/CLI job, including smoke tests and full restarts.
+
+        Discord interactions use the bot's own admission transaction. Keep
+        origin outside the render request so copying a Discord job's inputs
+        does not also copy permission to send notifications.
+        """
         now = utc_now()
         expires_at = int((datetime.now(UTC) + timedelta(days=35)).timestamp())
         job = {
@@ -57,6 +72,7 @@ class JobStore:
             "user_id": request.discord.user_id,
             "guild_id": request.discord.guild_id or "",
             "channel_id": request.discord.channel_id,
+            "request_origin": "cli",
             "status": "QUEUED",
             "slot_released": False,
             "created_at": request.created_at,

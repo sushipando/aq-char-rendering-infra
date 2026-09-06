@@ -2,6 +2,7 @@
 
 scripts/render-character --restart JOB_ID [--no-render-cache | --no-cache]
 No redrive, no compose-only branch, and no copying old raster artifacts.
+CLI results never post to Discord, even when the original job came from Discord.
 """
 
 from __future__ import annotations

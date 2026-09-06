@@ -541,19 +541,26 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       resultPath: '$.bounds',
     }).addRetry(lambdaRetry);
     const inlineProbeMap = new sfn.Map(this, 'ProbeUniqueStatesInline', {
-      itemsPath: '$.bounds.inline_tasks',
+      itemsPath: '$.bounds.inline_task_indices',
       maxConcurrency: tuning.boundsInlineConcurrency,
       resultPath: sfn.JsonPath.DISCARD,
+      itemSelector: {
+        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+        tasks_key: sfn.JsonPath.stringAt('$.bounds.tasks_key'),
+        task_index: sfn.JsonPath.numberAt('$$.Map.Item.Value'),
+      },
     });
     inlineProbeMap.itemProcessor(
       new tasks.LambdaInvoke(this, 'ProbeUniqueStateInline', {
         lambdaFunction: functions.bounds,
         payload: sfn.TaskInput.fromObject({
           phase: 'probe',
-          task: sfn.JsonPath.objectAt('$'),
+          task_ref: sfn.JsonPath.objectAt('$'),
         }),
         payloadResponseOnly: true,
-        resultPath: sfn.JsonPath.DISCARD,
+        // Trim each iteration before aggregation, not only the Map result.
+        resultSelector: { ack: 0 },
+        outputPath: '$.ack',
       }).addRetry(lambdaRetry),
     );
 

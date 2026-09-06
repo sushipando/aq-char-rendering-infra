@@ -9,7 +9,7 @@ from typing import Any
 import boto3
 
 from aqw_char_renderer.config import RuntimeConfig
-from aqw_char_renderer.jobs import JobStore
+from aqw_char_renderer.jobs import JobStore, discord_notification_pending
 from aqw_char_renderer.structured_logging import log_event
 
 _STATUS_MAP = {"FAILED": "FAILED", "TIMED_OUT": "TIMED_OUT", "ABORTED": "ABORTED"}
@@ -51,8 +51,9 @@ def _release_failure(
         status,
         attributes={"error_code": f"WORKFLOW_{status}", "result_payload": payload},
     )
-    if released:
-        _publish(config, payload)
+    current = jobs.get(record["job_id"]) or {}
+    if discord_notification_pending(current):
+        _publish(config, current["result_payload"])
         jobs.mark_result_enqueued(record["job_id"])
     return released
 
@@ -66,7 +67,7 @@ def _scheduled_reconcile(config: RuntimeConfig, jobs: JobStore) -> dict[str, Any
         job_id = str(record.get("job_id") or "")
         if not job_id:
             continue
-        if record.get("result_payload") and not record.get("result_enqueued_at"):
+        if discord_notification_pending(record):
             _publish(config, record["result_payload"])
             jobs.mark_result_enqueued(job_id)
             requeued.append(job_id)

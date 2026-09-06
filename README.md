@@ -220,7 +220,12 @@ FFDec, SVG, PNG, and WebP work remains in Lambda.
 - Standard workflow retries and deterministic job IDs make launches
   idempotent.
 - Terminal failures and scheduled reconciliation release leaked slots.
-- The bot deletes a result message only after Discord delivery is recorded.
+- Only jobs admitted by the bot (`request_origin=discord` on the DynamoDB job
+  record) publish to the Discord result queue. CLI jobs, including restarts and
+  smoke/deploy smoke tests, use `request_origin=cli` and remain silent.
+- The bot independently checks the admitted origin before posting. It deletes
+  Discord results after recording delivery, and silently acknowledges any CLI
+  or unmarked legacy results queued by older deployments.
 - S3 work objects expire after two days and renders after thirty days by
   default.
 - The AWS Budget notification turns off the SSM admission switch, disables the
@@ -253,7 +258,8 @@ docs/                 architecture and operating documentation
 `scripts/render-character` queues real character renders through the deployed
 workflow (same SQS + DynamoDB admission as the Discord bot) and waits for the
 delivered CloudFront WebP. It supplies the dev AWS profile, Region, and `uv`
-command automatically:
+command automatically. Successes and failures are reported on the command line,
+never posted to Discord:
 
 ```bash
 scripts/render-character alina -s 1024 -n 30 -q 70 -m 2
@@ -286,8 +292,16 @@ Restart goes through the same DynamoDB admission → SQS → launcher →
 `PrepareResolve` path as any normal job. It is not redrive or compose-only resume:
 no old rasters are copied, and the old job is not modified. The original cache
 settings apply by default, including `CachedResultExists`; cache hits can still
-skip work. Individual cache-disable flags are also available. The normal result
-notification targets the original Discord user/channel.
+skip work. Individual cache-disable flags are also available. Restarts retain
+the original user ID for admission limits, but never notify the original
+Discord user/channel. The new admission is always CLI-origin; origin is not
+copied from the old job or included in render/cache identity.
+
+For notification-policy rollout, update/restart the Discord bot before deploying
+the renderer changes. The updated bot also suppresses CLI results from older
+renderer deployments, so silencing them does not require waiting for deployment.
+Legacy jobs without an explicit origin are silent, even if originally submitted
+through Discord; new Discord jobs retain normal delivery across bot restarts.
 
 The command reads the hydrated execution request, preserving the original asset
 selection rather than fetching today's equipment. When the request did not
@@ -310,8 +324,11 @@ not an accumulated raster-results array. This works for both raster Map modes.
 switches, and both default to `inline`. Each is stored on the submitted job;
 the state machine never selects a mode from task count. Inline Maps run up to
 40 iterations concurrently and process additional work in later waves. Bounds
-planning fails with instructions to use distributed mode if its inline task
-data would make the Step Functions state unsafe. Use `--no-cache` when
+task details live in an immutable S3 snapshot; the inline Map carries only
+numeric task indices and returns scalar acknowledgements. Each invocation
+still probes one SVG. The payload guard applies to the compact indices, so
+hundreds of full task descriptions no longer overflow the inline handoff.
+Use `--no-cache` when
 comparing modes so a render, bounds, or component cache hit cannot bypass work.
 
 `--no-cache` forces a benchmark render to bypass every cross-job compute cache.

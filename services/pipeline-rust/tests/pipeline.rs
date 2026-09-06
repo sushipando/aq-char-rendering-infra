@@ -170,13 +170,13 @@ async fn global_dedup_barrier_cache_and_direct_component_contract() -> Result<()
     let (request, planned) = synthetic(&store).await?;
     assert_eq!(planned["task_count"], 2); // Two states across two symbols / 32 exported frames.
     assert_eq!(planned["bounds_mode"], "inline");
-    assert_eq!(planned["inline_tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(planned["inline_task_indices"], json!([0, 1]));
     let event = json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]});
     assert!(finish::finish(&store, &config(), &event).await.is_err());
     let tasks: Vec<ProbeTask> =
         store::read(&store, "work", planned["tasks_key"].as_str().unwrap()).await?;
-    for task in &tasks {
-        bounds::run_probe(&store, "work", task).await?;
+    for index in planned["inline_task_indices"].as_array().unwrap() {
+        assert_eq!(bounds::run_inline_probe(&store, "work", &json!({"phase":"probe","task_ref":{"job_id":JOB,"tasks_key":planned["tasks_key"],"task_index":index}})).await?, json!(0));
     }
     let prepared = finish::finish(&store, &config(), &event).await?;
     assert_eq!(prepared["frame_count"], 8);
@@ -313,7 +313,8 @@ async fn cache_bypass_uses_job_scoped_bounds_and_explicit_fanout_modes() -> Resu
     .await?;
     assert_eq!(uncached["task_count"], 2);
     assert_eq!(uncached["bounds_mode"], "inline");
-    let tasks: Vec<ProbeTask> = serde_json::from_value(uncached["inline_tasks"].clone())?;
+    assert_eq!(uncached["inline_task_indices"], json!([0, 1]));
+    let tasks: Vec<ProbeTask> = store::read(&store, "work", uncached["tasks_key"].as_str().unwrap()).await?;
     assert!(tasks.iter().all(|task| {
         !task.cache_enabled
             && task
@@ -339,7 +340,7 @@ async fn cache_bypass_uses_job_scoped_bounds_and_explicit_fanout_modes() -> Resu
     // Cache bypass forbids cross-job reuse, but the exporter prefetch and the
     // barrier share this job-scoped result identity.
     assert_eq!(distributed["task_count"], 0);
-    assert!(distributed["inline_tasks"].is_null());
+    assert!(distributed["inline_task_indices"].is_null());
     Ok(())
 }
 
