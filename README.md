@@ -69,10 +69,11 @@ All environment-specific tuning lives in
 - S3/DynamoDB/log retention;
 - queue/workflow timeouts and monthly budget shutdown threshold.
 
-The launcher hydrates sparse requests from this configuration. `/char-hd`
-exposes only a named final-size choice; the bot derives `raster_size` as
-exactly twice `output_size`. Matching sizes from other clients still skip
-resampling, while larger rasters are downsampled once before WebP encoding.
+The launcher hydrates sparse requests from this configuration. The Discord
+`/render` command exposes the render, animation, fan-out, item-override, WebP,
+and per-cache controls. When `raster_size` is omitted, the bot derives it as
+twice `output_size` (capped at 4096). Matching sizes still skip resampling,
+while larger rasters are downsampled once before WebP encoding.
 
 ## Architecture
 
