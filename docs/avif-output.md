@@ -32,7 +32,7 @@ The final key uses `.avif`, the correct content type, and the existing render ca
 
 `aq-image-search` has a companion commit: `/render output_format:AVIF quality:70` selects AVIF, and the existing `webp_lossless` toggle applies to it. WebP defaults to quality 85; AVIF defaults to 70. The API uses integer AVIF quality, so fractional Discord values are rounded for AVIF.
 
-The command already had 25 options. Its single-choice `raster_backend:resvg` control is replaced with `output_format`; it still submits patched resvg. The displayed `webp_quality` option becomes `quality`, while `webp_method` remains WebP-specific. Delivery continues through the existing result URL. Deploy the infrastructure before restarting/syncing the updated bot. Actual Discord animated-AVIF preview behavior still needs checking in the test server. The existing “View Render Info” decoder remains WebP-specific; AVIF does not add embedded character metadata.
+The command already had 25 options. Its single-choice `raster_backend:resvg` control is replaced with `output_format`; it still submits patched resvg. The displayed `webp_quality` option becomes `quality`, while `webp_method` remains WebP-specific. Delivery continues through the existing result URL. Deploy the infrastructure before restarting/syncing the updated bot. Actual Discord animated-AVIF preview behavior still needs checking in the test server. Both formats now carry embedded character/item metadata and the generating job ID; see [render metadata](render-file-metadata.md).
 
 ## Deployment render checks
 

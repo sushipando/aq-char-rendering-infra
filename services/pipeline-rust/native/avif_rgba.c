@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void fail(const char *message) { fprintf(stderr, "avif-rgba: %s\n", message); exit(1); }
 static void check(avifResult result) { if (result != AVIF_RESULT_OK) fail(avifResultToString(result)); }
@@ -15,7 +16,7 @@ static uint32_t number(void) {
     return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
 }
 int main(int argc, char **argv) {
-    if (argc != 2) fail("usage: avif-rgba OUTPUT.avif");
+    if (argc != 2 && argc != 3) fail("usage: avif-rgba OUTPUT.avif [METADATA.xmp]");
     uint32_t w = number(), h = number(), count = number(), quality = number();
     uint32_t speed = number(), lossless = number(), threads = number(), animated = number();
     if (!w || !h || w > 4096 || h > 4096 || !count || count > 2000 || quality > 100 || speed > 10 ||
@@ -26,6 +27,17 @@ int main(int argc, char **argv) {
     avifImage *image = avifImageCreate(w, h, 8, AVIF_PIXEL_FORMAT_YUV444);
     avifEncoder *encoder = avifEncoderCreate();
     if (!pixels || !durations || !image || !encoder) fail("allocation failed");
+    uint8_t xmp[65537];
+    size_t xmp_size = 0;
+    if (argc == 3) {
+        FILE *metadata = fopen(argv[2], "rb");
+        if (!metadata) fail("cannot read XMP");
+        xmp_size = fread(xmp, 1, sizeof(xmp), metadata);
+        int read_error = ferror(metadata);
+        fclose(metadata);
+        if (read_error || !xmp_size || xmp_size > 65536) fail("invalid XMP size");
+        check(avifImageSetMetadataXMP(image, xmp, xmp_size));
+    }
     image->yuvRange = AVIF_RANGE_FULL;
     image->colorPrimaries = AVIF_COLOR_PRIMARIES_BT709;
     image->transferCharacteristics = AVIF_TRANSFER_CHARACTERISTICS_SRGB;
@@ -78,6 +90,7 @@ int main(int argc, char **argv) {
     if (decoder->image->width != w || decoder->image->height != h || decoder->imageCount != (int)count ||
         decoder->image->depth != 8 || decoder->image->yuvFormat != AVIF_PIXEL_FORMAT_YUV444 ||
         decoder->image->alphaPremultiplied) fail("encoded image properties mismatch");
+    if (decoder->image->xmp.size != xmp_size || (xmp_size && memcmp(decoder->image->xmp.data, xmp, xmp_size))) fail("encoded XMP mismatch");
     if (animated) {
         if (!decoder->imageSequenceTrackPresent || decoder->timescale != 1000 || decoder->durationInTimescales != total ||
             decoder->repetitionCount != AVIF_REPETITION_COUNT_INFINITE) fail("encoded animation timing/loop mismatch");

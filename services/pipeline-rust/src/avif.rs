@@ -152,6 +152,8 @@ pub async fn finalize(
     );
     let temporary = tempfile::tempdir()?;
     let output = temporary.path().join("result.avif");
+    let xmp = temporary.path().join("render.xmp");
+    tokio::fs::write(&xmp, crate::metadata::packet(prepared)?).await?;
     let stderr = std::fs::File::create(temporary.path().join("encoder.stderr"))?;
     let stdout = std::fs::File::create(temporary.path().join("encoder.json"))?;
     let mut child = tokio::process::Command::new(crate::config::env(
@@ -159,6 +161,7 @@ pub async fn finalize(
         "/opt/avif/avif-rgba",
     ))
     .arg(&output)
+    .arg(&xmp)
     .stdin(Stdio::piped())
     .stderr(stderr)
     .stdout(stdout)
@@ -240,7 +243,7 @@ pub async fn finalize(
     );
     let result = json!({"url":format!("{}/{final_key}",config.public_base_url),"output_format":"avif",
         "frame_count":count,"logical_frame_count":count,"physical_frame_count":runs.len(),"merged_frame_count":count-runs.len(),
-        "finalize_policy":POLICY,"width":width,"height":height,"duration_ms":duration,"bytes":bytes.len(),
+        "finalize_policy":POLICY,"metadata_job_id":job,"metadata_policy":crate::metadata::POLICY,"width":width,"height":height,"duration_ms":duration,"bytes":bytes.len(),
         "cache_hit":false,"render_hash":prepared["render_hash"],"final_key":final_key});
     store
         .put(&config.work_bucket, final_key, bytes, "image/avif", false)

@@ -728,7 +728,8 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     let hash = crate::digest(
         &json!({"schema_version":1,"renderer_version":config.renderer_version,"character_renderer_sha256":character.sha256,"ffdec_version":FFDEC_VERSION,"export_policy":EXPORT_POLICY,"finalize_policy":FINALIZE_POLICY,"libwebp_version":"1.5.0","asset_dataset_version":config.dataset_version,"appearance":{"gender":gender,"visibility":fields.get("ia1"),"colors":fields.iter().filter(|(k,_)|k.starts_with("intColor")).collect::<BTreeMap<_,_>>(),"assets":assets,"sources":sources,"override":settings["override"]},"settings":settings,"bounds_policy":BOUNDS_POLICY}),
     )?;
-    let hash = crate::digest(&(&hash, aqw_component_raster::region::POLICY))?;
+    let metadata = crate::metadata::display(&serde_json::to_value(&fields)?, settings)?;
+    let hash = crate::digest(&(&hash, aqw_component_raster::region::POLICY, crate::metadata::POLICY, metadata))?;
     let avif = settings["output_format"] == "avif";
     let hash = if avif { crate::digest(&(&hash, crate::avif::POLICY))? } else { hash };
     let extension = if avif { "avif" } else { "webp" };

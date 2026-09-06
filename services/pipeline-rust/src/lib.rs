@@ -11,6 +11,7 @@ pub mod finalize;
 pub mod finish;
 pub mod geometry;
 pub mod jobs;
+pub mod metadata;
 pub mod model;
 pub mod queue;
 pub mod resolve;

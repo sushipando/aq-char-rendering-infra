@@ -351,6 +351,7 @@ pub async fn finalize(store: &dyn Store, config: &Config, event: &Value) -> Resu
         );
         tokio::fs::read(&output).await?
     };
+    let bytes = webp::with_xmp(&bytes, &crate::metadata::packet(&prepared)?)?;
     let mux_ms = mux_started.elapsed().as_secs_f64() * 1000.0;
     validate_schedule(
         &bytes,
@@ -359,7 +360,7 @@ pub async fn finalize(store: &dyn Store, config: &Config, event: &Value) -> Resu
         count == 1,
     )?;
     let final_key = string(&prepared, "final_key")?;
-    let result = json!({"url":format!("{}/{final_key}",config.public_base_url),"frame_count":count,"logical_frame_count":count,"physical_frame_count":runs.len(),"merged_frame_count":count-runs.len(),"finalize_policy":FINALIZE_POLICY,"width":canvas[0],"height":canvas[1],"duration_ms":durations.iter().map(|d|*d as u64).sum::<u64>(),"bytes":bytes.len(),"cache_hit":false,"render_hash":prepared["render_hash"],"final_key":final_key});
+    let result = json!({"url":format!("{}/{final_key}",config.public_base_url),"frame_count":count,"logical_frame_count":count,"physical_frame_count":runs.len(),"merged_frame_count":count-runs.len(),"finalize_policy":FINALIZE_POLICY,"metadata_job_id":job,"metadata_policy":crate::metadata::POLICY,"width":canvas[0],"height":canvas[1],"duration_ms":durations.iter().map(|d|*d as u64).sum::<u64>(),"bytes":bytes.len(),"cache_hit":false,"render_hash":prepared["render_hash"],"final_key":final_key});
     // Single PutObject is atomic; publish cache metadata only after validation
     // and a complete successful image write. No temporary S3 copy required.
     store

@@ -475,7 +475,7 @@ async fn incident_ground_cold_export_and_warm_cache() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires AQW_TEST_CWEBP and CHAR_RENDER_WEBPMUX"]
+#[ignore = "requires AQW_TEST_CWEBP, CHAR_RENDER_WEBPMUX and AQW_TEST_PYTHON with Pillow"]
 async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
     full_pipeline_format("webp").await
 }
@@ -495,6 +495,10 @@ async fn full_pipeline_format(format: &str) -> Result<()> {
         let mut test_config = config();
         test_config.compose_concurrency = 1;
         let (mut request, planned) = synthetic(&store).await?;
+        let mut input: Value = store::read(&store, "work", "jobs/input.json").await?;
+        input["fields"] = json!({"strName":"Test & Character","strClassName":"Mage","level":"42","guild":"Guild",
+            "strCapeFile":"cape.swf","strCapeName":"Cape <Blue>","strMiscFile":"rune.swf","strMiscName":"Rune & Stars","intColorHair":"16711680"});
+        store::write(&store, "work", "jobs/input.json", &input, false).await?;
         if format == "avif" {
             request["render"]["output_format"] = "avif".into();
             request["render"]["webp_lossless"] = true.into();
@@ -558,6 +562,21 @@ async fn full_pipeline_format(format: &str) -> Result<()> {
         assert_eq!(finalized["logical_frame_count"], frame_count);
         assert!(finalized["physical_frame_count"].as_u64().unwrap() <= frame_count);
         assert!(finalized["bytes"].as_u64().unwrap() > 0);
+        let image_path = temporary.path().join("work").join(finalized["final_key"].as_str().unwrap());
+        let metadata_check = tokio::process::Command::new(std::env::var("AQW_TEST_PYTHON")?)
+            .arg("-c").arg(r#"
+import sys, xml.etree.ElementTree as ET
+from PIL import Image
+im=Image.open(sys.argv[1]); xmp=im.info['xmp']
+root=ET.fromstring(xmp); ns={'a':'http://aqw.char/info/1.0/','r':'http://www.w3.org/1999/02/22-rdf-syntax-ns#'}
+d=root.find('.//r:Description',ns)
+assert d.find('a:jobId',ns).text==sys.argv[2]
+assert d.find('a:name',ns).text=='Test & Character'
+assert d.find('a:level',ns).text=='42'
+assert d.find('a:items/r:Seq/r:li[a:slot="Cape"]/a:name',ns).text=='Cape <Blue>'
+assert d.find('a:items/r:Seq/r:li[a:slot="Rune"]/a:name',ns).text=='Rune & Stars'
+"#).arg(&image_path).arg(job).output().await?;
+        assert!(metadata_check.status.success(), "{}", String::from_utf8_lossy(&metadata_check.stderr));
         if format == "avif" {
             let mut records = Vec::new();
             for result in &rendered {

@@ -20,7 +20,10 @@ class AvifRgbaTest(unittest.TestCase):
         data = header + b"".join(struct.pack("<I", duration) + frame for duration, frame in zip(durations, frames))
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "image.avif"
-            result = subprocess.run([os.environ["CHAR_RENDER_AVIF_RGBA"], str(output)], input=data, capture_output=True, timeout=60)
+            xmp = b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:aqw="http://aqw.char/info/1.0/"><aqw:jobId>job-test</aqw:jobId></rdf:Description></rdf:RDF></x:xmpmeta>'
+            metadata = Path(root) / "render.xmp"
+            metadata.write_bytes(xmp)
+            result = subprocess.run([os.environ["CHAR_RENDER_AVIF_RGBA"], str(output), str(metadata)], input=data, capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             report = json.loads(result.stdout)
             encoded = output.read_bytes()
@@ -28,6 +31,7 @@ class AvifRgbaTest(unittest.TestCase):
         self.assertEqual(report["physical_frame_count"], len(frames))
         self.assertEqual(report["bytes"], len(encoded))
         image = Image.open(io.BytesIO(encoded))
+        self.assertEqual(image.info.get("xmp"), xmp)
         self.assertEqual(image.size, (width, height))
         self.assertEqual(image.n_frames, len(frames))
         decoded = []

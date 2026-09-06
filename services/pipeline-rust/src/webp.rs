@@ -354,3 +354,26 @@ mod tests {
         assert!(single_frame_animation(&original, [8, 6], frame()).is_err());
     }
 }
+
+/// Add/replace final-file XMP without touching compressed pixels or timing.
+pub fn with_xmp(bytes: &[u8], xmp: &[u8]) -> Result<Vec<u8>> {
+    ensure!(!xmp.is_empty() && xmp.len() <= 65536, "invalid XMP size");
+    let info = inspect(bytes)?;
+    let mut output = Vec::from(b"RIFF\0\0\0\0WEBP");
+    let mut extended = vec![info.flags | 4, 0, 0, 0];
+    put24(&mut extended, info.canvas[0] - 1)?;
+    put24(&mut extended, info.canvas[1] - 1)?;
+    chunk(&mut output, b"VP8X", &extended)?;
+    for existing in container(bytes)? {
+        if !matches!(existing.kind, b"VP8X" | b"XMP ") {
+            chunk(&mut output, existing.kind, existing.data)?;
+        }
+    }
+    chunk(&mut output, b"XMP ", xmp)?;
+    let size = u32::try_from(output.len() - 8)?;
+    output[4..8].copy_from_slice(&size.to_le_bytes());
+    let actual = inspect(&output)?;
+    ensure!(actual.has_metadata && actual.canvas == info.canvas && actual.frames == info.frames &&
+        actual.loop_count == info.loop_count && actual.background == info.background, "XMP changed WebP schedule");
+    Ok(output)
+}
