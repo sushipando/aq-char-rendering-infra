@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 ///   "job_id": "...",
 ///   "manifest_key": "jobs/.../prepare/manifest.json",
 ///   "component_results": [...],
-///   "batch": {"index": 0, "frame_start": 1, "frame_end": 10}
+///   "batch": {"index": 0, "composition_start": 0, "composition_end": 0}
 /// }
 /// ```
 ///
@@ -33,8 +33,14 @@ pub struct ComposeEvent {
 #[derive(Clone, Debug, Deserialize)]
 pub struct BatchIndex {
     pub index: i64,
-    pub frame_start: i64,
-    pub frame_end: i64,
+    #[serde(default)]
+    pub frame_start: Option<i64>,
+    #[serde(default)]
+    pub frame_end: Option<i64>,
+    #[serde(default)]
+    pub composition_start: Option<usize>,
+    #[serde(default)]
+    pub composition_end: Option<usize>,
 }
 
 /// One compact component workflow result (the same fields
@@ -70,6 +76,8 @@ pub struct PrepareManifest {
     #[serde(default)]
     pub component_raster_space: Option<String>,
     pub component_frames: Vec<ComponentFrame>,
+    #[serde(default)]
+    pub component_compositions: Vec<ComponentComposition>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,6 +96,15 @@ pub struct ComponentFrame {
     pub layers: Vec<String>,
     #[serde(default)]
     pub duration_ms: Option<i64>,
+}
+
+/// One exact full-frame pixel recipe and every logical animation frame that
+/// uses it. `canonical_frame` owns the single encoded WebP object.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ComponentComposition {
+    pub canonical_frame: i64,
+    pub layers: Vec<String>,
+    pub logical_frames: Vec<i64>,
 }
 
 /// One record in the compose-batch manifest; the finalizer consumes
@@ -156,12 +173,27 @@ mod tests {
         let event: ComposeEvent = serde_json::from_str(raw).unwrap();
         assert_eq!(event.job_id, "job-1");
         assert_eq!(event.batch.index, 0);
-        assert_eq!(event.batch.frame_start, 1);
-        assert_eq!(event.batch.frame_end, 10);
+        assert_eq!(event.batch.frame_start, Some(1));
+        assert_eq!(event.batch.frame_end, Some(10));
+        assert_eq!(event.batch.composition_start, None);
         assert_eq!(event.component_results.len(), 2);
         assert!(event.component_results[1].empty);
         assert!(event.component_results[1].png_key.is_none());
         assert!(event.benchmark_output_prefix.is_none());
+    }
+
+    #[test]
+    fn parses_a_unique_composition_batch() {
+        let raw = r#"{
+            "job_id": "job-1",
+            "manifest_key": "jobs/job-1/prepare/manifest.json",
+            "component_results": [],
+            "batch": {"index": 3, "composition_start": 7, "composition_end": 7}
+        }"#;
+        let event: ComposeEvent = serde_json::from_str(raw).unwrap();
+        assert_eq!(event.batch.frame_start, None);
+        assert_eq!(event.batch.composition_start, Some(7));
+        assert_eq!(event.batch.composition_end, Some(7));
     }
 
     #[test]

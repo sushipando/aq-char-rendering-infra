@@ -58,7 +58,11 @@ pub struct ChunkStats {
     pub batch: i64,
     pub frame_start: i64,
     pub frame_end: i64,
+    /// Number of expensive composition/WebP encode operations performed.
     pub frames_rendered: i64,
+    pub unique_frames_encoded: i64,
+    pub logical_frames_emitted: i64,
+    pub deduplicated_frames: i64,
     pub referenced_component_count: usize,
     pub downloaded_png_count: usize,
     pub png_bytes: u64,
@@ -89,6 +93,21 @@ pub fn log_profile(stats: &ChunkStats) {
     field(&mut fields, "frame_start", stats.frame_start);
     field(&mut fields, "frame_end", stats.frame_end);
     field(&mut fields, "frames_rendered", stats.frames_rendered);
+    field(
+        &mut fields,
+        "unique_frames_encoded",
+        stats.unique_frames_encoded,
+    );
+    field(
+        &mut fields,
+        "logical_frames_emitted",
+        stats.logical_frames_emitted,
+    );
+    field(
+        &mut fields,
+        "deduplicated_frames",
+        stats.deduplicated_frames,
+    );
     field(
         &mut fields,
         "referenced_component_count",
@@ -158,6 +177,11 @@ pub fn log_profile(stats: &ChunkStats) {
         "ms_per_frame",
         rounded_ms(stats.total_ms / stats.frames_rendered.max(1) as f64),
     );
+    field(
+        &mut fields,
+        "ms_per_logical_frame",
+        rounded_ms(stats.total_ms / stats.logical_frames_emitted.max(1) as f64),
+    );
     log_json(fields);
 }
 
@@ -174,8 +198,18 @@ pub fn log_complete(
     field(&mut fields, "event", "component_compose_complete");
     field(&mut fields, "job_id", job_id.to_string());
     field(&mut fields, "batch", batch);
-    field(&mut fields, "frame_start", batch_index.frame_start);
-    field(&mut fields, "frame_end", batch_index.frame_end);
+    if let Some(frame_start) = batch_index.frame_start {
+        field(&mut fields, "frame_start", frame_start);
+    }
+    if let Some(frame_end) = batch_index.frame_end {
+        field(&mut fields, "frame_end", frame_end);
+    }
+    if let Some(composition_start) = batch_index.composition_start {
+        field(&mut fields, "composition_start", composition_start);
+    }
+    if let Some(composition_end) = batch_index.composition_end {
+        field(&mut fields, "composition_end", composition_end);
+    }
     field(&mut fields, "compositor", compositor.to_string());
     field(&mut fields, "cold_start", cold_start);
     field(&mut fields, "module_age_ms", rounded_ms(module_age_ms));

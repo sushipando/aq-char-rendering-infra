@@ -11,6 +11,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn unique_webps(frames: &BTreeMap<u64, Value>) -> Result<BTreeMap<String, (String, usize)>> {
+    let mut unique = BTreeMap::new();
+    for frame in frames.values() {
+        let key = string(frame, "webp_key")?.to_string();
+        let expected = (
+            string(frame, "sha256")?.to_string(),
+            integer(frame, "bytes", 1, usize::MAX as u64)? as usize,
+        );
+        if let Some(existing) = unique.insert(key.clone(), expected.clone()) {
+            ensure!(
+                existing == expected,
+                "encoded WebP key has conflicting checksum or size: {key}"
+            );
+        }
+    }
+    Ok(unique)
+}
+
 fn uint24(data: &[u8]) -> Result<u32> {
     ensure!(data.len() >= 3, "truncated WebP integer");
     Ok(data[0] as u32 | (data[1] as u32) << 8 | (data[2] as u32) << 16)
@@ -160,26 +178,41 @@ pub async fn finalize(store: &dyn Store, config: &Config, event: &Value) -> Resu
         durations.push(duration);
     }
     let temporary = tempfile::tempdir()?;
-    let paths: Vec<_> = stream::iter(frames.values())
-        .map(|frame| {
+    let unique = unique_webps(&frames)?;
+    let downloaded: Vec<_> = stream::iter(unique.into_iter().enumerate())
+        .map(|(index, (key, (sha256, expected_bytes)))| {
             let root = temporary.path();
             async move {
                 let bytes = store
-                    .get(&config.work_bucket, string(frame, "webp_key")?)
+                    .get(&config.work_bucket, &key)
                     .await?
                     .context("missing encoded WebP")?;
                 ensure!(
-                    crate::sha256(&bytes) == string(frame, "sha256")?,
+                    crate::sha256(&bytes) == sha256,
                     "encoded WebP checksum mismatch"
                 );
-                let path = root.join(format!("{}.webp", frame["frame"]));
+                ensure!(
+                    bytes.len() == expected_bytes,
+                    "encoded WebP byte length mismatch"
+                );
+                let path = root.join(format!("unique-{index:06}.webp"));
                 tokio::fs::write(&path, bytes).await?;
-                Ok::<_, anyhow::Error>(path)
+                Ok::<_, anyhow::Error>((key, path))
             }
         })
         .buffered(config.download_concurrency)
         .try_collect()
         .await?;
+    let downloaded: BTreeMap<_, _> = downloaded.into_iter().collect();
+    let paths: Vec<_> = frames
+        .values()
+        .map(|frame| {
+            downloaded
+                .get(string(frame, "webp_key")?)
+                .cloned()
+                .context("encoded WebP was not downloaded")
+        })
+        .collect::<Result<_>>()?;
     let output = temporary.path().join("result.webp");
     let mut command = tokio::process::Command::new(crate::config::env(
         "CHAR_RENDER_WEBPMUX",
@@ -230,4 +263,39 @@ pub async fn finalize(store: &dyn Store, config: &Config, event: &Value) -> Resu
         json!({"job_id":job,"frame_count":count,"output_bytes":result["bytes"],"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_webps;
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn collapses_alias_records_to_one_download() {
+        let frames: BTreeMap<u64, Value> = BTreeMap::from([
+            (1, json!({"webp_key":"same.webp","sha256":"abc","bytes":12})),
+            (
+                11,
+                json!({"webp_key":"same.webp","sha256":"abc","bytes":12}),
+            ),
+            (
+                12,
+                json!({"webp_key":"other.webp","sha256":"def","bytes":9}),
+            ),
+        ]);
+        assert_eq!(unique_webps(&frames).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejects_conflicting_metadata_for_one_key() {
+        let frames: BTreeMap<u64, Value> = BTreeMap::from([
+            (1, json!({"webp_key":"same.webp","sha256":"abc","bytes":12})),
+            (
+                2,
+                json!({"webp_key":"same.webp","sha256":"different","bytes":12}),
+            ),
+        ]);
+        assert!(unique_webps(&frames).is_err());
+    }
 }

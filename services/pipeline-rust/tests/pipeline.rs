@@ -179,12 +179,30 @@ async fn global_dedup_barrier_cache_and_direct_component_contract() -> Result<()
     }
     let prepared = finish::finish(&store, &config(), &event).await?;
     assert_eq!(prepared["frame_count"], 8);
+    assert_eq!(prepared["unique_composition_count"], 2);
+    assert_eq!(
+        prepared["component_batches"],
+        json!([{"index":0,"composition_start":0,"composition_end":1}])
+    );
     assert_eq!(
         prepared["component_task_indices"].as_array().unwrap().len(),
         4
     ); // two placements x two states
     let manifest: Value =
         store::read(&store, "work", prepared["manifest_key"].as_str().unwrap()).await?;
+    assert_eq!(manifest["component_compose_schema"], 2);
+    assert_eq!(
+        manifest["component_compositions"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        manifest["component_compositions"][0]["logical_frames"],
+        json!([1, 3, 5, 7])
+    );
+    assert_eq!(
+        manifest["component_compositions"][1]["logical_frames"],
+        json!([2, 4, 6, 8])
+    );
     assert!(manifest["component_tasks"]
         .as_array()
         .unwrap()

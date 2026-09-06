@@ -330,3 +330,85 @@ fn local_mode_rejects_missing_png() {
     );
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+#[tokio::test]
+async fn unique_composition_encodes_once_and_emits_every_logical_frame() {
+    let Some(cwebp) = cwebp() else {
+        eprintln!("skipping dedup encode test: cwebp not found");
+        return;
+    };
+    let temp = unique_dir("dedup");
+    let _ = std::fs::remove_dir_all(&temp);
+    let mut fixture = Fixture::new(temp.clone());
+    fixture.add("red", 40, 40, [255, 0, 0, 255], 10, 10, false);
+    let frames = vec![
+        serde_json::json!({"number":1,"layers":["red"],"duration_ms":40}),
+        serde_json::json!({"number":2,"layers":["red"],"duration_ms":55}),
+    ];
+    fixture.write_manifest(&frames);
+    let manifest_path = fixture.root.join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["frame_durations"] = serde_json::json!([40, 55]);
+    manifest["component_compositions"] = serde_json::json!([{
+        "canonical_frame": 1,
+        "layers": ["red"],
+        "logical_frames": [1, 2]
+    }]);
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let results = fixture
+        .records
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let event = aqw_component_compose::contract::ComposeEvent {
+        job_id: "rust-integration".to_string(),
+        manifest_key: "local://manifest".to_string(),
+        component_results: results,
+        batch: aqw_component_compose::contract::BatchIndex {
+            index: 0,
+            frame_start: None,
+            frame_end: None,
+            composition_start: Some(0),
+            composition_end: Some(0),
+        },
+        benchmark_output_prefix: None,
+    };
+    let output = temp.join("out");
+    let scratch = temp.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let (result, stats) = aqw_component_compose::worker::run_chunk(
+        &event,
+        &aqw_component_compose::local::FsSource::new(temp.clone()),
+        &aqw_component_compose::local::FsSink::new(output.clone(), 0),
+        &aqw_component_compose::worker::ComposeOptions {
+            download_concurrency: 4,
+            cwebp: cwebp.into(),
+            scratch_dir: scratch,
+            retain_png_dir: Some(output.join("frames")),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stats.unique_frames_encoded, 1);
+    assert_eq!(stats.logical_frames_emitted, 2);
+    assert_eq!(stats.deduplicated_frames, 1);
+    assert!(output.join("frames/000001.webp").is_file());
+    assert!(!output.join("frames/000002.webp").exists());
+    let batch: Value =
+        serde_json::from_slice(&std::fs::read(output.join("batch-0000.json")).unwrap()).unwrap();
+    assert_eq!(result.batch, 0);
+    assert_eq!(batch["frames"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        batch["frames"][0]["webp_key"],
+        batch["frames"][1]["webp_key"]
+    );
+    assert_eq!(batch["frames"][0]["sha256"], batch["frames"][1]["sha256"]);
+    assert_eq!(batch["frames"][0]["duration"], 40);
+    assert_eq!(batch["frames"][1]["duration"], 55);
+    let _ = std::fs::remove_dir_all(&temp);
+}

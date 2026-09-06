@@ -309,8 +309,10 @@ pub async fn run_local(cli: &CliOptions) -> Result<serde_json::Value, ComposeErr
         component_results: results,
         batch: crate::contract::BatchIndex {
             index: cli.batch_index,
-            frame_start: cli.frame_start,
-            frame_end: cli.frame_end,
+            frame_start: Some(cli.frame_start),
+            frame_end: Some(cli.frame_end),
+            composition_start: None,
+            composition_end: None,
         },
         benchmark_output_prefix: None,
     };

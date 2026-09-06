@@ -188,9 +188,10 @@ Each successful component task should produce a record similar to:
 
 ## Parallel frame composition
 
-Each `ComposeComponentFrameChunk` invocation processes one contiguous batch.
-Development currently uses 10 frames per invocation and Map concurrency 20,
-so a 120-frame animation can compose in one 12-worker wave.
+`PrepareFinish` globally groups logical frames with the same exact ordered
+component-task IDs. Each `ComposeComponentFrameChunk` invocation normally
+processes one unique composition. Development uses Map concurrency 40, so up
+to 40 distinct full-frame recipes encode in one wave.
 
 It will:
 
@@ -198,12 +199,14 @@ It will:
 2. Download only the unique component PNGs needed by that chunk, concurrently
    with a bounded worker pool.
 3. Decode each needed PNG once and retain it for the invocation.
-4. For each output frame, allocate one transparent output-size RGBA canvas.
+4. For each unique composition, allocate one transparent output-size RGBA canvas.
 5. Alpha-composite the referenced layers in exact back-to-front order at their
    recorded integer offsets.
 6. Encode each complete frame with the configured WebP settings.
-7. Upload each independent frame and write a compact batch manifest.
-8. Let `FinalizeAnimation` gather all batch manifests and frames, mux,
+7. Upload each unique frame, then emit a logical frame record for every frame
+   sharing that recipe while preserving each duration.
+8. Let `FinalizeAnimation` download each unique object once, gather all
+   logical frame records, mux,
    validate, publish, and complete the job.
 
 Pillow remains the compositor because the operation is cropped RGBA
@@ -253,8 +256,8 @@ Add explicit development tuning for the experiment:
 componentRasterInlineConcurrency = 40
 componentRasterConcurrency = 200
 componentRasterFrameCap = 120
-componentComposeFramesPerLambda = 10
-componentComposeConcurrency = 20
+componentComposeFramesPerLambda = 1
+componentComposeConcurrency = 40
 ```
 
 The existing request's raster size, output size, zoom, padding, WebP quality,

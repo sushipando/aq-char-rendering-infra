@@ -28,8 +28,8 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     componentRasterInlineConcurrency: 40,
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
-    componentComposeFramesPerLambda: 10,
-    componentComposeConcurrency: 20,
+    componentComposeFramesPerLambda: 1,
+    componentComposeConcurrency: 40,
   });
 });
 
@@ -263,7 +263,7 @@ test('the Rust component-raster worker is the live backend with 3008 MiB and no 
   expect(rust!.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
 });
 
-test('component composition uses Rust with 20-way per-job Map concurrency', () => {
+test('component composition uses Rust with 40-way per-job Map concurrency', () => {
   const template = synthesize();
   const stateMachines = template.findResources('AWS::StepFunctions::StateMachine');
   const stateMachine = Object.values(stateMachines)[0];
@@ -272,7 +272,7 @@ test('component composition uses Rust with 20-way per-job Map concurrency', () =
   expect(serializedDefinition).toContain('ComponentComposeRustFunction');
   expect(serializedDefinition).not.toContain('ComponentComposeFunction');
   expect(serializedDefinition).toContain('ComposeComponentFrameChunks');
-  expect(serializedDefinition).toContain('MaxConcurrency\\\":20');
+  expect(serializedDefinition).toContain('MaxConcurrency\\\":40');
 });
 
 test('Lambda request defaults come from the centralized environment tuning', () => {
@@ -290,7 +290,7 @@ test('Lambda request defaults come from the centralized environment tuning', () 
         CHAR_RENDER_FRAMES_PER_LAMBDA: '1',
         CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT: '4',
         CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY: '32',
-        CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: '10',
+        CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: '1',
         CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK: 'true',
       }),
     },

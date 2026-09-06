@@ -25,6 +25,59 @@ pub fn batches(count: usize, size: usize) -> Vec<Value> {
         .collect()
 }
 
+/// Group logical animation frames by their exact ordered component recipe.
+/// Duration is intentionally not part of the key: it changes playback timing,
+/// not the pixels produced by the component compositor.
+pub fn component_compositions(frames: &[Value]) -> Result<Vec<Value>> {
+    let mut by_layers: BTreeMap<Vec<String>, usize> = BTreeMap::new();
+    let mut compositions: Vec<Value> = Vec::new();
+    for frame in frames {
+        let number = frame["number"]
+            .as_u64()
+            .context("component frame has no number")?;
+        let layers = frame["layers"]
+            .as_array()
+            .context("component frame has no layers")?
+            .iter()
+            .map(|layer| {
+                layer
+                    .as_str()
+                    .context("component frame layer is not a string")
+                    .map(str::to_string)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(index) = by_layers.get(&layers).copied() {
+            compositions[index]["logical_frames"]
+                .as_array_mut()
+                .context("invalid component composition")?
+                .push(number.into());
+        } else {
+            by_layers.insert(layers.clone(), compositions.len());
+            compositions.push(json!({
+                "canonical_frame": number,
+                "layers": layers,
+                "logical_frames": [number],
+            }));
+        }
+    }
+    Ok(compositions)
+}
+
+/// Zero-based inclusive ranges into `component_compositions`.
+pub fn composition_batches(count: usize, size: usize) -> Vec<Value> {
+    (0..count)
+        .step_by(size)
+        .enumerate()
+        .map(|(index, start)| {
+            json!({
+                "index": index,
+                "composition_start": start,
+                "composition_end": count.min(start + size) - 1,
+            })
+        })
+        .collect()
+}
+
 pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result<Value> {
     let started = Instant::now();
     let request = crate::contract::request(event["request"].clone(), None)?;
@@ -255,6 +308,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         }
         frames.push(json!({"number":index+1,"duration_ms":duration,"layers":ids}));
     }
+    let compositions = component_compositions(&frames)?;
     let mut warnings = prepared["warnings"].as_array().cloned().unwrap_or_default();
     if count < natural_count {
         warnings
@@ -283,15 +337,48 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     }
     let manifest_key = format!("jobs/{job}/prepare/manifest.json");
     let batches = batches(count, config.frames_per_lambda);
-    let component_batches = self::batches(count, config.compose_batch_size);
+    let component_batches = composition_batches(compositions.len(), config.compose_batch_size);
     let mut manifest = prepared.clone();
-    for (key,value) in json!({"frame_count":count,"frame_rate":frame_rate,"viewbox":viewbox,"frame_durations":durations,"parts":parts,"static_keys":static_keys,"ground_animate":ground,"all_color_rules":all_rules,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_raster_space":if settings["raster_size"].as_u64().unwrap()<=output*2 {"output"} else {"raster"},"component_tasks":tasks,"component_frames":frames,"warnings":warnings,"detected_loop":detected,"detected_blink_frames":blink,"ignored_loop_keys":ignored,"source_bundles":{},"sources":[]}).as_object().unwrap() {manifest[key]=value.clone();}
+    for (key,value) in json!({"frame_count":count,"frame_rate":frame_rate,"viewbox":viewbox,"frame_durations":durations,"parts":parts,"static_keys":static_keys,"ground_animate":ground,"all_color_rules":all_rules,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_compose_schema":2,"component_raster_space":if settings["raster_size"].as_u64().unwrap()<=output*2 {"output"} else {"raster"},"component_tasks":tasks,"component_frames":frames,"component_compositions":compositions,"warnings":warnings,"detected_loop":detected,"detected_blink_frames":blink,"ignored_loop_keys":ignored,"source_bundles":{},"sources":[]}).as_object().unwrap() {manifest[key]=value.clone();}
     store::write(store, &config.work_bucket, &manifest_key, &manifest, false).await?;
     crate::log(
         "prepare_profile",
-        json!({"job_id":job,"frame_count":count,"unique_component_tasks":tasks.len(),"unique_bounds_states":results.len(),"detected_item_loop":item_loop,"detected_blink_frames":blink,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
+        json!({"job_id":job,"frame_count":count,"unique_compositions":compositions.len(),"deduplicated_frames":count-compositions.len(),"unique_component_tasks":tasks.len(),"unique_bounds_states":results.len(),"detected_item_loop":item_loop,"detected_blink_frames":blink,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(
-        json!({"schema_version":1,"job_id":job,"cache_hit":false,"render_hash":prepared["render_hash"],"final_key":prepared["final_key"],"manifest_key":manifest_key,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_task_indices":(0..tasks.len()).collect::<Vec<_>>(),"frame_count":count}),
+        json!({"schema_version":1,"job_id":job,"cache_hit":false,"render_hash":prepared["render_hash"],"final_key":prepared["final_key"],"manifest_key":manifest_key,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_task_indices":(0..tasks.len()).collect::<Vec<_>>(),"frame_count":count,"unique_composition_count":compositions.len()}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{component_compositions, composition_batches};
+    use serde_json::json;
+
+    #[test]
+    fn groups_exact_recipes_globally_without_using_duration() {
+        let frames = vec![
+            json!({"number":1,"duration_ms":40,"layers":["a","b"]}),
+            json!({"number":2,"duration_ms":80,"layers":["b","a"]}),
+            json!({"number":11,"duration_ms":120,"layers":["a","b"]}),
+        ];
+        let groups = component_compositions(&frames).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["canonical_frame"], 1);
+        assert_eq!(groups[0]["logical_frames"], json!([1, 11]));
+        assert_eq!(groups[1]["canonical_frame"], 2);
+        assert_eq!(groups[1]["logical_frames"], json!([2]));
+    }
+
+    #[test]
+    fn batches_unique_compositions_with_zero_based_inclusive_ranges() {
+        assert_eq!(
+            composition_batches(5, 2),
+            vec![
+                json!({"index":0,"composition_start":0,"composition_end":1}),
+                json!({"index":1,"composition_start":2,"composition_end":3}),
+                json!({"index":2,"composition_start":4,"composition_end":4}),
+            ]
+        );
+    }
 }

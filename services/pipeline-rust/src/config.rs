@@ -77,7 +77,7 @@ impl Config {
             component_frame_cap: number("CHAR_RENDER_COMPONENT_RASTER_FRAME_CAP", 25, 1, 2000)?,
             compose_batch_size: number(
                 "CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA",
-                10,
+                1,
                 1,
                 2000,
             )?,

@@ -194,10 +194,11 @@ const DEV_TUNING: InfrastructureTuning = {
     // Distributed mode remains available for explicit high-concurrency tests.
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
-    // Twelve 10-frame workers cover the current 120-frame maximum in one Map
-    // wave while amortizing component downloads and Lambda cold starts.
-    componentComposeFramesPerLambda: 10,
-    componentComposeConcurrency: 20,
+    // PrepareFinish globally deduplicates exact full-frame recipes. Give each
+    // remaining unique composition its own worker and encode up to 40 in one
+    // Inline Map wave.
+    componentComposeFramesPerLambda: 1,
+    componentComposeConcurrency: 40,
   },
   retention: {
     workDays: 2,

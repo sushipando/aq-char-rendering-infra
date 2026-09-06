@@ -1,10 +1,10 @@
 //! The chunk composer shared by the Lambda runtime and the local mode.
 //!
 //! Contract parity with the Python worker (`stages/component_compose.py`):
-//! one process starts once, shared components are decoded once, and the whole
-//! frame chunk (default ten frames) is composed to the output grid, encoded
-//! with the pinned cwebp, uploaded, and recorded in one compose-batch
-//! manifest. A missing task or missing PNG fails the whole chunk.
+//! one process starts once, shared components are decoded once, and each
+//! globally unique full-frame recipe assigned to it is composed, encoded with
+//! the pinned cwebp, uploaded, and expanded back into logical frame records.
+//! A missing task or missing PNG fails the whole chunk.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,8 +14,8 @@ use futures::stream::{self, StreamExt};
 
 use crate::compositor::{frame_canvas_sizes, Canvas, RgbaImage};
 use crate::contract::{
-    BatchManifest, ComponentFrame, ComponentResult, ComposeEvent, ComposeOutput, FrameRecord,
-    PrepareManifest,
+    BatchIndex, BatchManifest, ComponentFrame, ComponentResult, ComposeEvent, ComposeOutput,
+    FrameRecord, PrepareManifest,
 };
 use crate::encode::encode_webp;
 use crate::error::ComposeError;
@@ -131,7 +131,117 @@ fn frame_duration(frame: &ComponentFrame, durations: &[i64], frame_number: i64) 
         .unwrap_or_else(|| durations[(frame_number - 1) as usize])
 }
 
-/// Compose, encode, upload, and record one contiguous frame chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompositionWork {
+    canonical_frame: i64,
+    layers: Vec<String>,
+    logical_frames: Vec<i64>,
+}
+
+/// Validate the global recipe partition and select the unique compositions
+/// addressed by this batch. Old frame-range events remain supported during
+/// rollout and by the local benchmarking CLI.
+fn select_compositions(
+    prepared: &PrepareManifest,
+    batch: &BatchIndex,
+) -> Result<Vec<CompositionWork>, ComposeError> {
+    let frame_count = prepared.frame_count;
+    if prepared.component_frames.len() != frame_count as usize {
+        return Err(invalid(
+            "Component frame count does not match the prepared frame count",
+        ));
+    }
+    if prepared.frame_durations.len() != frame_count as usize {
+        return Err(invalid(
+            "Frame duration count does not match the prepared frame count",
+        ));
+    }
+    for (index, frame) in prepared.component_frames.iter().enumerate() {
+        if frame.number != index as i64 + 1 {
+            return Err(invalid("Component frames are not contiguous"));
+        }
+    }
+
+    let composition_range = match (batch.composition_start, batch.composition_end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        (None, None) => None,
+        _ => return Err(invalid("Incomplete component composition range")),
+    };
+    let frame_range = match (batch.frame_start, batch.frame_end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        (None, None) => None,
+        _ => return Err(invalid("Incomplete component frame range")),
+    };
+    if composition_range.is_some() && frame_range.is_some() {
+        return Err(invalid("Compose batch mixes composition and frame ranges"));
+    }
+
+    if let Some((start, end)) = composition_range {
+        let compositions = &prepared.component_compositions;
+        if start > end || end >= compositions.len() {
+            return Err(invalid(format!(
+                "Invalid component composition batch {start}-{end} for {} compositions",
+                compositions.len()
+            )));
+        }
+        let mut claimed = vec![false; frame_count as usize];
+        for composition in compositions {
+            if composition.logical_frames.is_empty()
+                || !composition
+                    .logical_frames
+                    .contains(&composition.canonical_frame)
+            {
+                return Err(invalid(
+                    "Component composition has no canonical logical frame",
+                ));
+            }
+            for &number in &composition.logical_frames {
+                if number < 1 || number > frame_count {
+                    return Err(invalid("Component composition frame is out of range"));
+                }
+                let index = number as usize - 1;
+                if std::mem::replace(&mut claimed[index], true) {
+                    return Err(invalid("Logical frame appears in multiple compositions"));
+                }
+                if prepared.component_frames[index].layers != composition.layers {
+                    return Err(invalid(
+                        "Component composition layers differ from its logical frame",
+                    ));
+                }
+            }
+        }
+        if claimed.iter().any(|claimed| !claimed) {
+            return Err(invalid(
+                "Component compositions do not cover every logical frame",
+            ));
+        }
+        return Ok(compositions[start..=end]
+            .iter()
+            .map(|composition| CompositionWork {
+                canonical_frame: composition.canonical_frame,
+                layers: composition.layers.clone(),
+                logical_frames: composition.logical_frames.clone(),
+            })
+            .collect());
+    }
+
+    let (start, end) = frame_range.ok_or_else(|| invalid("Compose batch has no range"))?;
+    if start < 1 || end > frame_count || start > end {
+        return Err(invalid(format!(
+            "Invalid component compose batch {start}-{end} for {frame_count} frames"
+        )));
+    }
+    Ok(prepared.component_frames[start as usize - 1..end as usize]
+        .iter()
+        .map(|frame| CompositionWork {
+            canonical_frame: frame.number,
+            layers: frame.layers.clone(),
+            logical_frames: vec![frame.number],
+        })
+        .collect())
+}
+
+/// Compose, encode, upload, and record one unique-composition chunk.
 pub async fn run_chunk(
     event: &ComposeEvent,
     source: &dyn Source,
@@ -154,25 +264,21 @@ pub async fn run_chunk(
     }
 
     let batch_index = event.batch.index;
-    let frame_start = event.batch.frame_start;
-    let frame_end = event.batch.frame_end;
-    let frame_count = prepared.frame_count;
-    if frame_start < 1 || frame_end > frame_count || frame_start > frame_end {
-        return Err(invalid(format!(
-            "Invalid component compose batch {frame_start}-{frame_end} for {frame_count} frames"
-        )));
-    }
-    if prepared.component_frames.len() != frame_count as usize {
-        return Err(invalid(
-            "Component frame count does not match the prepared frame count",
-        ));
-    }
-    let component_frames = &prepared.component_frames[frame_start as usize - 1..frame_end as usize];
-    for (index, frame) in component_frames.iter().enumerate() {
-        if frame.number != frame_start + index as i64 {
-            return Err(invalid("Component frame chunk is not contiguous"));
-        }
-    }
+    let compositions = select_compositions(&prepared, &event.batch)?;
+    let logical_frames_emitted = compositions
+        .iter()
+        .map(|composition| composition.logical_frames.len())
+        .sum::<usize>();
+    let frame_start = compositions
+        .iter()
+        .flat_map(|composition| composition.logical_frames.iter().copied())
+        .min()
+        .ok_or_else(|| invalid("Compose batch has no logical frames"))?;
+    let frame_end = compositions
+        .iter()
+        .flat_map(|composition| composition.logical_frames.iter().copied())
+        .max()
+        .ok_or_else(|| invalid("Compose batch has no logical frames"))?;
 
     // ---- results ----------------------------------------------------------
     let results_started = Instant::now();
@@ -181,8 +287,8 @@ pub async fn run_chunk(
         results_by_task.insert(result.task_id.clone(), result.clone());
     }
     let mut referenced: BTreeSet<String> = BTreeSet::new();
-    for frame in component_frames {
-        for layer in &frame.layers {
+    for composition in &compositions {
+        for layer in &composition.layers {
             referenced.insert(layer.clone());
         }
     }
@@ -269,7 +375,7 @@ pub async fn run_chunk(
     let decode_ms = elapsed_ms(decode_started);
 
     // ---- compose frames ---------------------------------------------------
-    let mut records: Vec<FrameRecord> = Vec::with_capacity(component_frames.len());
+    let mut records: Vec<FrameRecord> = Vec::with_capacity(logical_frames_emitted);
     let mut frame_canvases: HashSet<[i64; 2]> = HashSet::new();
     let mut composite_total = 0.0;
     let mut downsample_total = 0.0;
@@ -277,12 +383,12 @@ pub async fn run_chunk(
     let mut upload_total = 0.0;
     let downsampled_in_compose = component_raster_space == "raster" && output_size < raster_size;
 
-    for frame in component_frames {
-        let frame_number = frame.number;
+    for composition in &compositions {
+        let frame_number = composition.canonical_frame;
         let mut canvas = Canvas::new(canvas_size[0] as u32, canvas_size[1] as u32);
 
         let composite_started = Instant::now();
-        for raw_task_id in &frame.layers {
+        for raw_task_id in &composition.layers {
             let result = results_by_task.get(raw_task_id);
             match result {
                 None => continue, // unreachable after the missing-results check
@@ -348,19 +454,23 @@ pub async fn run_chunk(
         sink.put_webp(frame_number, &webp_key, &webp_bytes).await?;
         upload_total += elapsed_ms(upload_started);
 
-        records.push(FrameRecord {
-            frame: frame_number,
-            webp_key,
-            x: 0,
-            y: 0,
-            width: frame_canvas[0],
-            height: frame_canvas[1],
-            canvas_width: frame_canvas[0],
-            canvas_height: frame_canvas[1],
-            duration: frame_duration(frame, &prepared.frame_durations, frame_number),
-            sha256: sha256_hex(&webp_bytes),
-            bytes: webp_bytes.len(),
-        });
+        let sha256 = sha256_hex(&webp_bytes);
+        for &logical_frame in &composition.logical_frames {
+            let frame = &prepared.component_frames[logical_frame as usize - 1];
+            records.push(FrameRecord {
+                frame: logical_frame,
+                webp_key: webp_key.clone(),
+                x: 0,
+                y: 0,
+                width: frame_canvas[0],
+                height: frame_canvas[1],
+                canvas_width: frame_canvas[0],
+                canvas_height: frame_canvas[1],
+                duration: frame_duration(frame, &prepared.frame_durations, logical_frame),
+                sha256: sha256.clone(),
+                bytes: webp_bytes.len(),
+            });
+        }
     }
 
     if frame_canvases.len() != 1 {
@@ -388,7 +498,8 @@ pub async fn run_chunk(
     let manifest_write_ms = elapsed_ms(manifest_write_started);
 
     let total_ms = elapsed_ms(started);
-    let frames_rendered = frame_end - frame_start + 1;
+    let unique_frames_encoded = compositions.len() as i64;
+    let logical_frames_emitted = logical_frames_emitted as i64;
     let timings = Timings {
         manifest_ms,
         results_read_ms,
@@ -405,7 +516,10 @@ pub async fn run_chunk(
         batch: batch_index,
         frame_start,
         frame_end,
-        frames_rendered,
+        frames_rendered: unique_frames_encoded,
+        unique_frames_encoded,
+        logical_frames_emitted,
+        deduplicated_frames: logical_frames_emitted - unique_frames_encoded,
         referenced_component_count: referenced.len(),
         downloaded_png_count: unique_task_ids.len(),
         png_bytes,
@@ -436,4 +550,117 @@ pub async fn compose_and_report(
     let (output, stats) = run_chunk(event, source, sink, opts).await?;
     crate::telemetry::log_profile(&stats);
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_compositions, CompositionWork};
+    use crate::contract::{
+        BatchIndex, ComponentComposition, ComponentFrame, ManifestSettings, PrepareManifest,
+    };
+
+    fn manifest() -> PrepareManifest {
+        PrepareManifest {
+            job_id: "job-1".to_string(),
+            frame_count: 3,
+            viewbox: vec![0.0, 0.0, 100.0, 100.0],
+            frame_durations: vec![40, 50, 60],
+            settings: ManifestSettings {
+                raster_size: 256,
+                output_size: 256,
+                webp_quality: 85.0,
+                webp_method: 4,
+                webp_lossless: Some(false),
+            },
+            component_pipeline: Some(true),
+            component_raster_space: Some("output".to_string()),
+            component_frames: vec![
+                ComponentFrame {
+                    number: 1,
+                    layers: vec!["a".to_string()],
+                    duration_ms: Some(40),
+                },
+                ComponentFrame {
+                    number: 2,
+                    layers: vec!["b".to_string()],
+                    duration_ms: Some(50),
+                },
+                ComponentFrame {
+                    number: 3,
+                    layers: vec!["a".to_string()],
+                    duration_ms: Some(60),
+                },
+            ],
+            component_compositions: vec![
+                ComponentComposition {
+                    canonical_frame: 1,
+                    layers: vec!["a".to_string()],
+                    logical_frames: vec![1, 3],
+                },
+                ComponentComposition {
+                    canonical_frame: 2,
+                    layers: vec!["b".to_string()],
+                    logical_frames: vec![2],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn selects_one_global_composition_with_noncontiguous_aliases() {
+        let selected = select_compositions(
+            &manifest(),
+            &BatchIndex {
+                index: 0,
+                frame_start: None,
+                frame_end: None,
+                composition_start: Some(0),
+                composition_end: Some(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec![CompositionWork {
+                canonical_frame: 1,
+                layers: vec!["a".to_string()],
+                logical_frames: vec![1, 3],
+            }]
+        );
+    }
+
+    #[test]
+    fn preserves_legacy_contiguous_frame_batches() {
+        let selected = select_compositions(
+            &manifest(),
+            &BatchIndex {
+                index: 0,
+                frame_start: Some(2),
+                frame_end: Some(3),
+                composition_start: None,
+                composition_end: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].logical_frames, vec![2]);
+        assert_eq!(selected[1].logical_frames, vec![3]);
+    }
+
+    #[test]
+    fn rejects_a_recipe_partition_with_duplicate_logical_frames() {
+        let mut prepared = manifest();
+        prepared.component_compositions[1].logical_frames.push(3);
+        assert!(select_compositions(
+            &prepared,
+            &BatchIndex {
+                index: 0,
+                frame_start: None,
+                frame_end: None,
+                composition_start: Some(0),
+                composition_end: Some(0),
+            },
+        )
+        .is_err());
+    }
 }

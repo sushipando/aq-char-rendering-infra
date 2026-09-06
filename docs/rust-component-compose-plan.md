@@ -107,7 +107,23 @@ correctness is established.
 
 ## Lambda event and result compatibility
 
-Accept the existing event without translation:
+New manifests address globally deduplicated composition groups:
+
+```json
+{
+  "job_id": "...",
+  "manifest_key": "jobs/.../prepare/manifest.json",
+  "component_results": [],
+  "batch": {
+    "index": 0,
+    "composition_start": 0,
+    "composition_end": 0
+  }
+}
+```
+
+The worker also accepts the original contiguous-frame event during rollout
+and for local benchmarks:
 
 ```json
 {
@@ -190,6 +206,9 @@ job_id
 batch
 frame_start / frame_end
 frames_rendered
+unique_frames_encoded
+logical_frames_emitted
+deduplicated_frames
 referenced_component_count
 downloaded_png_count
 png_bytes
