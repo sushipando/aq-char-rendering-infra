@@ -18,7 +18,8 @@ ProbeUniqueStatesInline|ProbeUniqueStatesDistributed -> PrepareFinish ->
 RasterComponentStatesInline|RasterComponentStatesDistributed ->
 ComposeComponentFrameChunks -> FinalizeAnimation`.
 
-Export runs per source SWF, grouping its symbol requests. FFDec has a deadline
+Export runs per independently placed symbol, carrying the original source’s
+full normalization context. See [per-symbol exports](../../docs/per-symbol-export.md). FFDec has a deadline
 shorter than the invocation deadline and is killed on timeout. Export hashes
 the effective SVG after settled-child registration corrections, preserves
 ordered schedules and the eight-frame validation tail, and never probes a
@@ -45,7 +46,7 @@ All new intermediate/cache objects are in the work bucket:
 | `svg-bounds/v1/<identity>.json` | SVG hash, patched-renderer policy, resolution/retry/padding/zoom, visibility and registration-space bounds |
 | `component-rasters/2/<identity>.*` | Reusable raster/result for appearance-independent placed components |
 | `jobs/<job>/prepare/` | Small source references, S3 probe task dataset, plan, verified bounds join and component manifest |
-| `renders/v20-rust-bounds/` | Validated final WebP and cache-completion metadata sidecar |
+| `renders/v20-rust-bounds/` | Validated final WebP/AVIF and cache-completion metadata sidecar |
 
 Vector and bounds caches are independent of the final-render cache switch.
 Existing librsvg bounds and old vector archives cannot become new-policy hits.
@@ -232,3 +233,5 @@ Python code is retained for that reference, not silently switched at runtime.
 For subsequent test-bot deployments, do not pause admissions or drain the
 queue. The repository owner runs `scripts/deploy_renderer.sh --yes`; agents and
 unattended automation stop after validation and diff review.
+
+Optional AVIF uses the same compose/finalizer workflow with original RGBA handoff. See [AVIF output](../../docs/avif-output.md) for settings, validation, and owner-run deployment checks.

@@ -26,6 +26,12 @@ pub trait Sink: Send + Sync {
         key: &str,
         bytes: &[u8],
     ) -> Result<(), ComposeError>;
+    async fn put_rgba(
+        &self,
+        frame_number: i64,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(), ComposeError>;
     async fn put_json(&self, key: &str, value: &serde_json::Value) -> Result<(), ComposeError>;
 }
 
@@ -109,6 +115,24 @@ impl Sink for S3Store {
             .bucket(&self.bucket)
             .key(key)
             .content_type("image/webp")
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .map_err(|error| self.error("put", key, error.to_string()))?;
+        Ok(())
+    }
+
+    async fn put_rgba(
+        &self,
+        _frame_number: i64,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(), ComposeError> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type("application/octet-stream")
             .body(ByteStream::from(bytes.to_vec()))
             .send()
             .await

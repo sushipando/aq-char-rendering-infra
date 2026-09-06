@@ -406,6 +406,9 @@ pub async fn run_chunk(
     let decode_ms = elapsed_ms(decode_started);
 
     // ---- compose frames ---------------------------------------------------
+    let raw_rgba = match settings.output_format.as_str() {
+        "webp" => false, "avif" => true, _ => return Err(invalid("Unsupported output format")),
+    };
     let mut records: Vec<FrameRecord> = Vec::with_capacity(logical_frames_emitted);
     let mut frame_canvases: HashSet<[i64; 2]> = HashSet::new();
     let mut composite_total = 0.0;
@@ -450,6 +453,28 @@ pub async fn run_chunk(
         let frame_canvas = [canvas.width as i64, canvas.height as i64];
         frame_canvases.insert(frame_canvas);
 
+        // AVIF consumes original straight-alpha RGBA. No PNG compression or
+        // independent still-image encode; one upload per unique composition.
+        if raw_rgba {
+            let prefix = event.benchmark_output_prefix.clone()
+                .unwrap_or_else(|| format!("jobs/{}/component", event.job_id));
+            let key = format!("{prefix}/rgba-frames/{frame_number:06}.rgba");
+            let sha256 = sha256_hex(&canvas.pixels);
+            for &logical_frame in &composition.logical_frames {
+                let frame = &prepared.component_frames[logical_frame as usize - 1];
+                records.push(FrameRecord {
+                    frame: logical_frame, webp_key: String::new(), rgba_key: Some(key.clone()),
+                    x: 0, y: 0, width: frame_canvas[0], height: frame_canvas[1],
+                    canvas_width: frame_canvas[0], canvas_height: frame_canvas[1],
+                    duration: frame_duration(frame, &prepared.frame_durations, logical_frame),
+                    sha256: sha256.clone(), bytes: canvas.pixels.len(),
+                });
+            }
+            let upload_started = Instant::now();
+            sink.put_rgba(frame_number, &key, &canvas.pixels).await?;
+            upload_total += elapsed_ms(upload_started);
+            continue;
+        }
         // ---- encode -------------------------------------------------------
         let encode_started = Instant::now();
         let raw_png = png::encode_rgba8(canvas.width, canvas.height, &canvas.pixels)?;
@@ -518,6 +543,7 @@ pub async fn run_chunk(
             records.push(FrameRecord {
                 frame: logical_frame,
                 webp_key: webp_key.clone(),
+                rgba_key: None,
                 x: 0,
                 y: 0,
                 width: frame_canvas[0],
@@ -559,7 +585,7 @@ pub async fn run_chunk(
     };
     let manifest_write_started = Instant::now();
     let batch_manifest = BatchManifest {
-        schema_version: 1,
+        schema_version: if raw_rgba { 2 } else { 1 },
         job_id: event.job_id.clone(),
         batch: batch_index,
         frames: records,
@@ -662,6 +688,7 @@ mod tests {
             viewbox: vec![0.0, 0.0, 100.0, 100.0],
             frame_durations: vec![40, 50, 60],
             settings: ManifestSettings {
+                output_format: "webp".into(),
                 raster_size: 256,
                 output_size: 256,
                 webp_quality: 85.0,

@@ -1,5 +1,7 @@
 # AQW Character Rendering Infrastructure
 
+WebP and AVIF use the existing compose/finalizer workers. See [AVIF output and deployment checks](docs/avif-output.md) for quality controls, raw-frame handoff details, and test commands. Multipart exports are described in [per-symbol export](docs/per-symbol-export.md).
+
 This repository owns the distributed `/char` rendering system: AWS CDK
 infrastructure, Step Functions orchestration, Rust Lambda services,
 container definitions, tests, and operational documentation. Rendering uses

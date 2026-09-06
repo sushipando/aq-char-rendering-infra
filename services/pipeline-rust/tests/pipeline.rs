@@ -82,6 +82,17 @@ impl aqw_component_compose::storage::Sink for ComposeStore<'_> {
             .await
             .map_err(compose_error)
     }
+    async fn put_rgba(
+        &self,
+        _: i64,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(), aqw_component_compose::error::ComposeError> {
+        self.0
+            .put("work", key, bytes.to_vec(), "application/octet-stream", false)
+            .await
+            .map_err(compose_error)
+    }
     async fn put_json(
         &self,
         key: &str,
@@ -466,6 +477,16 @@ async fn incident_ground_cold_export_and_warm_cache() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires AQW_TEST_CWEBP and CHAR_RENDER_WEBPMUX"]
 async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
+    full_pipeline_format("webp").await
+}
+
+#[tokio::test]
+#[ignore = "requires CHAR_RENDER_AVIF_RGBA and AQW_TEST_PYTHON with Pillow AVIF support"]
+async fn full_rust_pipeline_encodes_and_validates_avif() -> Result<()> {
+    full_pipeline_format("avif").await
+}
+
+async fn full_pipeline_format(format: &str) -> Result<()> {
     for frame_count in [1, 8] {
         let temporary = tempfile::tempdir()?;
         let store = FsStore(temporary.path().into());
@@ -474,6 +495,14 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         let mut test_config = config();
         test_config.compose_concurrency = 1;
         let (mut request, planned) = synthetic(&store).await?;
+        if format == "avif" {
+            request["render"]["output_format"] = "avif".into();
+            request["render"]["webp_lossless"] = true.into();
+            let mut input: Value = store::read(&store, "work", "jobs/input.json").await?;
+            input["settings"] = request["render"].clone();
+            input["final_key"] = "renders/test.avif".into();
+            store::write(&store, "work", "jobs/input.json", &input, false).await?;
+        }
         if frame_count == 1 {
             request["render"]["complete_loop"] = false.into();
             let mut input: Value = store::read(&store, "work", "jobs/input.json").await?;
@@ -495,7 +524,7 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         let handoff = pipeline::components::collect(&store, "work", &json!({"job_id":job,"manifest_key":prepared["manifest_key"]})).await?;
         let compose_store = ComposeStore(&store);
         let opts = aqw_component_compose::worker::ComposeOptions {
-            cwebp: std::env::var("AQW_TEST_CWEBP")?.into(),
+            cwebp: if format == "avif" { "/nonexistent/cwebp".into() } else { std::env::var("AQW_TEST_CWEBP")?.into() },
             download_concurrency: 4,
             scratch_dir: temporary.path().into(),
             retain_png_dir: None,
@@ -529,6 +558,53 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         assert_eq!(finalized["logical_frame_count"], frame_count);
         assert!(finalized["physical_frame_count"].as_u64().unwrap() <= frame_count);
         assert!(finalized["bytes"].as_u64().unwrap() > 0);
+        if format == "avif" {
+            let mut records = Vec::new();
+            for result in &rendered {
+                let batch: Value = store::read(&store, "work", result["batch_manifest_key"].as_str().unwrap()).await?;
+                assert_eq!(batch["schema_version"], 2);
+                for frame in batch["frames"].as_array().unwrap() {
+                    assert!(frame.get("webp_key").is_none());
+                    records.push(frame.clone());
+                }
+            }
+            records.sort_by_key(|f| f["frame"].as_u64().unwrap());
+            let spec = temporary.path().join("verify.json");
+            tokio::fs::write(&spec, serde_json::to_vec(&json!({"result":finalized,"frames":records}))?).await?;
+            let check = tokio::process::Command::new(std::env::var("AQW_TEST_PYTHON")?)
+                .arg("-c").arg(r#"
+import json, sys
+from pathlib import Path
+from PIL import Image
+root=Path(sys.argv[1]); spec=json.loads((root/'verify.json').read_text())
+im=Image.open(root/'work'/spec['result']['final_key'])
+assert im.format == 'AVIF'
+expected=spec['frames']; logical=0
+for i in range(im.n_frames):
+    im.seek(i); im.load(); pixels=im.convert('RGBA').tobytes()
+    duration=round(im.info.get('duration', expected[logical]['duration']))
+    consumed=0
+    while logical<len(expected) and (consumed<duration or im.n_frames==1):
+        frame=expected[logical]
+        assert pixels == (root/'work'/frame['rgba_key']).read_bytes(), (i, logical)
+        consumed += frame['duration']; logical += 1
+        if im.n_frames==1: break
+    if im.n_frames>1: assert consumed==duration
+assert logical==len(expected)
+"#).arg(temporary.path()).output().await?;
+            assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+            let first_batch: Value = store::read(&store, "work", rendered[0]["batch_manifest_key"].as_str().unwrap()).await?;
+            let raw_key = first_batch["frames"][0]["rgba_key"].as_str().unwrap();
+            store.put("work", raw_key, vec![0], "application/octet-stream", false).await?;
+            let manifest_key = prepared["manifest_key"].as_str().unwrap();
+            let mut manifest: Value = store::read(&store, "work", manifest_key).await?;
+            manifest["final_key"] = "renders/corrupt.avif".into();
+            store::write(&store, "work", manifest_key, &manifest, false).await?;
+            assert!(pipeline::finalize::finalize(&store, &test_config,
+                &json!({"job_id":job,"manifest_key":manifest_key,"render_results":rendered})).await.is_err());
+            assert!(!store.exists("work", "renders/corrupt.avif").await?);
+            assert!(!store.exists("work", "renders/corrupt.avif.json").await?);
+        }
         // Missing and duplicated encoded batches fail before publishing a result.
         assert!(pipeline::finalize::finalize(
             &store,

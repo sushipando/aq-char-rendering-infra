@@ -96,7 +96,8 @@ const DEV_TUNING: InfrastructureTuning = {
     // own FFDec JVM, so prepare runs are capped at 300s.
     prepare: mib(3008, 4096, 300),
     bounds: mib(1024, 512, 60),
-    finalizer: mib(3008, 4096, 300),
+    // AVIF sequence encoding has an 840s process deadline plus upload headroom.
+    finalizer: mib(3008, 4096, 900),
     // Component workers rasterize one unique placed state each (tight page at
     // the shared pixel scale); a 4096-raster benchmark needs the render-class
     // memory/time profile.

@@ -157,7 +157,7 @@ def receive_result(
     raise TimeoutError(f"Timed out waiting for result message for {job_id}")
 
 
-def verify_webp(url: str, expected_base_url: str) -> dict[str, Any]:
+def verify_image(url: str, expected_base_url: str, output_format: str = "webp") -> dict[str, Any]:
     expected_prefix = expected_base_url.rstrip("/") + "/renders/"
     if not url.startswith(expected_prefix):
         raise RuntimeError(f"Result URL is outside the expected CDN prefix: {url}")
@@ -167,8 +167,14 @@ def verify_webp(url: str, expected_base_url: str) -> dict[str, Any]:
         content_type = response.headers.get_content_type()
         content_length = response.headers.get("Content-Length")
         status = response.status
-    if not (prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP"):
-        raise RuntimeError("CloudFront response is not a WebP file")
+    if output_format == "avif":
+        valid = prefix[4:8] == b"ftyp" and prefix[8:12] in {b"avif", b"avis"}
+    elif output_format == "webp":
+        valid = prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP"
+    else:
+        raise ValueError("Unsupported output format")
+    if not valid or content_type != f"image/{output_format}":
+        raise RuntimeError(f"CloudFront response is not an {output_format} image with the expected content type")
     return {
         "url": url,
         "http_status": status,
@@ -176,6 +182,9 @@ def verify_webp(url: str, expected_base_url: str) -> dict[str, Any]:
         "content_length": int(content_length) if content_length else None,
     }
 
+
+def verify_webp(url: str, expected_base_url: str) -> dict[str, Any]:
+    return verify_image(url, expected_base_url, "webp")
 
 def main() -> int:
     args = parser().parse_args()

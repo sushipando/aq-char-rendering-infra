@@ -385,3 +385,22 @@ def test_missing_manifest_asset_is_fetched_only_from_official_host_then_cached()
     assert requested_urls == ["https://game.aq.com/game/gamefiles/classes/F/Yami%20Armor.swf"]
     assert cached_record == record
     assert record.key.startswith("dynamic-assets/dev-v1/")
+
+
+@pytest.mark.parametrize("lossless", [False, True])
+def test_avif_controls_round_trip(lossless):
+    payload = request_payload()
+    payload["render"].update(output_format="avif", avif_quality=63, avif_speed=8, webp_lossless=lossless)
+    parsed = JobRequest.from_dict(payload)
+    assert parsed.render.output_format == "avif"
+    assert parsed.render.avif_quality == 63
+    assert parsed.render.webp_lossless is lossless
+    assert JobRequest.from_dict(parsed.to_dict()) == parsed
+
+
+@pytest.mark.parametrize("field,value", [("output_format", "png"), ("avif_quality", 101), ("avif_quality", 1.5), ("avif_speed", 11)])
+def test_invalid_avif_controls(field, value):
+    payload = request_payload()
+    payload["render"][field] = value
+    with pytest.raises(ContractError):
+        JobRequest.from_dict(payload)

@@ -84,8 +84,12 @@ pub struct PrepareManifest {
     pub component_compositions: Vec<ComponentComposition>,
 }
 
+fn default_output_format() -> String { "webp".into() }
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ManifestSettings {
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
     pub raster_size: i64,
     pub output_size: i64,
     pub webp_quality: f64,
@@ -117,7 +121,10 @@ pub struct ComponentComposition {
 #[derive(Clone, Debug, Serialize)]
 pub struct FrameRecord {
     pub frame: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub webp_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rgba_key: Option<String>,
     pub x: i64,
     pub y: i64,
     pub width: i64,
@@ -220,6 +227,7 @@ mod tests {
     fn frame_record_serializes_with_preserved_schema() {
         let record = FrameRecord {
             frame: 1,
+            rgba_key: None,
             webp_key: "jobs/job-1/component/webp-frames/000001.webp".to_string(),
             x: 0,
             y: 0,

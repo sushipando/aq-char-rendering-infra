@@ -224,6 +224,10 @@ pub async fn finalize(store: &dyn Store, config: &Config, event: &Value) -> Resu
         prepared["job_id"] == job,
         "prepare manifest belongs to another job"
     );
+    if prepared["settings"]["output_format"] == "avif" {
+        return crate::avif::finalize(store, config, event, &prepared).await;
+    }
+    ensure!(prepared["settings"]["output_format"].is_null() || prepared["settings"]["output_format"] == "webp", "invalid output format");
     let count = integer(&prepared, "frame_count", 1, 2000)? as usize;
     let batches: Vec<Value> = stream::iter(
         event["render_results"]

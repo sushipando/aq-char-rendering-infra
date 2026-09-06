@@ -123,7 +123,7 @@ impl Store for S3Store {
             .content_type(content_type)
             .metadata("sha256", checksum)
             .body(ByteStream::from(bytes));
-        if content_type == "image/webp" && key.starts_with("renders/") {
+        if matches!(content_type, "image/webp" | "image/avif") && key.starts_with("renders/") {
             call = call
                 .cache_control("public, max-age=86400")
                 .content_disposition("inline");

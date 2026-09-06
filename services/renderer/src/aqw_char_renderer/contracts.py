@@ -198,6 +198,9 @@ class RenderSettings:
     raster_size: int = 2048
     output_size: int = 2048
     padding: int = 0
+    output_format: str = "webp"
+    avif_quality: int = 70
+    avif_speed: int = 8
     webp_quality: float = 85.0
     webp_method: int = 4
     webp_lossless: bool | None = None
@@ -224,6 +227,9 @@ class RenderSettings:
             # Backward-compatible alias for requests queued before v17.
             "max_size",
             "padding",
+            "output_format",
+            "avif_quality",
+            "avif_speed",
             "webp_quality",
             "webp_method",
             "webp_lossless",
@@ -273,6 +279,9 @@ class RenderSettings:
             raster_size=raster_size,
             output_size=output_size,
             padding=padding,
+            output_format=_choice(payload.get("output_format", "webp"), "render.output_format", {"webp", "avif"}),
+            avif_quality=_integer(payload.get("avif_quality", 70), "render.avif_quality", 0, 100),
+            avif_speed=_integer(payload.get("avif_speed", 8), "render.avif_speed", 0, 10),
             webp_quality=_number(payload.get("webp_quality", 85), "render.webp_quality", 0, 100),
             webp_method=_integer(payload.get("webp_method", 4), "render.webp_method", 0, 6),
             webp_lossless=(

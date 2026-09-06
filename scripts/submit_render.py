@@ -48,7 +48,7 @@ from aqw_char_renderer.jobs import TERMINAL_STATUSES, JobStore
 from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
 
 # Proven helpers from the smoke harness (same repo, importable module).
-from smoke_test_deployment import load_outputs, seed_missing_assets, verify_webp
+from smoke_test_deployment import load_outputs, seed_missing_assets, verify_image
 
 
 def parser() -> argparse.ArgumentParser:
@@ -112,6 +112,9 @@ def parser() -> argparse.ArgumentParser:
         choices=("armor", "weapon", "helm", "cape", "ground"),
         help="slot for --item-id when it cannot be inferred",
     )
+    result.add_argument("--format", dest="output_format", choices=("webp", "avif"), default="webp")
+    result.add_argument("--avif-quality", type=int, choices=range(101), default=70, metavar="0..100")
+    result.add_argument("--avif-speed", type=int, choices=range(11), default=8, metavar="0..10")
     result.add_argument(
         "-q",
         "--webp-quality",
@@ -137,7 +140,7 @@ def parser() -> argparse.ArgumentParser:
         "--webp-lossless",
         "--lossless",
         action="store_true",
-        help="Encode frames with cwebp -lossless instead of lossy",
+        help="Use lossless encoding for the selected output format",
     )
     result.add_argument(
         "-n",
@@ -199,7 +202,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--no-verify",
         action="store_true",
-        help="Skip the CloudFront WebP fetch/validation at the end",
+        help="Skip the CloudFront image fetch/validation at the end",
     )
     result.add_argument(
         "--watch",
@@ -259,6 +262,9 @@ def queue_one(
             raster_size=args.raster_size,
             output_size=args.output_size,
             padding=args.padding,
+            output_format=args.output_format,
+            avif_quality=args.avif_quality,
+            avif_speed=args.avif_speed,
             webp_quality=args.webp_quality,
             webp_method=args.webp_method,
             webp_lossless=args.webp_lossless or None,
@@ -367,7 +373,7 @@ def result_row(
     }
     if not args.no_verify:
         try:
-            verified = verify_webp(result["url"], outputs["CloudFrontBaseUrl"])
+            verified = verify_image(result["url"], outputs["CloudFrontBaseUrl"], result.get("output_format", "webp"))
             row.update(verified)
         except Exception as error:  # noqa: BLE001 - verification is best-effort.
             row["verify_error"] = str(error)

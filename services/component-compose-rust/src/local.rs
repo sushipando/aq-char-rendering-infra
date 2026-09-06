@@ -145,6 +145,19 @@ impl Sink for FsSink {
         Ok(())
     }
 
+    async fn put_rgba(
+        &self,
+        frame_number: i64,
+        _key: &str,
+        bytes: &[u8],
+    ) -> Result<(), ComposeError> {
+        let dir = self.output_dir.join("frames");
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("{frame_number:06}.rgba"));
+        tokio::fs::write(&path, bytes).await?;
+        Ok(())
+    }
+
     async fn put_json(&self, _key: &str, value: &serde_json::Value) -> Result<(), ComposeError> {
         tokio::fs::create_dir_all(&self.output_dir).await?;
         let path = self

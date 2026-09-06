@@ -24,8 +24,20 @@ RUN curl -fsSL "https://storage.googleapis.com/downloads.webmproject.org/release
     && echo "ec874dd2e52097f11dd4999176ae6b6fb0ecb165bc1e05d3ecc9b29014fb003e  /tmp/webp.tar.gz" | sha256sum -c - \
     && mkdir -p /opt/libwebp && tar -xzf /tmp/webp.tar.gz --strip-components=1 -C /opt/libwebp
 
+# Original-RGBA sequence encoder, pinned independently from the WebP path.
+# libavif's LOCAL AOM dependency is pinned to v3.14.1 in this source release.
+RUN curl -fsSL https://codeload.github.com/AOMediaCodec/libavif/tar.gz/refs/tags/v1.4.2 -o /tmp/libavif.tar.gz \
+    && echo "2b645287340ba5a631d268b551dc2d72bd73ac33335962dd36dcdb6d8366921d  /tmp/libavif.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/libavif.tar.gz -C /tmp \
+    && cmake -S /build/pipeline-rust/native -B /tmp/avif-build \
+        -DCMAKE_BUILD_TYPE=Release -DLIBAVIF_SOURCE=/tmp/libavif-1.4.2 \
+    && cmake --build /tmp/avif-build -j 2 --target avif-rgba \
+    && cp /tmp/avif-build/avif-rgba /out/avif-rgba
+
 FROM public.ecr.aws/lambda/provided:al2023 AS runtime
 COPY --from=build /out/bootstrap /var/runtime/bootstrap
+COPY --from=build /out/avif-rgba /opt/avif/avif-rgba
+ENV CHAR_RENDER_AVIF_RGBA=/opt/avif/avif-rgba
 COPY --from=build /opt/libwebp/bin/webpmux /opt/libwebp/bin/webpmux
 ENV CHAR_RENDER_WEBPMUX=/opt/libwebp/bin/webpmux
 CMD ["bootstrap"]
