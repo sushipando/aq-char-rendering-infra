@@ -6,7 +6,7 @@ use std::{
     io::Read,
 };
 
-fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
+pub(crate) fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
         data.get(offset..offset + 2)
             .context("truncated SWF u16")?
@@ -39,6 +39,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 pub fn tags(data: &[u8], mut offset: usize) -> Result<Vec<(u16, &[u8])>> {
     let mut result = Vec::new();
     while offset < data.len() {
+        ensure!(result.len() < 2_000_000, "SWF tag count limit exceeded");
         let header = u16_at(data, offset)?;
         offset += 2;
         let mut length = (header & 63) as usize;
@@ -63,7 +64,7 @@ pub fn tags(data: &[u8], mut offset: usize) -> Result<Vec<(u16, &[u8])>> {
     Ok(result)
 }
 
-fn cstring(data: &[u8], offset: &mut usize) -> Result<String> {
+pub(crate) fn cstring(data: &[u8], offset: &mut usize) -> Result<String> {
     let end = data
         .get(*offset..)
         .context("truncated SWF string")?
@@ -166,7 +167,6 @@ impl Swf {
             }
         }
         let selected = match (idle, ready) {
-            (Some(i), Some(r)) if r < i => i - 1,
             (Some(i), _) => i,
             (_, Some(r)) => r,
             _ => 1,
@@ -287,6 +287,59 @@ fn color_transform(data: &[u8], offset: usize, alpha: bool) -> Result<[i64; 8]> 
 }
 
 type Placement = (u16, Option<u16>, Option<[i64; 8]>);
+
+/// Placement identity/name only. Rendering fields remain byte-for-byte in the SWF.
+pub(crate) fn instance(code: u16, data: &[u8]) -> Result<Option<(u16, Option<u16>, Option<String>, bool)>> {
+    if code == 4 {
+        return Ok(Some((u16_at(data, 2)?, Some(u16_at(data, 0)?), None, false)));
+    }
+    if !matches!(code, 26 | 70 | 94) { return Ok(None); }
+    let flags = *data.first().context("truncated placement")?;
+    ensure!(flags & 128 == 0, "AVM1 placement clip actions are unsupported");
+    let (depth, mut offset) = if code == 26 { (u16_at(data, 1)?, 3) } else { (u16_at(data, 2)?, 4) };
+    if code != 26 && (data[1] & 8 != 0 || (data[1] & 16 != 0 && flags & 2 != 0)) {
+        cstring(data, &mut offset)?;
+        ensure!(flags & 2 != 0, "class-only dynamic sprite placement is unsupported");
+    }
+    let id = if flags & 2 != 0 { let id = u16_at(data, offset)?; offset += 2; Some(id) } else { None };
+    if flags & 4 != 0 { offset = skip_matrix(data, offset)?; }
+    if flags & 8 != 0 {
+        let mut bits = Bits { data, offset: offset * 8 };
+        let add = bits.unsigned(1)?;
+        let mult = bits.unsigned(1)?;
+        let n = bits.unsigned(4)? as usize;
+        for _ in 0..4 * (add + mult) { bits.signed(n)?; }
+        offset = bits.bytes();
+    }
+    if flags & 16 != 0 { u16_at(data, offset)?; offset += 2; }
+    let name = if flags & 32 != 0 { Some(cstring(data, &mut offset)?) } else { None };
+    Ok(Some((depth, id, name, flags & 1 != 0)))
+}
+
+pub(crate) fn write_tag(output: &mut Vec<u8>, code: u16, data: &[u8]) {
+    let short = data.len().min(63) as u16;
+    output.extend_from_slice(&(code << 6 | short).to_le_bytes());
+    if short == 63 { output.extend_from_slice(&(data.len() as u32).to_le_bytes()); }
+    output.extend_from_slice(data);
+}
+
+/// Replace only DefineSprite payloads, preserving the stage header and all other tags.
+pub(crate) fn replace_sprites(source: &[u8], replacements: &BTreeMap<u16, Vec<u8>>) -> Result<Vec<u8>> {
+    if replacements.is_empty() { return Ok(source.to_vec()); }
+    let body = decompress(source)?;
+    let offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
+    let mut result = Vec::from(&source[..8]);
+    result[..3].copy_from_slice(b"FWS");
+    result.extend_from_slice(body.get(..offset).context("truncated SWF stage")?);
+    for (code, data) in tags(&body, offset)? {
+        let replacement = if code == 39 { replacements.get(&u16_at(data, 0)?) } else { None };
+        write_tag(&mut result, code, replacement.map(Vec::as_slice).unwrap_or(data));
+    }
+    let size = u32::try_from(result.len())?;
+    result[4..8].copy_from_slice(&size.to_le_bytes());
+    Ok(result)
+}
+
 fn placement(code: u16, data: &[u8]) -> Result<Option<Placement>> {
     if code == 4 {
         let offset = skip_matrix(data, 4)?;
@@ -379,7 +432,7 @@ mod tests {
             let swf = Swf::parse(&bytes).unwrap();
             assert_eq!(swf.frame_rate, 24.0);
             assert_eq!(swf.symbol("example").unwrap().0, 1);
-            assert_eq!(swf.timeline(1).unwrap(), (2, 1));
+            assert_eq!(swf.timeline(1).unwrap(), (3, 1));
             assert!(Swf::parse(&bytes[..bytes.len() - 1]).is_err());
         }
     }

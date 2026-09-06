@@ -7,8 +7,10 @@ use serde_json::Value;
 pub const VECTOR_SCHEMA: u32 = 6;
 pub const FFDEC_VERSION: &str = "26.2.1";
 // Bump whenever effective-export corrections or the pinned renderer change.
-pub const EXPORT_POLICY: &str = "rust-effective-svg-v1";
+pub const EXPORT_POLICY: &str = "rust-effective-svg-v2-timelines";
 pub const BOUNDS_POLICY: &str = "resvg-0.48.1-aqw-v1-cells-v1";
+// Final-container changes must not invalidate immutable intermediate caches.
+pub const FINALIZE_POLICY: &str = "webp-adjacent-runs-v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +126,8 @@ pub struct SourceManifest {
     pub states: BTreeMap<String, StateRef>,
     pub color_rules: BTreeMap<String, Vec<String>>,
     pub placement_colors: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub timeline_decisions: Vec<crate::timeline::Decision>,
 }
 
 impl SourceManifest {

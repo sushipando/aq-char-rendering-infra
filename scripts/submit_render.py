@@ -54,6 +54,7 @@ from smoke_test_deployment import load_outputs, seed_missing_assets, verify_webp
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description="Queue deployed AQW character renders (with WebP toggles) and watch them.",
+        epilog="Restart with the same appearance/settings and a new job ID: scripts/render-character --restart JOB_ID (must come first; --restart --help for options).",
     )
     result.add_argument("usernames", nargs="*", help="Public AQW character name(s)")
     result.add_argument("--outputs", type=Path, default=Path("cdk-outputs.dev.json"))
@@ -274,8 +275,16 @@ def queue_one(
         ),
         appearance=appearance,
     )
+    return enqueue_request(outputs, request, args.max_active)
+
+
+def enqueue_request(
+    outputs: dict[str, str], request: JobRequest, maximum_active: int
+) -> tuple[str, dict[str, Any]]:
+    """Shared normal admission/SQS path for fresh renders and restarts."""
     jobs = JobStore(outputs["JobTableName"])
-    jobs.acquire(request, args.max_active)
+    jobs.acquire(request, maximum_active)
+    job_id = request.job_id
     # Keep this CLI deterministic: every exposed flag is included explicitly,
     # independently of fleet defaults used to hydrate sparse Discord requests.
     queue_payload = request.to_dict()

@@ -219,28 +219,38 @@ test('component rasterization uses the request-selected Inline or Distributed Ma
   const inline = states.RasterComponentStatesInline;
   expect(inline.ItemsPath).toBe('$.prepare.component_task_indices');
   expect(inline.MaxConcurrency).toBe(40);
-  expect(inline.ResultPath).toBe('$.component_results');
+  expect(inline.ResultPath).toBeNull();
   expect(inline.ItemProcessor.ProcessorConfig).toEqual({ Mode: 'INLINE' });
-  expect(inline.Next).toBe('ComposeComponentFrameChunks');
+  expect(inline.Next).toBe('CollectComponentResults');
 
   const distributed = states.RasterComponentStatesDistributed;
   expect(distributed.ItemsPath).toBe('$.prepare.component_task_indices');
   expect(distributed.MaxConcurrency).toBe(200);
-  expect(distributed.ResultPath).toBe('$.component_results');
+  expect(distributed.ResultPath).toBeNull();
   expect(distributed.ItemProcessor.ProcessorConfig).toEqual({
     Mode: 'DISTRIBUTED',
     ExecutionType: 'EXPRESS',
   });
-  expect(distributed.Next).toBe('ComposeComponentFrameChunks');
+  expect(distributed.Next).toBe('CollectComponentResults');
 
   for (const map of [inline, distributed]) {
     const task = Object.values(map.ItemProcessor.States)[0] as any;
+    expect(task.ResultSelector).toEqual({ ack: 0 });
+    expect(task.OutputPath).toBe('$.ack');
     expect(task.Parameters).toMatchObject({
       'job_id.$': '$.job_id',
       'manifest_key.$': '$.manifest_key',
       'task_index.$': '$.task_index',
     });
   }
+
+  expect(states.CollectComponentResults.Next).toBe('ComposeComponentFrameChunks');
+  expect(states.ComposeComponentFrameChunks.ItemSelector['component_results_key.$']).toBe('$.components.manifest_key');
+  expect(states.ComposeComponentFrameChunks.ItemSelector.component_results).toBeUndefined();
+  expect(states.ComposeComponentFrameChunks.ItemSelector['component_results.$']).toBeUndefined();
+  expect(definition.States.ProtectedRenderWorkflow.Branches[0].StartAt).toBe('PrepareResolve');
+  expect(states.PrepareResume).toBeUndefined();
+  expect(states.SelectRenderEntry).toBeUndefined();
 
   // Function references are objects inside the Fn::Join array.
   const referencedFunctions = parts
@@ -277,6 +287,11 @@ test('the Rust component-raster worker is the live backend with 3008 MiB and no 
   );
   expect(rust).toBeDefined();
   expect(rust!.Properties).not.toHaveProperty('ReservedConcurrentExecutions');
+  expect(rust!.Properties.Environment.Variables).toEqual(
+    expect.objectContaining({
+      RESVG_BLUR_THREADS: 'single',
+    }),
+  );
 });
 
 test('component composition uses Rust with 40-way per-job Map concurrency', () => {

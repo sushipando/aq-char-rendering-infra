@@ -12,13 +12,18 @@ export AWS_PROFILE="$RENDER_AWS_PROFILE"
 export AWS_DEFAULT_REGION="$RENDER_AWS_REGION"
 export AWS_PAGER=""
 
-if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+if [[ "${1:-}" != "--help" && "${1:-}" != "-h" && "${2:-}" != "--help" && "${2:-}" != "-h" ]]; then
   if ! aws sts get-caller-identity \
       --profile "$RENDER_AWS_PROFILE" \
       --region "$RENDER_AWS_REGION" >/dev/null 2>&1; then
     echo ">> AWS session expired; opening SSO login for $RENDER_AWS_PROFILE"
     aws sso login --profile "$RENDER_AWS_PROFILE"
   fi
+fi
+
+if [[ "${1:-}" == "--restart" ]]; then
+  shift
+  exec uv run --package aqw-char-renderer python scripts/restart_render.py "$@"
 fi
 
 exec uv run --package aqw-char-renderer python scripts/submit_render.py "$@"

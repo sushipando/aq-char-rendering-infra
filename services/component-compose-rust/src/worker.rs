@@ -40,6 +40,19 @@ fn invalid(message: impl Into<String>) -> ComposeError {
     ComposeError::invalid(message)
 }
 
+fn stored_component_results(
+    event: &ComposeEvent,
+    manifest: serde_json::Value,
+) -> Result<Vec<ComponentResult>, ComposeError> {
+    if manifest["schema_version"] != 1
+        || manifest["job_id"] != event.job_id
+        || manifest["prepare_manifest_key"] != event.manifest_key
+    {
+        return Err(invalid("Component results manifest mismatch"));
+    }
+    Ok(serde_json::from_value(manifest["component_results"].clone())?)
+}
+
 fn missing_preview(missing: &[String]) -> String {
     let mut preview = missing
         .iter()
@@ -288,9 +301,21 @@ pub async fn run_chunk(
 
     // ---- results ----------------------------------------------------------
     let results_started = Instant::now();
+    let stored_results: Vec<ComponentResult>;
+    let component_results = if let Some(key) = &event.component_results_key {
+        if !event.component_results.is_empty() {
+            return Err(invalid("Supply either component_results or component_results_key"));
+        }
+        stored_results = stored_component_results(event, source.read_json(key).await?)?;
+        &stored_results
+    } else {
+        &event.component_results
+    };
     let mut results_by_task: HashMap<String, ComponentResult> = HashMap::new();
-    for result in &event.component_results {
-        results_by_task.insert(result.task_id.clone(), result.clone());
+    for result in component_results {
+        if results_by_task.insert(result.task_id.clone(), result.clone()).is_some() {
+            return Err(invalid(format!("Duplicate component result {}", result.task_id)));
+        }
     }
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     for composition in &compositions {
@@ -331,7 +356,7 @@ pub async fn run_chunk(
             )));
         }
     };
-    for result in &event.component_results {
+    for result in component_results {
         if result.empty {
             continue;
         }
@@ -606,6 +631,29 @@ mod tests {
     use crate::contract::{
         BatchIndex, ComponentComposition, ComponentFrame, ManifestSettings, PrepareManifest,
     };
+
+    #[test]
+    fn validates_s3_result_manifest_identity_and_schema() {
+        use serde_json::json;
+        let event = serde_json::from_value(json!({
+            "job_id":"job-1", "manifest_key":"prepare.json",
+            "component_results_key":"results.json", "batch":{"index":0}
+        })).unwrap();
+        let value = json!({"schema_version":1,"job_id":"job-1",
+            "prepare_manifest_key":"prepare.json",
+            "component_results":[{"task_id":"a","empty":true}]});
+        assert_eq!(super::stored_component_results(&event, value.clone()).unwrap().len(), 1);
+        for (field, wrong) in [
+            ("schema_version", json!(2)),
+            ("job_id", json!("another-job")),
+            ("prepare_manifest_key", json!("another-prepare.json")),
+            ("component_results", json!(null)),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = wrong;
+            assert!(super::stored_component_results(&event, invalid).is_err());
+        }
+    }
 
     fn manifest() -> PrepareManifest {
         PrepareManifest {

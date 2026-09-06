@@ -307,6 +307,7 @@ pub async fn run_local(cli: &CliOptions) -> Result<serde_json::Value, ComposeErr
         job_id,
         manifest_key: "local://manifest".to_string(),
         component_results: results,
+        component_results_key: None,
         batch: crate::contract::BatchIndex {
             index: cli.batch_index,
             frame_start: Some(cli.frame_start),

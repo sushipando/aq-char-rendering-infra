@@ -368,6 +368,7 @@ async fn unique_composition_encodes_once_and_emits_every_logical_frame() {
         job_id: "rust-integration".to_string(),
         manifest_key: "local://manifest".to_string(),
         component_results: results,
+        component_results_key: None,
         batch: aqw_component_compose::contract::BatchIndex {
             index: 0,
             frame_start: None,

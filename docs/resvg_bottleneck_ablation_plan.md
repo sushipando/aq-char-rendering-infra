@@ -541,6 +541,12 @@ usvg parsing/tree construction
 
 # 2026-09-04 ablation results (Godlow LaeDWearGoldDragon ground)
 
+Validation note (2026-09-05): the benchmark helper changes viewport size and
+adds a root scale while retaining the viewBox. For built component SVGs this
+scales artwork twice, so the resolution speedup ratios below must be
+revalidated. Correctly scaled tests on Annie's related dragon also reveal
+blur-dispatch sensitivity. See [the follow-up investigation](annie-dragon-raster-investigation.md).
+
 Ran the built component SVG (4096x2478, ~2.3M px tight page) through the
 in-process resvg 0.48.1 via `aqw-component-raster bench-svg` on an M1 with
 `RESVG_BLUR_BACKEND=original`. Median-ish single runs:

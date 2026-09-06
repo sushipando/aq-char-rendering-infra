@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// {
 ///   "job_id": "...",
 ///   "manifest_key": "jobs/.../prepare/manifest.json",
-///   "component_results": [...],
+///   "component_results_key": "jobs/.../component/manifest.json",
 ///   "batch": {"index": 0, "composition_start": 0, "composition_end": 0}
 /// }
 /// ```
@@ -25,6 +25,10 @@ pub struct ComposeEvent {
     pub manifest_key: String,
     #[serde(default)]
     pub component_results: Vec<ComponentResult>,
+    /// Production uses S3 instead of carrying all raster metadata in Map state.
+    /// Inline records remain supported for local benchmarks and old executions.
+    #[serde(default)]
+    pub component_results_key: Option<String>,
     pub batch: BatchIndex,
     #[serde(default, rename = "benchmark_output_prefix")]
     pub benchmark_output_prefix: Option<String>,

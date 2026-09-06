@@ -461,6 +461,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           description: `AQW character renderer component raster stage (Rust, resvg in-process)`,
           environment: {
             CHAR_RENDER_WORK_BUCKET: workBucket.bucketName,
+            RESVG_BLUR_THREADS: 'single',
           },
           ephemeralStorageSize: cdk.Size.mebibytes(
             tuning.functions.componentRaster.ephemeralStorageMiB,
@@ -606,7 +607,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     const componentRasterInlineMap = new sfn.Map(this, 'RasterComponentStatesInline', {
       itemsPath: '$.prepare.component_task_indices',
       maxConcurrency: tuning.render.componentRasterInlineConcurrency,
-      resultPath: '$.component_results',
+      resultPath: sfn.JsonPath.DISCARD,
       itemSelector: {
         job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
         manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
@@ -622,6 +623,10 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           task_index: sfn.JsonPath.numberAt('$.task_index'),
         }),
         payloadResponseOnly: true,
+        // Trim EACH iteration before Map aggregates. Discarding only the
+        // Map result still lets its raw result exceed the 256 KiB limit.
+        resultSelector: { ack: 0 },
+        outputPath: '$.ack',
       }).addRetry(lambdaRetry),
     );
 
@@ -632,7 +637,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         itemsPath: '$.prepare.component_task_indices',
         maxConcurrency: tuning.render.componentRasterConcurrency,
         mapExecutionType: sfn.StateMachineType.EXPRESS,
-        resultPath: '$.component_results',
+        resultPath: sfn.JsonPath.DISCARD,
         itemSelector: {
           job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
@@ -649,6 +654,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
           task_index: sfn.JsonPath.numberAt('$.task_index'),
         }),
         payloadResponseOnly: true,
+        resultSelector: { ack: 0 },
+        outputPath: '$.ack',
       }).addRetry(lambdaRetry),
     );
 
@@ -662,7 +669,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       itemSelector: {
         job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
         manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
-        component_results: sfn.JsonPath.listAt('$.component_results'),
+        component_results_key: sfn.JsonPath.stringAt('$.components.manifest_key'),
         batch: sfn.JsonPath.objectAt('$$.Map.Item.Value'),
       },
     });
@@ -672,7 +679,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         payload: sfn.TaskInput.fromObject({
           job_id: sfn.JsonPath.stringAt('$.job_id'),
           manifest_key: sfn.JsonPath.stringAt('$.manifest_key'),
-          component_results: sfn.JsonPath.listAt('$.component_results'),
+          component_results_key: sfn.JsonPath.stringAt('$.component_results_key'),
           batch: sfn.JsonPath.objectAt('$.batch'),
         }),
         payloadResponseOnly: true,
@@ -680,8 +687,19 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     );
 
     componentComposeMap.next(finalize);
-    componentRasterInlineMap.next(componentComposeMap);
-    componentRasterDistributedMap.next(componentComposeMap);
+    const collectComponentResults = new tasks.LambdaInvoke(this, 'CollectComponentResults', {
+      lambdaFunction: functions.prepare,
+      payload: sfn.TaskInput.fromObject({
+        phase: 'collect_components',
+        job_id: sfn.JsonPath.stringAt('$.prepare.job_id'),
+        manifest_key: sfn.JsonPath.stringAt('$.prepare.manifest_key'),
+      }),
+      payloadResponseOnly: true,
+      resultPath: '$.components',
+    }).addRetry(lambdaRetry);
+    collectComponentResults.next(componentComposeMap);
+    componentRasterInlineMap.next(collectComponentResults);
+    componentRasterDistributedMap.next(collectComponentResults);
     const componentRasterMode = new sfn.Choice(this, 'SelectComponentRasterMode')
       .when(
         sfn.Condition.stringEquals('$.request.component_raster_mode', 'inline'),

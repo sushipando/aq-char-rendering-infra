@@ -724,7 +724,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         .map(|a| a.weapon_type.clone())
         .unwrap_or_else(|| "Sword".into());
     let hash = crate::digest(
-        &json!({"schema_version":1,"renderer_version":config.renderer_version,"character_renderer_sha256":character.sha256,"ffdec_version":FFDEC_VERSION,"libwebp_version":"1.5.0","asset_dataset_version":config.dataset_version,"appearance":{"gender":gender,"visibility":fields.get("ia1"),"colors":fields.iter().filter(|(k,_)|k.starts_with("intColor")).collect::<BTreeMap<_,_>>(),"assets":assets,"sources":sources,"override":settings["override"]},"settings":settings,"bounds_policy":BOUNDS_POLICY}),
+        &json!({"schema_version":1,"renderer_version":config.renderer_version,"character_renderer_sha256":character.sha256,"ffdec_version":FFDEC_VERSION,"export_policy":EXPORT_POLICY,"finalize_policy":FINALIZE_POLICY,"libwebp_version":"1.5.0","asset_dataset_version":config.dataset_version,"appearance":{"gender":gender,"visibility":fields.get("ia1"),"colors":fields.iter().filter(|(k,_)|k.starts_with("intColor")).collect::<BTreeMap<_,_>>(),"assets":assets,"sources":sources,"override":settings["override"]},"settings":settings,"bounds_policy":BOUNDS_POLICY}),
     )?;
     let quality = settings["webp_quality"]
         .as_f64()
@@ -755,7 +755,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         .context("invalid max_frames")? as usize;
     let complete = settings["complete_loop"] == true;
     let precomputed = if complete && request["cache"]["animation"] == true {
-        precomputed_loop(store, config, &sources, max).await?
+        precomputed_loop(store, &config.source_bucket, &sources, max).await?
     } else {
         None
     };
@@ -782,7 +782,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
 
 async fn precomputed_loop(
     store: &dyn Store,
-    config: &Config,
+    source_bucket: &str,
     sources: &[Value],
     max: usize,
 ) -> Result<Option<Value>> {
@@ -795,9 +795,12 @@ async fn precomputed_loop(
             "animation-metadata/2/{FFDEC_VERSION}/{}.json",
             string(source, "sha256")?
         );
-        let Some(meta) = store::cached::<Value>(store, &config.source_bucket, &key).await? else {
+        let Some(meta) = store::cached::<Value>(store, source_bucket, &key).await? else {
             return Ok(None);
         };
+        // Legacy metadata measured timelines before nested state resolution. Its
+        // periods can truncate a corrected export even when all SVG caches miss.
+        if meta["export_policy"] != EXPORT_POLICY { return Ok(None); }
         for request in source["requests"]
             .as_array()
             .context("missing symbol requests")?
@@ -842,6 +845,19 @@ async fn precomputed_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn legacy_loop_metadata_cannot_truncate_normalized_timelines() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::FsStore(root.path().into());
+        let sources = vec![json!({"sha256":"fixture","requests":[{"key":"pet","class_name":"Pet"}]})];
+        let key = format!("animation-metadata/2/{FFDEC_VERSION}/fixture.json");
+        for policy in [None,Some("rust-effective-svg-v1"),Some(EXPORT_POLICY)] {
+            let mut meta = json!({"symbols":{"pet":{"period":37}}});
+            if let Some(policy) = policy { meta["export_policy"] = policy.into(); }
+            store::write(&store,"source",&key,&meta,false).await.unwrap();
+            assert_eq!(precomputed_loop(&store,"source",&sources,120).await.unwrap().is_some(),policy == Some(EXPORT_POLICY));
+        }
+    }
     #[test]
     fn armor_ranking_matches_sequence_matcher() {
         for (a, b, expected) in [

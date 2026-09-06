@@ -2,7 +2,7 @@
 //! tasks after each unique SVG is durably stored.
 use anyhow::{ensure, Context, Result};
 use aqw_component_raster::{
-    import::{transformed_bounds, IDENTITY},
+    import::IDENTITY,
     svg::{self, FFDEC_NS, XLINK_NS},
 };
 use futures::{stream, StreamExt, TryStreamExt};
@@ -289,7 +289,7 @@ impl Ffdec {
             };
             // Reconcile once after exit because filesystem events are an
             // optimization, not the source of truth. The later manifest pass
-            // does this again after settled-frame corrections are applied.
+            // also validates the final normalized export set.
             streamed += stream_completed_svgs(output_root, &mut observed, prefetcher).await;
             crate::log(
                 "ffdec_svg_stream_complete",
@@ -428,7 +428,7 @@ fn ranges(values: &[usize]) -> String {
 #[derive(Default, Serialize, Deserialize)]
 pub struct ScriptMetadata {
     pub color_rules: BTreeMap<String, Vec<String>>,
-    pub terminal_stops: BTreeMap<String, usize>,
+    pub timelines: BTreeMap<String, crate::script::Class>,
     pub random_pose: bool,
 }
 
@@ -440,54 +440,16 @@ impl ScriptMetadata {
             || (folded.contains("random")
                 && folded.contains("gotoandstop")
                 && folded.contains("totalframes"));
-        let class = Regex::new(r"\bclass\s+([A-Za-z_]\w*)\b")?;
-        let Some(class) = class.captures(text) else {
+        let Some((name, timeline)) = crate::script::parse(text)? else {
             return Ok(());
         };
-        let package = Regex::new(r"\bpackage(?:\s+([A-Za-z_][\w.]*))?\s*\{")?;
-        let package = package
-            .captures(text)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str())
-            .unwrap_or("");
-        let name = if package.is_empty() {
-            class[1].to_lowercase()
-        } else {
-            format!("{package}.{}", &class[1]).to_lowercase()
-        };
+        ensure!(self.timelines.insert(name.clone(), timeline).is_none(), "duplicate decompiled class {name}");
         let color = Regex::new(
             r#"(?:mcSetColor|setColor)\s*\(\s*this\s*,\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#,
         )?;
         if let Some(color) = color.captures(text) {
             self.color_rules
                 .insert(name.clone(), vec![color[1].into(), color[2].into()]);
-        }
-        let stop = Regex::new(r"(?:^|[^\w.])(?:this\.)?stop\s*\(\s*\)\s*;")?;
-        for pair in Regex::new(r"(\d+)\s*,\s*this\.([A-Za-z_]\w*)")?.captures_iter(text) {
-            let declaration = Regex::new(&format!(
-                r"\bfunction\s+{}\s*\([^)]*\)[^{{]*\{{",
-                regex::escape(&pair[2])
-            ))?;
-            if let Some(found) = declaration.find(text) {
-                let mut depth = 1;
-                for (index, c) in text[found.end()..].char_indices() {
-                    if c == '{' {
-                        depth += 1;
-                    } else if c == '}' {
-                        depth -= 1;
-                    }
-                    if depth == 0 {
-                        if stop.is_match(&text[found.end()..found.end() + index]) {
-                            let frame = pair[1].parse::<usize>()? + 1;
-                            self.terminal_stops
-                                .entry(name.clone())
-                                .and_modify(|f| *f = (*f).min(frame))
-                                .or_insert(frame);
-                        }
-                        break;
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -511,103 +473,6 @@ fn script_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     result.sort();
     Ok(result)
-}
-
-fn settled(
-    request: &SymbolRequest,
-    bytes: &[u8],
-    stops: &BTreeMap<String, usize>,
-) -> Result<Option<(SymbolRequest, Option<[f64; 6]>)>> {
-    if stops.get(&request.class_name.to_lowercase()) == Some(&(request.frame + 1)) {
-        let mut corrected = request.clone();
-        corrected.frame += 1;
-        corrected.root_timeline_frames = 1;
-        return Ok(Some((corrected, None)));
-    }
-    let document = svg::parse(bytes)?;
-    let rendered: Vec<_> = document
-        .root
-        .children
-        .iter()
-        .filter(|n| !matches!(n.local(), "defs" | "metadata" | "title" | "desc" | "style"))
-        .collect();
-    if rendered.len() != 1 || rendered[0].children.len() != 1 {
-        return Ok(None);
-    }
-    let child = &rendered[0].children[0];
-    if child.local() != "use"
-        || ["filter", "clip-path", "mask", "opacity"]
-            .iter()
-            .any(|name| child.get(name).is_some())
-    {
-        return Ok(None);
-    }
-    let (Some(name), Some(id)) = (
-        child.get_in("characterName", FFDEC_NS),
-        child.get_in("characterId", FFDEC_NS),
-    ) else {
-        return Ok(None);
-    };
-    let stop = stops.get(&name.to_lowercase()).copied().unwrap_or(0);
-    if stop < 2 {
-        return Ok(None);
-    }
-    let placement = child
-        .get("transform")
-        .and_then(svg::parse_matrix)
-        .unwrap_or(IDENTITY);
-    Ok(Some((
-        SymbolRequest {
-            key: request.key.clone(),
-            class_name: name.into(),
-            character_id: id.parse()?,
-            frame: stop,
-            root_timeline_frames: 1,
-        },
-        Some(placement),
-    )))
-}
-
-fn registration(bytes: &[u8], placement: [f64; 6], zoom: f64) -> Result<Vec<u8>> {
-    let mut document = svg::parse(bytes)?;
-    let root = &mut document.root;
-    let length = |name: &str| -> Result<f64> {
-        let raw = root.get(name).context("missing SVG dimension")?;
-        Ok(raw.strip_suffix("px").unwrap_or(raw).parse()?)
-    };
-    let (width, height) = (length("width")?, length("height")?);
-    let index = root
-        .children
-        .iter()
-        .position(|n| n.local() == "g")
-        .context("missing FFDec wrapper")?;
-    let mut frame = root.children.remove(index);
-    let m = frame
-        .get("transform")
-        .and_then(svg::parse_matrix)
-        .context("missing FFDec registration matrix")?;
-    ensure!(
-        m[1].abs() < 1e-8
-            && m[2].abs() < 1e-8
-            && (m[0] - zoom).abs() < 1e-5
-            && (m[3] - zoom).abs() < 1e-5,
-        "unexpected FFDec registration matrix"
-    );
-    let [x, y, w, h] = transformed_bounds(
-        [-m[4] / zoom, -m[5] / zoom, width / zoom, height / zoom],
-        placement,
-    );
-    frame.set("transform", svg::matrix_text(placement));
-    let mut wrapper = svg::Node::elem("g");
-    wrapper.set(
-        "transform",
-        svg::matrix_text([zoom, 0.0, 0.0, zoom, -x * zoom, -y * zoom]),
-    );
-    wrapper.children.push(frame);
-    root.children.insert(index, wrapper);
-    root.set("width", format!("{}px", svg::fmt_g(w * zoom)));
-    root.set("height", format!("{}px", svg::fmt_g(h * zoom)));
-    Ok(svg::serialize(&document).into_bytes())
 }
 
 fn mirror_flip(frames: &[Vec<u8>]) -> Result<usize> {
@@ -957,58 +822,27 @@ pub async fn export_source(
             .await?;
         let mut computed = ScriptMetadata::default();
         for path in script_files(&output)? {
-            computed.inspect(&String::from_utf8_lossy(&std::fs::read(path)?))?;
+            computed.inspect(&String::from_utf8_lossy(&std::fs::read(&path)?)).with_context(|| format!("decompiled script {}", path.display()))?;
         }
         if vector_cache {
             store::write(store, work_bucket, &metadata_key, &computed, true).await?;
         }
         computed
     };
+    let normalized = crate::timeline::normalize(&bytes, &swf, &metadata.timelines, &requests)?;
+    tokio::fs::write(&source_path, &normalized.bytes).await?;
+    crate::log("export_timeline_resolution", json!({"job_id":job,"source_idx":source_idx,"decisions":normalized.decisions}));
     let metadata_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut exported = ffdec
         .frames(
             &source_path,
-            &requests,
+            &normalized.requests,
             &temporary.path().join("exports"),
             zoom,
             FrameRange { start, count },
             prefetcher.as_ref(),
         )
         .await?;
-    let mut corrections = BTreeMap::new();
-    for request in &requests {
-        if let Some(correction) = settled(
-            request,
-            &exported[&request.key][0],
-            &metadata.terminal_stops,
-        )? {
-            corrections.insert(request.key.clone(), correction);
-        }
-    }
-    if !corrections.is_empty() {
-        let corrected: Vec<_> = corrections.values().map(|(r, _)| r.clone()).collect();
-        let frames = ffdec
-            .frames(
-                &source_path,
-                &corrected,
-                &temporary.path().join("settled"),
-                zoom,
-                FrameRange { start, count },
-                prefetcher.as_ref(),
-            )
-            .await?;
-        for (key, frames) in frames {
-            let effective = if let Some(placement) = corrections[&key].1 {
-                frames
-                    .iter()
-                    .map(|bytes| registration(bytes, placement, zoom))
-                    .collect::<Result<_>>()?
-            } else {
-                frames
-            };
-            exported.insert(key, effective);
-        }
-    }
     let ffdec_ms = started.elapsed().as_secs_f64() * 1000.0 - metadata_ms;
     let mut manifest = SourceManifest {
         schema_version: VECTOR_SCHEMA,
@@ -1019,6 +853,7 @@ pub async fn export_source(
         states: BTreeMap::new(),
         color_rules: metadata.color_rules,
         placement_colors: swf.placement_colors()?,
+        timeline_decisions: normalized.decisions.clone(),
     };
     let mut uploads = BTreeMap::new();
     for request in requests {
@@ -1035,13 +870,11 @@ pub async fn export_source(
             uploads.entry(state.svg_key.clone()).or_insert(bytes);
             manifest.states.insert(state.sha256.clone(), state);
         }
-        let (effective, stop) = corrections
-            .remove(&request.key)
-            .map(|(r, _)| {
-                let frame = r.frame;
-                (r, Some(frame))
-            })
-            .unwrap_or((request.clone(), None));
+        let effective = normalized.requests.iter().find(|r| r.key == request.key).context("missing normalized export request")?.clone();
+        let stop = normalized.decisions.iter().find(|d| d.character_id == request.character_id).and_then(|d| match d.selection {
+            crate::timeline::Selection::Hold { frame } => Some(frame),
+            _ => None,
+        });
         manifest.symbols.insert(
             request.key.clone(),
             SymbolExport {
@@ -1222,8 +1055,8 @@ mod tests {
     #[test]
     fn scripts_keep_cc_stops_and_random_pose() {
         let mut value = ScriptMetadata::default();
-        value.inspect(r#"package aq { public class Test { addFrameScript(25,this.frame26); function frame26():void {this.stop();} mcSetColor(this,"Base","dark"); gotoAndStop(Math.round(Math.random()*totalFrames)); }}"#).unwrap();
-        assert_eq!(value.terminal_stops["aq.test"], 26);
+        value.inspect(r#"package aq { public class Test { function Test() {addFrameScript(25,this.frame26);} function frame26():void {this.stop();} mcSetColor(this,"Base","dark"); gotoAndStop(Math.round(Math.random()*totalFrames)); }}"#).unwrap();
+        assert_eq!(value.timelines["aq.test"].frames[&26].commands[0].action, crate::script::Action::Stop);
         assert_eq!(value.color_rules["aq.test"], vec!["Base", "dark"]);
         assert!(value.random_pose);
     }
@@ -1232,48 +1065,72 @@ mod tests {
         assert_eq!(ranges(&[3, 1, 2, 3, 8, 9]), "1-3,8-9");
     }
 
-    #[test]
-    fn settled_root_and_child_keep_original_registration_without_probing() {
-        let request = SymbolRequest {
-            key: "pet".into(),
-            class_name: "Pet".into(),
-            character_id: 1,
-            frame: 7,
-            root_timeline_frames: 1,
-        };
-        let stops = BTreeMap::from([("pet".into(), 8)]);
-        assert_eq!(
-            settled(&request, b"not needed for adjacent root stop", &stops)
-                .unwrap()
-                .unwrap()
-                .0
-                .frame,
-            8
-        );
-        let child = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:f="{FFDEC_NS}" width="100" height="80"><g transform="matrix(1 0 0 1 20 30)"><use f:characterName="Child" f:characterId="2" href="#shape" transform="matrix(-1 0 0 1 15 25)"/></g></svg>"##
-        );
-        let stops = BTreeMap::from([("child".into(), 26)]);
-        let (corrected, placement) = settled(&request, child.as_bytes(), &stops)
-            .unwrap()
-            .unwrap();
-        assert_eq!((corrected.character_id, corrected.frame), (2, 26));
-        let original=br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80"><g transform="matrix(1 0 0 1 20 30)"><rect x="-20" y="-30" width="100" height="80"/></g></svg>"#;
-        let effective = registration(original, placement.unwrap(), 1.0).unwrap();
-        assert_ne!(crate::sha256(original), crate::sha256(&effective));
-        let document = svg::parse(&effective).unwrap();
-        let wrapper = &document.root.children[0];
-        assert_eq!(
-            svg::parse_matrix(wrapper.get("transform").unwrap()).unwrap(),
-            [1.0, 0.0, 0.0, 1.0, 65.0, 5.0]
-        );
-        assert_eq!(
-            svg::parse_matrix(wrapper.children[0].get("transform").unwrap()).unwrap(),
-            [-1.0, 0.0, 0.0, 1.0, 15.0, 25.0]
-        );
-        let unsafe_child = child.replace("<use ", "<use opacity=\"0.5\" ");
-        assert!(settled(&request, unsafe_child.as_bytes(), &stops)
-            .unwrap()
-            .is_none());
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_MOGLIN_SWF; local FFDec regression, no AWS"]
+    async fn real_moglin_export_keeps_idle_animated_without_walking() -> Result<()> {
+        let jar = PathBuf::from(std::env::var("AQW_TEST_FFDEC")?);
+        let bytes = std::fs::read(std::env::var("AQW_TEST_MOGLIN_SWF")?)?;
+        ensure!(crate::sha256(&bytes) == "777ad52938825594c49c4b46af688314e4e44ad5eae9dc44ae2c5450601b33f6", "wrong regression asset");
+        let root = tempfile::tempdir()?;
+        let store = FsStore(root.path().join("objects"));
+        let source = json!({"idx":0,"key":"pet.swf","sha256":crate::sha256(&bytes),"requests":[{"key":"pet","class_name":"QuibbleBFCM2024Pet","character_id":114,"frame":8,"root_timeline_frames":1}]});
+        store.put("source", "pet.swf", bytes, "application/octet-stream", true).await?;
+        store::write(&store,"work","input.json", &json!({"job_id":"fixture","sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":76}), false).await?;
+        let publisher = FakePublisher { store: &store, seen: Mutex::new(Vec::new()) };
+        let event = json!({"job_id":"fixture","input_key":"input.json","source":source});
+        let options = || ExportOptions { jar: jar.clone(), timeout: Duration::from_secs(180), bounds_prefetch: Some(BoundsPrefetch { publisher: &publisher, resolution:256, padding_pixels:1 }) };
+        let result = export_source(&store,"work","source",&event,options()).await?;
+        let manifest: SourceManifest = store::read(&store,"work",result["manifest_key"].as_str().unwrap()).await?;
+        assert_eq!(manifest.timeline_decisions.iter().find(|d| d.character_id == 113).unwrap().selection, crate::timeline::Selection::Hold { frame:16 });
+        assert!(!manifest.timeline_decisions.iter().any(|d| d.character_id == 94), "37-frame idle artwork should remain untouched");
+        assert!(manifest.states.len() > 1, "idle must not be frozen into a still image");
+        assert_eq!(manifest.symbols["pet"].schedule.len(), 76);
+        for state in manifest.states.values() {
+            let svg = store.get("work", &state.svg_key).await?.unwrap();
+            let doc = svg::parse(&svg)?;
+            assert!(!doc.root.iter().any(|n| n.get_in("characterId",FFDEC_NS).and_then(|s|s.parse::<u16>().ok()).is_some_and(|id| (101..=112).contains(&id))), "walking artwork leaked into the idle export");
+        }
+        let mut pixels = BTreeSet::new();
+        for frame in [0,15,37] {
+            let state = &manifest.states[&manifest.symbols["pet"].schedule[frame]];
+            let svg = store.get("work",&state.svg_key).await?.unwrap();
+            let tree = resvg::usvg::Tree::from_data(&svg,&resvg::usvg::Options::default())?;
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(256,256).unwrap();
+            let scale = 256.0/tree.size().width().max(tree.size().height());
+            resvg::render(&tree,resvg::tiny_skia::Transform::from_scale(scale,scale),&mut pixmap.as_mut());
+            assert!(pixmap.data().chunks_exact(4).any(|p|p[3]>0), "normalized idle rendered transparent");
+            pixels.insert(crate::sha256(pixmap.data()));
+        }
+        assert!(pixels.len()>1, "different SVG hashes must correspond to actual visible animation");
+        let queued: BTreeSet<_> = publisher.seen.lock().unwrap().iter().map(|t|t.state.sha256.clone()).collect();
+        assert_eq!(queued, manifest.states.keys().cloned().collect(), "prefetch must publish only corrected SVGs");
+        assert_eq!(export_source(&store,"work","source",&event,options()).await?["vector_cache_hit"], true);
+        println!("moglin regression: 76 frames, {} unique animated idle SVGs, no walking IDs, cache hit verified", manifest.states.len());
+        Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_SOURCE_CORPUS containing input.json and source/; no AWS"]
+    async fn real_source_corpus_resolves_before_export() -> Result<()> {
+        let root = PathBuf::from(std::env::var("AQW_TEST_SOURCE_CORPUS")?);
+        let input: Value = serde_json::from_slice(&std::fs::read(root.join("input.json"))?)?;
+        let ffdec = Ffdec { jar: std::env::var("AQW_TEST_FFDEC")?.into(), deadline: Instant::now() + Duration::from_secs(180) };
+        let temporary = tempfile::tempdir()?;
+        for (index, source) in input["sources"].as_array().context("missing corpus sources")?.iter().enumerate() {
+            let path = root.join("source").join(source["key"].as_str().context("missing source key")?);
+            let bytes = std::fs::read(&path)?;
+            let swf = Swf::parse(&bytes)?;
+            let mut requests: Vec<SymbolRequest> = serde_json::from_value(source["requests"].clone())?;
+            for r in &mut requests { r.frame = swf.timeline(r.character_id)?.0; }
+            let output = temporary.path().join(index.to_string());
+            ffdec.run(&temporary.path().join("home"), &["-onerror".into(),"ignore".into(),"-export".into(),"script".into(),output.to_string_lossy().into_owned(),path.to_string_lossy().into_owned()]).await?;
+            let mut metadata = ScriptMetadata::default();
+            for p in script_files(&output)? { metadata.inspect(&std::fs::read_to_string(p)?)?; }
+            let normalized = crate::timeline::normalize(&bytes,&swf,&metadata.timelines,&requests).with_context(||format!("source {}",path.display()))?;
+            Swf::parse(&normalized.bytes)?;
+            println!("corpus {}: {} requested roots; {} timeline corrections", path.display(), requests.len(), normalized.decisions.len());
+        }
+        Ok(())
+    }
+
 }

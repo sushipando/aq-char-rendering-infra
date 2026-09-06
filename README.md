@@ -104,6 +104,21 @@ every exporter completes, reuses valid prefetched results (including job-scoped
 no-cache results), and sends only unfinished work through the request-selected
 Inline or Distributed path.
 
+Before SVG generation, Rust resolves supported nested MovieClip state controls
+and normalizes an export-only SWF. Stopped controllers keep their idle artwork
+animated without advancing into Walk/Attack. Unsupported reachable controls fail
+with a sprite/frame diagnostic instead of silently guessing. See
+[nested timeline resolution](docs/nested-idle-timeline-resolution.md) for behavior,
+limits, cache invalidation, and local regression commands.
+
+`FinalizeAnimation` losslessly combines adjacent identical encoded frames by
+extending their duration. It preserves logical `frame_count` and reports
+`physical_frame_count` and `merged_frame_count` separately. A constant animation
+retains a timed animation frame, and oversized duration runs are split safely.
+This is automatic; no generation flag is required. Only the final-result cache
+identity changes. See the [audit implementation addendum](docs/render-speed-quality-audit-2026-09-06.md#implementation-addendum-adjacent-run-merging)
+for validation results and repeatable local tests.
+
 The bulk SWF corpus is checksummed and immutable. If a live character refers
 to a legitimate staff/legacy asset absent from that corpus, Prepare can fetch
 only from `https://game.aq.com/game/gamefiles/`, validate the SWF header, and
@@ -248,6 +263,41 @@ options). Use `scripts/render-character --help` for facing, hidden/base items,
 loop, start-frame, zoom, raster/output size, padding, item override, and WebP
 controls. The deployed request contract is resvg-only.
 
+Restart an existing job with the same appearance/assets, colors, render settings,
+and Map modes, but a fresh job ID and the currently deployed workflow:
+
+```bash
+scripts/render-character --restart eccabdb9-d329-4e3d-a0a8-5b30eb7425df --dry-run
+scripts/render-character --restart eccabdb9-d329-4e3d-a0a8-5b30eb7425df
+# Skip the completed-result shortcut while retaining intermediate caches:
+scripts/render-character --restart eccabdb9-d329-4e3d-a0a8-5b30eb7425df --no-render-cache
+# Force every cache off for a cold-path comparison:
+scripts/render-character --restart eccabdb9-d329-4e3d-a0a8-5b30eb7425df --no-cache
+```
+
+Restart goes through the same DynamoDB admission → SQS → launcher →
+`PrepareResolve` path as any normal job. It is not redrive or compose-only resume:
+no old rasters are copied, and the old job is not modified. The original cache
+settings apply by default, including `CachedResultExists`; cache hits can still
+skip work. Individual cache-disable flags are also available. The normal result
+notification targets the original Discord user/channel.
+
+The command reads the hydrated execution request, preserving the original asset
+selection rather than fetching today's equipment. When the request did not
+contain an appearance snapshot, it uses saved preparation fields; if neither
+snapshot remains, it refuses to silently change assets. Otherwise old temporary
+rasters/SVGs are not required. `--dry-run` prints the proposed request without
+writes. An execution ARN or console-created UUID execution name is also accepted.
+Use `scripts/render-character --restart --help` for restart-specific options.
+This CLI works with the normal deployed workflow; no special restart Lambda or
+state-machine branch is needed. Workflow changes themselves still require an
+operator deployment.
+
+Raster Map iterations now return scalar acknowledgements, and their aggregate
+is discarded. `CollectComponentResults` validates all expected records and
+writes `jobs/JOB/component/manifest.json`; compose receives only its S3 key,
+not an accumulated raster-results array. This works for both raster Map modes.
+
 `--bounds-mode inline|distributed` and
 `--component-raster-mode inline|distributed` are independent per-job fan-out
 switches, and both default to `inline`. Each is stored on the submitted job;
@@ -265,6 +315,22 @@ SVG bounds, and appearance-independent component-raster caches respectively.
 Uncached bounds and vector manifests are written under the job prefix, so
 later stages cannot consume older shared results. Exact source SWFs and the
 newly generated SVG blobs remain immutable pipeline inputs, not cache hits.
+
+### Benchmarking WebP against AVIF
+
+`scripts/benchmark_webp_avif.py` decodes an animated WebP to lossless RGBA PNG
+frames, benchmarks equivalent lossy and lossless WebP/AVIF encodes, verifies
+alpha and lossless round trips, and writes machine-readable results. Its quick
+default samples 12 evenly spaced frames:
+
+```bash
+scripts/benchmark-webp-avif
+```
+
+This defaults to `~/Desktop/annie-large.webp`; pass another input path when
+needed. Add `--full-animation` to also compare `img2webp` with AVIF sequence
+encoding over every frame, preserving source frame durations. The script
+requires the `cwebp`, `img2webp`, `avifenc`, and `avifdec` command-line tools.
 
 ### Rust component workers
 

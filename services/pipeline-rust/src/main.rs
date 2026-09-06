@@ -95,6 +95,9 @@ async fn prepare(
             .await
         }
         "finish" => pipeline::finish::finish(store, config, event).await,
+        "collect_components" => {
+            pipeline::components::collect(store, &config.work_bucket, event).await
+        }
         phase => anyhow::bail!("unknown prepare phase {phase}"),
     }
 }

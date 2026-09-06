@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Short local wrapper for scripts/benchmark_webp_avif.py.
+
+set -euo pipefail
+
+readonly RENDER_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+cd "$RENDER_REPO_ROOT"
+exec uv run --package aqw-char-renderer python scripts/benchmark_webp_avif.py "$@"

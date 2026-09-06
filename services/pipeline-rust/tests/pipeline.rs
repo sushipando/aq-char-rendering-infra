@@ -138,6 +138,7 @@ async fn synthetic(store: &dyn Store) -> Result<(Value, Value)> {
         states,
         color_rules: BTreeMap::new(),
         placement_colors: BTreeMap::new(),
+        timeline_decisions: Vec::new(),
     };
     store::write(
         store,
@@ -390,6 +391,8 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         for index in prepared["component_task_indices"].as_array().unwrap() {
             results.push(serde_json::to_value(aqw_component_raster::worker::run_raster_task(&serde_json::from_value(json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"task_index":index}))?,&raster_store,&raster_store).await?)?);
         }
+        let job = prepared["job_id"].as_str().unwrap();
+        let handoff = pipeline::components::collect(&store, "work", &json!({"job_id":job,"manifest_key":prepared["manifest_key"]})).await?;
         let compose_store = ComposeStore(&store);
         let opts = aqw_component_compose::worker::ComposeOptions {
             cwebp: std::env::var("AQW_TEST_CWEBP")?.into(),
@@ -403,7 +406,7 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
             .context("missing batches")?
         {
             let event = serde_json::from_value(
-                json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"component_results":results,"batch":batch}),
+                json!({"job_id":job,"manifest_key":prepared["manifest_key"],"component_results_key":handoff["manifest_key"],"batch":batch}),
             )?;
             rendered.push(serde_json::to_value(
                 aqw_component_compose::worker::run_chunk(
@@ -419,16 +422,18 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         let finalized = pipeline::finalize::finalize(
         &store,
         &test_config,
-        &json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"render_results":rendered}),
+        &json!({"job_id":job,"manifest_key":prepared["manifest_key"],"render_results":rendered}),
     )
     .await?;
         assert_eq!(finalized["frame_count"], frame_count);
+        assert_eq!(finalized["logical_frame_count"], frame_count);
+        assert!(finalized["physical_frame_count"].as_u64().unwrap() <= frame_count);
         assert!(finalized["bytes"].as_u64().unwrap() > 0);
         // Missing and duplicated encoded batches fail before publishing a result.
         assert!(pipeline::finalize::finalize(
             &store,
             &test_config,
-            &json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"render_results":[]})
+            &json!({"job_id":job,"manifest_key":prepared["manifest_key"],"render_results":[]})
         )
         .await
         .is_err());
@@ -436,11 +441,142 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         assert!(pipeline::finalize::finalize(
             &store,
             &test_config,
-            &json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"render_results":rendered})
+            &json!({"job_id":job,"manifest_key":prepared["manifest_key"],"render_results":rendered})
         )
         .await
         .is_err());
     }
+    Ok(())
+}
+
+async fn assert_same_webp_timeline(reference: &std::path::Path, candidate: &std::path::Path) -> Result<()> {
+    let result = tokio::process::Command::new(std::env::var("AQW_TEST_PYTHON").context("set AQW_TEST_PYTHON to a Python with Pillow")?)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/verify_webp_timeline.py"))
+        .arg(reference).arg(candidate).output().await?;
+    anyhow::ensure!(result.status.success(),"decoded timeline differs: {}",String::from_utf8_lossy(&result.stderr));
+    println!("{}",String::from_utf8_lossy(&result.stdout).trim());
+    Ok(())
+}
+
+async fn finalize_test_records(store: &FsStore, records: &[Value]) -> Result<Value> {
+    let prepared = json!({"job_id":JOB,"frame_count":records.len(),"frame_durations":records.iter().map(|r|r["duration"].clone()).collect::<Vec<_>>(),"final_key":"renders/merged.webp","render_hash":"fixture"});
+    store::write(store,"work","prepare.json",&prepared,false).await?;
+    // Reversed/out-of-order batches verify that runs follow logical order and
+    // cross batch boundaries, not completion order or canonical-frame order.
+    let reversed: Vec<_> = records.iter().rev().cloned().collect();
+    let mut results = Vec::new();
+    for (index, chunk) in reversed.chunks(3).enumerate() {
+        let key = format!("batch-{index}.json");
+        store::write(store,"work",&key,&json!({"job_id":JOB,"frames":chunk}),false).await?;
+        results.push(json!({"batch_manifest_key":key}));
+    }
+    pipeline::finalize::finalize(store,&config(),&json!({"job_id":JOB,"manifest_key":"prepare.json","render_results":results})).await
+}
+
+#[tokio::test]
+#[ignore = "requires AQW_TEST_CWEBP, CHAR_RENDER_WEBPMUX, and AQW_TEST_PYTHON with Pillow"]
+async fn adjacent_runs_preserve_decoded_pixels_timing_and_static_animation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    for lossless in [false,true] {
+        let mut images = Vec::new();
+        for variant in 0..2 {
+            let pixels: Vec<u8> = (0..64).flat_map(|n|[(40+variant*80) as u8,(n*3) as u8,180,if n%3==0 {0} else {128}]).collect();
+            let png = aqw_component_compose::png::encode_rgba8(8,8,&pixels)?;
+            let png_path = root.path().join(format!("{lossless}-{variant}.png"));
+            let webp_path = png_path.with_extension("webp");
+            tokio::fs::write(&png_path,png).await?;
+            let mut cmd = tokio::process::Command::new(std::env::var("AQW_TEST_CWEBP")?);
+            cmd.args(["-quiet","-q","85","-m","4"]);
+            if lossless { cmd.args(["-lossless","-exact"]); }
+            let output = cmd.arg(&png_path).arg("-o").arg(&webp_path).output().await?;
+            anyhow::ensure!(output.status.success(),"cwebp failed: {}",String::from_utf8_lossy(&output.stderr));
+            images.push((webp_path.clone(),tokio::fs::read(webp_path).await?));
+        }
+        for (case, variants, durations, expected_count) in [
+            ("still",vec![0],vec![42],1),
+            ("constant",vec![0,0,0,0],vec![41,42,41,42],1),
+            ("adjacent",vec![0,0,1,1,0],vec![41,42,41,42,41],3),
+            ("nonadjacent",vec![0,1,0],vec![41,42,41],3),
+            ("limit",vec![0,0],vec![0xffffff-19,20],2),
+            ("short",vec![0,0],vec![5,5],2),
+        ] {
+            let case_root = root.path().join(format!("{lossless}-{case}"));
+            let store = FsStore(case_root.clone());
+            let mut records = Vec::new();
+            let mut mux = tokio::process::Command::new(std::env::var("CHAR_RENDER_WEBPMUX")?);
+            for (index, (&variant, &duration)) in variants.iter().zip(&durations).enumerate() {
+                let (path, bytes) = &images[variant];
+                // Different keys for identical bytes exercise verified content identity.
+                let key = format!("frames/{index}.webp");
+                store.put("work",&key,bytes.clone(),"image/webp",false).await?;
+                records.push(json!({"frame":index+1,"webp_key":key,"sha256":pipeline::sha256(bytes),"bytes":bytes.len(),"x":0,"y":0,"width":8,"height":8,"canvas_width":8,"canvas_height":8,"duration":duration}));
+                mux.arg("-frame").arg(path).arg(format!("+{duration}+0+0+0-b"));
+            }
+            let baseline = case_root.join("baseline.webp");
+            let output = mux.args(["-loop","0","-bgcolor","0,0,0,0","-o"]).arg(&baseline).output().await?;
+            anyhow::ensure!(output.status.success(),"baseline mux failed: {}",String::from_utf8_lossy(&output.stderr));
+            let result = finalize_test_records(&store,&records).await?;
+            assert_eq!(result["frame_count"],records.len());
+            assert_eq!(result["physical_frame_count"],expected_count);
+            assert_eq!(result["duration_ms"],durations.iter().map(|d|*d as u64).sum::<u64>());
+            let candidate = case_root.join("work/renders/merged.webp");
+            assert_same_webp_timeline(&baseline,&candidate).await?;
+            if expected_count < records.len() { assert!(std::fs::metadata(&candidate)?.len() < std::fs::metadata(&baseline)?.len()); }
+        }
+        // Bad payload metadata must fail before any final image/cache publication.
+        for bad in ["checksum","length","dimensions","missing","metadata","animated"] {
+            let store = FsStore(root.path().join(format!("{lossless}-{bad}")));
+            let mut bytes = images[0].1.clone();
+            let mut record = json!({"frame":1,"webp_key":"bad.webp","sha256":pipeline::sha256(&bytes),"bytes":bytes.len(),"x":0,"y":0,"width":8,"height":8,"canvas_width":8,"canvas_height":8,"duration":42});
+            if bad == "metadata" {
+                bytes.extend_from_slice(b"EXIF\x02\0\0\0{}");
+                let size = (bytes.len()-8) as u32;
+                bytes[4..8].copy_from_slice(&size.to_le_bytes());
+            } else if bad == "animated" {
+                bytes = pipeline::webp::single_frame_animation(&bytes,[8,8],pipeline::webp::FrameInfo{x:0,y:0,width:8,height:8,duration:42,flags:2})?;
+            }
+            if matches!(bad,"metadata"|"animated") { record["sha256"]=pipeline::sha256(&bytes).into();record["bytes"]=bytes.len().into(); }
+            match bad { "checksum"=>bytes[15]^=1,"length"=>record["bytes"]=(bytes.len()+1).into(),"dimensions"=>{record["width"]=6.into();record["canvas_width"]=6.into();},_=>() }
+            if bad != "missing" { store.put("work","bad.webp",bytes,"image/webp",false).await?; }
+            assert!(finalize_test_records(&store,&[record]).await.is_err());
+            assert!(!store.exists("work","renders/merged.webp").await?);
+            assert!(!store.exists("work","renders/merged.webp.json").await?);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires AQW_TEST_RUN_SOURCE, CHAR_RENDER_WEBPMUX and AQW_TEST_PYTHON; optional AQW_TEST_RUN_OUTPUT"]
+async fn adjacent_runs_on_saved_animation() -> Result<()> {
+    let source = PathBuf::from(std::env::var("AQW_TEST_RUN_SOURCE")?);
+    let original = tokio::fs::read(&source).await?;
+    let info = pipeline::webp::inspect(&original)?;
+    anyhow::ensure!(info.loop_count == Some(0) && info.background == Some(0),"fixture must use current loop/background semantics");
+    let root = tempfile::tempdir()?;
+    let store = FsStore(root.path().into());
+    let mut records = Vec::new();
+    for (index, frame) in info.frames.iter().enumerate() {
+        anyhow::ensure!(frame.flags == pipeline::webp::REPLACE_NO_DISPOSE,"fixture must use no-blend/no-dispose frames");
+        let path = root.path().join(format!("frame-{index}.webp"));
+        let output = tokio::process::Command::new(std::env::var("CHAR_RENDER_WEBPMUX")?)
+            .args(["-get","frame",&(index+1).to_string()]).arg(&source).arg("-o").arg(&path).output().await?;
+        anyhow::ensure!(output.status.success(),"frame extraction failed: {}",String::from_utf8_lossy(&output.stderr));
+        let bytes = tokio::fs::read(path).await?;
+        let sha = pipeline::sha256(&bytes);
+        let key = format!("frames/{sha}.webp");
+        store.put("work",&key,bytes.clone(),"image/webp",true).await?;
+        records.push(json!({"frame":index+1,"webp_key":key,"sha256":sha,"bytes":bytes.len(),"x":frame.x,"y":frame.y,"width":frame.width,"height":frame.height,"canvas_width":info.canvas[0],"canvas_height":info.canvas[1],"duration":frame.duration}));
+    }
+    let result = finalize_test_records(&store,&records).await?;
+    let candidate = root.path().join("work/renders/merged.webp");
+    assert_same_webp_timeline(&source,&candidate).await?;
+    assert_eq!(result["frame_count"],info.frames.len());
+    if let Ok(path) = std::env::var("AQW_TEST_RUN_OUTPUT") {
+        tokio::fs::copy(&candidate,&path).await?;
+        tokio::fs::write(format!("{path}.json"),serde_json::to_vec_pretty(&result)?).await?;
+    }
+    println!("saved animation: before_bytes={}, result={result}",original.len());
     Ok(())
 }
 
