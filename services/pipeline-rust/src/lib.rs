@@ -5,6 +5,7 @@ pub mod config;
 pub mod contract;
 pub mod control;
 pub mod export;
+pub mod export_plan;
 pub mod finalize;
 pub mod finish;
 pub mod geometry;

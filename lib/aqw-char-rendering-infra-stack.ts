@@ -43,6 +43,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     super(scope, id, props);
 
     const { stageName, tuning } = props;
+    if (tuning.prepareExportConcurrency < 1 || tuning.prepareExportConcurrency > 40) {
+      throw new Error('Symbol-export Inline Map concurrency must be between 1 and 40');
+    }
     if (tuning.boundsQueueVisibilitySeconds < 6 * tuning.functions.bounds.timeoutSeconds) {
       throw new Error('Bounds queue visibility must cover six worker timeouts');
     }
@@ -497,7 +500,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       backoffRate: 2,
       maxAttempts: 5,
     };
-    // Export stores vectors per source and immediately prefetches their bounds.
+    // Each independently placed symbol exports in its own invocation and
+    // immediately prefetches its bounds, including multipart source SWFs.
     // This planner is still the barrier and dispatches only unfinished states.
     const prepareResolve = new tasks.LambdaInvoke(this, 'PrepareResolve', {
       lambdaFunction: functions.prepare,

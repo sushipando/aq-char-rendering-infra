@@ -719,6 +719,8 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         requests.sort_by(|a, b| a.key.cmp(&b.key));
         sources.push(json!({"idx":index,"key":record.key,"sha256":record.sha256,"remote_path":record.remote_path,"requests":requests}));
     }
+    let source_count = sources.len();
+    let sources = crate::export_plan::partition(sources)?;
     let weapon_type = assets
         .get("weapon")
         .map(|a| a.weapon_type.clone())
@@ -774,7 +776,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     store::write(store,&config.work_bucket,&input_key,&json!({"schema_version":1,"job_id":job,"render_hash":hash,"final_key":final_key,"export_frame_count":export_count,"precomputed_loop":precomputed,"fields":fields,"aliases":aliases,"weapon_type":weapon_type,"settings":settings,"bounds_mode":request["bounds_mode"],"component_raster_mode":request["component_raster_mode"],"cache":request["cache"],"warnings":warnings,"character_renderer":character,"frame_rate":character_swf.frame_rate,"sources":sources}),false).await?;
     crate::log(
         "prepare_resolve_profile",
-        json!({"job_id":job,"cache_hit":false,"cache":request["cache"],"source_count":sources.len(),"export_frame_count":export_count,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
+        json!({"job_id":job,"cache_hit":false,"cache":request["cache"],"source_count":source_count,"export_unit_count":sources.len(),"export_frame_count":export_count,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(
         json!({"schema_version":1,"job_id":job,"cache_hit":false,"input_key":input_key,"render_hash":hash,"final_key":final_key,"sources":sources}),
@@ -791,14 +793,19 @@ async fn precomputed_loop(
     let mut blink = None;
     let mut static_keys = Vec::new();
     let mut ground = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
     for source in sources {
         let key = format!(
             "animation-metadata/2/{FFDEC_VERSION}/{}.json",
             string(source, "sha256")?
         );
-        let Some(meta) = store::cached::<Value>(store, source_bucket, &key).await? else {
-            return Ok(None);
-        };
+        if !metadata.contains_key(&key) {
+            let Some(meta) = store::cached::<Value>(store, source_bucket, &key).await? else {
+                return Ok(None);
+            };
+            metadata.insert(key.clone(), meta);
+        }
+        let meta = &metadata[&key];
         // Legacy metadata measured timelines before nested state resolution. Its
         // periods can truncate a corrected export even when all SVG caches miss.
         if meta["export_policy"] != EXPORT_POLICY { return Ok(None); }

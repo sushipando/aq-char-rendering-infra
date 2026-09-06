@@ -10,7 +10,7 @@ test('dev environment targets the dedicated account and exposes tuning in one co
   expect(environment.account).toBe('538522204887');
   expect(environment.region).toBe('us-west-2');
   expect(environment.stage).toBe('dev');
-  expect(environment.tuning.prepareExportConcurrency).toBe(8);
+  expect(environment.tuning.prepareExportConcurrency).toBe(40);
   expect(environment.tuning.boundsInlineConcurrency).toBe(40);
   expect(environment.tuning.render).toMatchObject({
     rendererVersion: 'v20-rust-bounds',

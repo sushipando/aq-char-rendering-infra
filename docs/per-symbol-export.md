@@ -1,0 +1,9 @@
+# Independent exports for multipart assets
+
+Armor parts and separately placed helm/hair back pieces now receive independent export tasks. The existing export Map runs up to 40 tasks concurrently. Bounds already run per unique SVG, and rasterization already runs per unique placed symbol/state; those stages retain their existing global deduplication and layer ordering. No arbitrary SVG group splitting is performed, which would change filter/isolation semantics.
+
+Each export carries the full original source's timeline-normalization context, but asks FFDec to export only its own symbol. This preserves shared child-state decisions and conflict detection from batched exports. The context participates in the vector-cache identity. Old batched manifests remain readable, and single-symbol vector identities remain compatible. Each independently emitted manifest must contain exactly the symbols assigned to its export unit; missing, swapped, or duplicate unit handoffs fail validation.
+
+Immutable SVG objects, script metadata, and bounds results still share their existing caches. Animation metadata is read once per source during planning even when that SWF has several export tasks. A completely cold multipart source can still cause concurrent workers to decompile the same script metadata before the shared cache is populated; this trades aggregate cold-start work for parallel export latency. No AWS speedup or reduction in billed work is claimed without a matched deployment benchmark.
+
+Validation covers independent armor/helm units, preservation of shared normalization context, rejection of duplicate/missing/swapped work, and identical raster PNG hashes, placement, frame order, timing, framing, and loop decisions for batched versus split source manifests. The full Rust pipeline suite and infrastructure tests are the deployment gates.

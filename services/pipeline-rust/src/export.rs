@@ -718,7 +718,8 @@ pub async fn export_source(
             .any(|s| s["idx"] == source["idx"]
                 && s["sha256"] == source["sha256"]
                 && s["key"] == source["key"]
-                && s["requests"] == source["requests"]),
+                && s["requests"] == source["requests"]
+                && s.get("normalization_requests") == source.get("normalization_requests")),
         "source does not match prepare input"
     );
     let source_hash = source["sha256"]
@@ -728,6 +729,10 @@ pub async fn export_source(
     let vector_cache = prepared["cache"]["vectors"].as_bool().unwrap_or(true);
     let bounds_cache = prepared["cache"]["bounds"].as_bool().unwrap_or(true);
     let requests: Vec<SymbolRequest> = serde_json::from_value(source["requests"].clone())?;
+    let normalization_requests: Vec<SymbolRequest> = serde_json::from_value(
+        source.get("normalization_requests").unwrap_or(&source["requests"]).clone(),
+    )?;
+    ensure!(!requests.is_empty(), "empty export unit");
     let settings = &prepared["settings"];
     let zoom = settings["zoom"].as_f64().context("missing zoom")?;
     let probe_config = bounds_prefetch
@@ -744,9 +749,11 @@ pub async fn export_source(
     let count = prepared["export_frame_count"]
         .as_u64()
         .context("missing export count")? as usize;
-    let identity = crate::digest(
-        &json!({"schema":VECTOR_SCHEMA,"policy":EXPORT_POLICY,"ffdec":FFDEC_VERSION,"sha256":source_hash,"requests":requests,"zoom":zoom,"start":start,"count":count}),
-    )?;
+    let mut export_inputs = json!({"schema":VECTOR_SCHEMA,"policy":EXPORT_POLICY,"ffdec":FFDEC_VERSION,"sha256":source_hash,"requests":requests,"zoom":zoom,"start":start,"count":count});
+    if source.get("normalization_requests").is_some() {
+        export_inputs["normalization_requests"] = serde_json::to_value(&normalization_requests)?;
+    }
+    let identity = crate::digest(&export_inputs)?;
     let manifest_key = if vector_cache {
         format!("vector-manifests/{VECTOR_SCHEMA}/{identity}.json")
     } else {
@@ -829,14 +836,18 @@ pub async fn export_source(
         }
         computed
     };
-    let normalized = crate::timeline::normalize(&bytes, &swf, &metadata.timelines, &requests)?;
+    let normalized = crate::timeline::normalize(&bytes, &swf, &metadata.timelines, &normalization_requests)?;
+    let selected: BTreeSet<_> = requests.iter().map(|r| r.key.as_str()).collect();
+    let effective_requests: Vec<_> = normalized.requests.iter()
+        .filter(|r| selected.contains(r.key.as_str())).cloned().collect();
+    ensure!(effective_requests.len() == requests.len(), "export unit is missing from normalization context");
     tokio::fs::write(&source_path, &normalized.bytes).await?;
     crate::log("export_timeline_resolution", json!({"job_id":job,"source_idx":source_idx,"decisions":normalized.decisions}));
     let metadata_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut exported = ffdec
         .frames(
             &source_path,
-            &normalized.requests,
+            &effective_requests,
             &temporary.path().join("exports"),
             zoom,
             FrameRange { start, count },

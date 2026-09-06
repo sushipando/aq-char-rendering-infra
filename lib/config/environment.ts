@@ -208,10 +208,9 @@ const DEV_TUNING: InfrastructureTuning = {
     shutdownPercent: 100,
   },
   workflowTimeoutMinutes: 60,
-  // Each source SWF exports in its own Lambda, with its own CPU allocation.
-  // A character normally has about five sources, so keep enough concurrency
-  // to export all of them in one wave.
-  prepareExportConcurrency: 8,
+  // Export independently placed symbols (armor parts, helm/backhair, etc.)
+  // in separate Lambdas. Let ordinary characters fit in one Inline Map wave.
+  prepareExportConcurrency: 40,
   // A request selects Inline or Distributed bounds fan-out. AWS Inline Map
   // supports at most 40 concurrent iterations, processing larger task lists
   // in additional waves while they fit within the workflow payload limit.

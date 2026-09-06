@@ -164,6 +164,59 @@ async fn synthetic(store: &dyn Store) -> Result<(Value, Value)> {
 }
 
 #[tokio::test]
+async fn split_exports_preserve_rasters_order_and_global_bounds_dedup() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = FsStore(temporary.path().into());
+    let raster_store = aqw_component_raster::storage::FsStore::new(temporary.path().into());
+    let (request, _) = synthetic(&store).await?;
+    let original: SourceManifest = store::read(&store, "work", "vector-manifests/fixture.json").await?;
+    let mut input: Value = store::read(&store, "work", "jobs/input.json").await?;
+    input["cache"] = json!({"components":false});
+    input["sources"][0]["requests"] = serde_json::to_value(original.symbols.values().map(|s| &s.request).collect::<Vec<_>>())?;
+    let mut snapshots = Vec::new();
+    for split in [false, true] {
+        let mut keys = BTreeMap::from([(0, "vector-manifests/fixture.json".to_string())]);
+        if split {
+            input["sources"] = serde_json::to_value(pipeline::export_plan::partition(input["sources"].as_array().unwrap().clone())?)?;
+            keys.clear();
+            for unit in input["sources"].as_array().unwrap() {
+                let name = unit["requests"][0]["key"].as_str().unwrap();
+                let mut manifest = original.clone();
+                manifest.symbols.retain(|key, _| key == name);
+                let key = format!("vector-manifests/{name}.json");
+                store::write(&store, "work", &key, &manifest, false).await?;
+                keys.insert(unit["idx"].as_u64().unwrap() as usize, key);
+            }
+        }
+        store::write(&store, "work", "jobs/input.json", &input, false).await?;
+        if split {
+            assert!(bounds::plan(&store, "work", JOB, "jobs/input.json", BTreeMap::from([(0, keys[&1].clone()),(1,keys[&0].clone())]), ProbeConfig::new(1.0), bounds::PlanOptions::new(true,bounds::BoundsMode::Inline)).await.is_err());
+            assert!(bounds::plan(&store, "work", JOB, "jobs/input.json", BTreeMap::from([(0,keys[&0].clone())]), ProbeConfig::new(1.0), bounds::PlanOptions::new(true,bounds::BoundsMode::Inline)).await.is_err());
+        }
+        let planned = bounds::plan(&store, "work", JOB, "jobs/input.json", keys, ProbeConfig::new(1.0), bounds::PlanOptions::new(true,bounds::BoundsMode::Inline)).await?;
+        let tasks: Vec<ProbeTask> = store::read(&store,"work",planned["tasks_key"].as_str().unwrap()).await?;
+        for task in tasks { bounds::run_probe(&store,"work",&task).await?; }
+        let plan: BoundsPlan = store::read(&store,"work",planned["plan_key"].as_str().unwrap()).await?;
+        assert_eq!(plan.states.len(),2);
+        let prepared = finish::finish(&store,&config(),&json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]})).await?;
+        let manifest: Value = store::read(&store,"work",prepared["manifest_key"].as_str().unwrap()).await?;
+        let mut rasters = BTreeMap::new();
+        for index in 0..manifest["component_tasks"].as_array().unwrap().len() {
+            let event = serde_json::from_value(json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"task_index":index}))?;
+            let result = aqw_component_raster::worker::run_raster_task(&event,&raster_store,&raster_store).await?;
+            rasters.insert(result.task_id, json!({"png":result.sha256,"x":result.x,"y":result.y,"width":result.width,"height":result.height,"symbol":result.symbol_key}));
+        }
+        let frames: Vec<_> = manifest["component_frames"].as_array().unwrap().iter().map(|frame| {
+            let layers: Vec<_> = frame["layers"].as_array().unwrap().iter().map(|id|rasters[id.as_str().unwrap()].clone()).collect();
+            json!({"duration":frame["duration_ms"],"layers":layers})
+        }).collect();
+        snapshots.push(json!({"viewbox":manifest["viewbox"],"frames":frames,"loop":manifest["detected_loop"]}));
+    }
+    assert_eq!(snapshots[0],snapshots[1]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_dedup_barrier_cache_and_direct_component_contract() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let store = FsStore(temporary.path().into());
@@ -675,7 +728,9 @@ async fn replay_incident_through_all_rust_stages() -> Result<()> {
             .iter()
             .find(|s| s["sha256"] == source["sha256"])
             .context("unexpected resolved source")?;
-        assert_eq!(source["requests"], expected["requests"]);
+        assert_eq!(source["requests"].as_array().unwrap().len(), 1);
+        assert!(expected["requests"].as_array().unwrap().contains(&source["requests"][0]));
+        assert_eq!(source.get("normalization_requests").unwrap_or(&source["requests"]), &expected["requests"]);
     }
     let job = request["job_id"].as_str().unwrap();
     let mut sources = BTreeMap::new();

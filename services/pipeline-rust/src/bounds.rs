@@ -447,6 +447,7 @@ pub async fn plan(
         expected == source_keys.keys().copied().collect(),
         "missing or unexpected source export"
     );
+    ensure!(expected.len() == prepared["sources"].as_array().unwrap().len(), "duplicate export unit index");
     let mut states = BTreeMap::new();
     let mut exported_frames = 0;
     for (index, key) in &source_keys {
@@ -462,6 +463,13 @@ pub async fn plan(
             source["sha256"] == manifest.source_sha256,
             "source export identity mismatch"
         );
+        if let Some(requests) = source["requests"].as_array() {
+            let expected_symbols: BTreeSet<_> = requests.iter()
+                .map(|r| r["key"].as_str().context("missing requested symbol"))
+                .collect::<Result<_>>()?;
+            ensure!(expected_symbols == manifest.symbols.keys().map(String::as_str).collect(),
+                "export unit contains missing or unexpected symbols");
+        }
         exported_frames += manifest
             .symbols
             .values()
