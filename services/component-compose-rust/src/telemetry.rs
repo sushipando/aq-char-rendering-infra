@@ -34,6 +34,8 @@ pub struct Timings {
     pub downsample_ms: f64,
     pub encode_ms: f64,
     pub upload_ms: f64,
+    /// Upload time hidden behind a subsequent frame's WebP encode.
+    pub upload_overlap_ms: f64,
     pub manifest_write_ms: f64,
 }
 
@@ -47,6 +49,7 @@ impl Timings {
             + self.downsample_ms
             + self.encode_ms
             + self.upload_ms
+            - self.upload_overlap_ms
             + self.manifest_write_ms
     }
 }
@@ -164,6 +167,11 @@ pub fn log_profile(stats: &ChunkStats) {
     );
     field(&mut fields, "encode_ms", rounded_ms(timings.encode_ms));
     field(&mut fields, "upload_ms", rounded_ms(timings.upload_ms));
+    field(
+        &mut fields,
+        "upload_overlap_ms",
+        rounded_ms(timings.upload_overlap_ms),
+    );
     field(
         &mut fields,
         "manifest_write_ms",

@@ -138,6 +138,12 @@ struct CompositionWork {
     logical_frames: Vec<i64>,
 }
 
+struct PendingUpload {
+    frame_number: i64,
+    key: String,
+    bytes: Vec<u8>,
+}
+
 /// Validate the global recipe partition and select the unique compositions
 /// addressed by this batch. Old frame-range events remain supported during
 /// rollout and by the local benchmarking CLI.
@@ -381,6 +387,8 @@ pub async fn run_chunk(
     let mut downsample_total = 0.0;
     let mut encode_total = 0.0;
     let mut upload_total = 0.0;
+    let mut upload_overlap_total: f64 = 0.0;
+    let mut pending_upload: Option<PendingUpload> = None;
     let downsampled_in_compose = component_raster_space == "raster" && output_size < raster_size;
 
     for composition in &compositions {
@@ -427,22 +435,51 @@ pub async fn run_chunk(
             tokio::fs::write(retain_dir.join(format!("{frame_number:06}.png")), &raw_png).await?;
         }
         let webp_path = opts.scratch_dir.join(format!("{frame_number:06}.webp"));
-        encode_webp(
-            &opts.cwebp,
-            settings.webp_quality,
-            settings.webp_method,
-            settings.webp_lossless.unwrap_or(false),
-            &png_path,
-            &webp_path,
-        )
-        .await?;
+        let encode_prep_ms = elapsed_ms(encode_started);
+        let cwebp_started = Instant::now();
+        let encode = async {
+            let result = encode_webp(
+                &opts.cwebp,
+                settings.webp_quality,
+                settings.webp_method,
+                settings.webp_lossless.unwrap_or(false),
+                &png_path,
+                &webp_path,
+            )
+            .await;
+            (result, elapsed_ms(cwebp_started))
+        };
+        let cwebp_ms = if let Some(upload) = pending_upload.take() {
+            let upload_started = Instant::now();
+            let upload_frame = upload.frame_number;
+            let upload_key = upload.key;
+            let upload_bytes = upload.bytes;
+            let upload = async {
+                let result = sink
+                    .put_webp(upload_frame, &upload_key, &upload_bytes)
+                    .await;
+                (result, elapsed_ms(upload_started))
+            };
+            let ((encode_result, encode_ms), (upload_result, upload_ms)) =
+                tokio::join!(encode, upload);
+            encode_result?;
+            upload_result?;
+            upload_total += upload_ms;
+            upload_overlap_total += encode_ms.min(upload_ms);
+            encode_ms
+        } else {
+            let (encode_result, encode_ms) = encode.await;
+            encode_result?;
+            encode_ms
+        };
+        let encode_cleanup_started = Instant::now();
         let webp_bytes = tokio::fs::read(&webp_path).await?;
         let _ = tokio::fs::remove_file(&png_path).await;
         let _ = tokio::fs::remove_file(&webp_path).await;
-        encode_total += elapsed_ms(encode_started);
+        encode_total += encode_prep_ms + cwebp_ms + elapsed_ms(encode_cleanup_started);
         drop(canvas);
 
-        // ---- upload -------------------------------------------------------
+        // ---- queue upload -------------------------------------------------
         let webp_key = match &event.benchmark_output_prefix {
             Some(prefix) => format!("{prefix}/webp-frames/{frame_number:06}.webp"),
             None => format!(
@@ -450,10 +487,6 @@ pub async fn run_chunk(
                 event.job_id
             ),
         };
-        let upload_started = Instant::now();
-        sink.put_webp(frame_number, &webp_key, &webp_bytes).await?;
-        upload_total += elapsed_ms(upload_started);
-
         let sha256 = sha256_hex(&webp_bytes);
         for &logical_frame in &composition.logical_frames {
             let frame = &prepared.component_frames[logical_frame as usize - 1];
@@ -471,6 +504,20 @@ pub async fn run_chunk(
                 bytes: webp_bytes.len(),
             });
         }
+        // Retain at most one encoded frame. Its upload is polled alongside
+        // the next frame's cwebp process; the final upload is awaited below.
+        pending_upload = Some(PendingUpload {
+            frame_number,
+            key: webp_key,
+            bytes: webp_bytes,
+        });
+    }
+
+    if let Some(upload) = pending_upload {
+        let upload_started = Instant::now();
+        sink.put_webp(upload.frame_number, &upload.key, &upload.bytes)
+            .await?;
+        upload_total += elapsed_ms(upload_started);
     }
 
     if frame_canvases.len() != 1 {
@@ -509,6 +556,7 @@ pub async fn run_chunk(
         downsample_ms: downsample_total,
         encode_ms: encode_total,
         upload_ms: upload_total,
+        upload_overlap_ms: upload_overlap_total,
         manifest_write_ms,
     };
     let stats = ChunkStats {

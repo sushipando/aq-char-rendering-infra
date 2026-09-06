@@ -21,13 +21,13 @@ That job produced 120 logical frame objects, but only 30 unique WebP payloads. N
 | Rank | Idea | Expected win | Ease | Notes |
 | ---: | --- | --- | --- | --- |
 | 1 | Deduplicate complete frame recipes globally | Very high | Medium | The measured job could fall from 120 encodes to 30. |
-| 2 | Run one unique composition per Lambda with Map concurrency 40 | High latency win | Easy after dedup | Gives up to 40 unique encodes one wave without multiplying duplicate work. |
+| 2 | Adapt composition batches to Map concurrency 40 | High latency win | Easy after dedup | Uses one frame per Lambda up to 40 unique recipes, then consecutive balanced batches. |
 | 3 | Lower the `cwebp` method | Medium | Easy | Trades compression efficiency or output size for speed. Benchmark before changing output defaults. |
 | 4 | Enable `cwebp -mt` and allocate more CPU | Medium | Easy | Must be measured on Lambda ARM64; it may be less useful when each Lambda encodes only one frame. |
 | 5 | Call libwebp directly with RGBA | Medium | Hard | Removes temporary PNG creation, filesystem I/O, and a subprocess, but encoding itself remains. |
 | 6 | Merge adjacent identical animation frames by adding durations | Medium for some jobs | Medium | Reduces final WebP physical frames, but changes validation and timing semantics. Defer initially. |
 | 7 | Store component RGBA as zstd instead of PNG | Low from current evidence | Hard | Download plus PNG decode was about 100 ms per ten frames, far below WebP encode time. |
-| 8 | Overlap WebP uploads with encoding | Low after one-frame fan-out | Medium | There is no next encode to overlap in a one-composition invocation. |
+| 8 | Overlap WebP uploads with encoding | Low but cheap | Medium | Multi-frame adaptive batches can upload frame N during frame N+1's encode. |
 
 ## Exact deduplication key
 
@@ -49,7 +49,7 @@ Deduplication is global across the job, not scoped to the existing ten-frame bat
 }
 ```
 
-`component_batches` will address ranges of `component_compositions`, rather than ranges of logical frame numbers. Initially the deployment default should be one unique composition per batch and Map concurrency 40. Both values remain environment-configurable.
+`component_batches` addresses consecutive ranges of `component_compositions`, rather than ranges of logical frame numbers. Its batch size is computed as `ceil(unique_compositions / compose_concurrency)`. With concurrency 40, 30 unique recipes produce 30 one-frame batches, 120 produce 40 three-frame batches, and 400 would produce 40 ten-frame batches. The same concurrency setting configures both `PrepareFinish` and the Inline Map, preventing scheduling drift.
 
 The manifest change is additive. The compose worker will retain support for the old `frame_start`/`frame_end` batch contract so local tooling and in-flight manifests do not break during deployment.
 
@@ -61,6 +61,11 @@ For each unique composition assigned to an invocation, `ComposeComponentFrameChu
 2. Compose the canonical frame once.
 3. Encode and upload one WebP object, using the canonical logical frame number in its key.
 4. Emit one `FrameRecord` for every logical frame represented by the composition.
+
+For multi-frame batches, the worker retains one encoded WebP and uploads it
+while `cwebp` encodes the next frame. It awaits the final upload before
+publishing the batch manifest. This bounds queued image memory to one frame
+and preserves all-or-nothing manifest visibility.
 
 Alias records share the same WebP key, SHA-256, byte length, and canvas, while retaining their own frame number and duration. Batch manifests may consequently contain non-contiguous logical frame numbers. `Finalize` already orders records by logical frame number and will continue requiring exactly the requested logical frame count.
 
@@ -91,7 +96,7 @@ Merging consecutive equal frames into one physical WebP frame with a summed dura
 
 Without deduplication, shrinking from ten logical frames to one frame per Lambda repeats manifests, downloads, cold starts, and initialization up to 120 times. It may reduce wall-clock latency while increasing aggregate GB-seconds.
 
-With this job's measured deduplication, one unique composition per Lambda means about 30 invocations in a single concurrency-40 wave, rather than 12 ten-frame invocations that collectively perform 120 WebP encodes. Both aggregate work and critical-path latency should fall substantially. Jobs with no duplicates still retain the configurable batch size as a cost/latency control.
+With this job's measured deduplication, about 30 unique compositions mean 30 one-frame invocations in a single concurrency-40 wave, rather than 12 ten-frame invocations that collectively perform 120 WebP encodes. If a job has more than 40 unique recipes, adaptive consecutive batches retain all 40 workers while amortizing manifest reads, component downloads, and cold starts. The encode depth remains `ceil(unique_compositions / 40)`.
 
 ## Tests and rollout
 

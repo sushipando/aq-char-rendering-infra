@@ -223,6 +223,7 @@ composite_ms
 downsample_ms
 encode_ms
 upload_ms
+upload_overlap_ms
 manifest_write_ms
 total_ms
 ms_per_frame

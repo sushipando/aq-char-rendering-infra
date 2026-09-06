@@ -31,7 +31,6 @@ export interface RenderTuning {
   readonly componentRasterInlineConcurrency: number;
   readonly componentRasterConcurrency: number;
   readonly componentRasterFrameCap: number;
-  readonly componentComposeFramesPerLambda: number;
   readonly componentComposeConcurrency: number;
 }
 
@@ -194,10 +193,8 @@ const DEV_TUNING: InfrastructureTuning = {
     // Distributed mode remains available for explicit high-concurrency tests.
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
-    // PrepareFinish globally deduplicates exact full-frame recipes. Give each
-    // remaining unique composition its own worker and encode up to 40 in one
-    // Inline Map wave.
-    componentComposeFramesPerLambda: 1,
+    // PrepareFinish globally deduplicates exact full-frame recipes and splits
+    // them into at most this many consecutive, balanced compose batches.
     componentComposeConcurrency: 40,
   },
   retention: {

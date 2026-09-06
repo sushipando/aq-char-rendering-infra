@@ -26,7 +26,7 @@ fn config() -> Config {
         render_cache: false,
         official_fallback: false,
         component_frame_cap: 120,
-        compose_batch_size: 4,
+        compose_concurrency: 4,
         frames_per_lambda: 1,
         download_concurrency: 4,
         bounds_resolution: 256,
@@ -182,7 +182,10 @@ async fn global_dedup_barrier_cache_and_direct_component_contract() -> Result<()
     assert_eq!(prepared["unique_composition_count"], 2);
     assert_eq!(
         prepared["component_batches"],
-        json!([{"index":0,"composition_start":0,"composition_end":1}])
+        json!([
+            {"index":0,"composition_start":0,"composition_end":0},
+            {"index":1,"composition_start":1,"composition_end":1}
+        ])
     );
     assert_eq!(
         prepared["component_task_indices"].as_array().unwrap().len(),
@@ -365,6 +368,10 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
     for frame_count in [1, 8] {
         let temporary = tempfile::tempdir()?;
         let store = FsStore(temporary.path().into());
+        // Force both unique recipes in the eight-frame fixture into one
+        // adaptive batch, exercising upload/encode overlap before final mux.
+        let mut test_config = config();
+        test_config.compose_concurrency = 1;
         let (mut request, planned) = synthetic(&store).await?;
         if frame_count == 1 {
             request["render"]["complete_loop"] = false.into();
@@ -377,7 +384,7 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         for task in tasks {
             bounds::run_probe(&store, "work", &task).await?;
         }
-        let prepared=finish::finish(&store,&config(),&json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]})).await?;
+        let prepared=finish::finish(&store,&test_config,&json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]})).await?;
         let raster_store = aqw_component_raster::storage::FsStore::new(temporary.path().into());
         let mut results = Vec::new();
         for index in prepared["component_task_indices"].as_array().unwrap() {
@@ -411,7 +418,7 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         }
         let finalized = pipeline::finalize::finalize(
         &store,
-        &config(),
+        &test_config,
         &json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"render_results":rendered}),
     )
     .await?;
@@ -420,7 +427,7 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         // Missing and duplicated encoded batches fail before publishing a result.
         assert!(pipeline::finalize::finalize(
             &store,
-            &config(),
+            &test_config,
             &json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"render_results":[]})
         )
         .await
@@ -428,7 +435,7 @@ async fn full_rust_pipeline_encodes_and_validates_webp() -> Result<()> {
         rendered.push(rendered[0].clone());
         assert!(pipeline::finalize::finalize(
             &store,
-            &config(),
+            &test_config,
             &json!({"job_id":JOB,"manifest_key":prepared["manifest_key"],"render_results":rendered})
         )
         .await

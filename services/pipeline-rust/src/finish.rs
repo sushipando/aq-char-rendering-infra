@@ -63,8 +63,14 @@ pub fn component_compositions(frames: &[Value]) -> Result<Vec<Value>> {
     Ok(compositions)
 }
 
-/// Zero-based inclusive ranges into `component_compositions`.
-pub fn composition_batches(count: usize, size: usize) -> Vec<Value> {
+/// Split first-seen unique compositions into contiguous batches. The adaptive
+/// size keeps the number of Inline Map iterations at or below its configured
+/// concurrency while minimizing the longest batch.
+pub fn composition_batches(count: usize, concurrency: usize) -> Vec<Value> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let size = count.div_ceil(concurrency.max(1));
     (0..count)
         .step_by(size)
         .enumerate()
@@ -337,16 +343,19 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     }
     let manifest_key = format!("jobs/{job}/prepare/manifest.json");
     let batches = batches(count, config.frames_per_lambda);
-    let component_batches = composition_batches(compositions.len(), config.compose_batch_size);
+    let compositions_per_batch = compositions
+        .len()
+        .div_ceil(config.compose_concurrency.max(1));
+    let component_batches = composition_batches(compositions.len(), config.compose_concurrency);
     let mut manifest = prepared.clone();
     for (key,value) in json!({"frame_count":count,"frame_rate":frame_rate,"viewbox":viewbox,"frame_durations":durations,"parts":parts,"static_keys":static_keys,"ground_animate":ground,"all_color_rules":all_rules,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_compose_schema":2,"component_raster_space":if settings["raster_size"].as_u64().unwrap()<=output*2 {"output"} else {"raster"},"component_tasks":tasks,"component_frames":frames,"component_compositions":compositions,"warnings":warnings,"detected_loop":detected,"detected_blink_frames":blink,"ignored_loop_keys":ignored,"source_bundles":{},"sources":[]}).as_object().unwrap() {manifest[key]=value.clone();}
     store::write(store, &config.work_bucket, &manifest_key, &manifest, false).await?;
     crate::log(
         "prepare_profile",
-        json!({"job_id":job,"frame_count":count,"unique_compositions":compositions.len(),"deduplicated_frames":count-compositions.len(),"unique_component_tasks":tasks.len(),"unique_bounds_states":results.len(),"detected_item_loop":item_loop,"detected_blink_frames":blink,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
+        json!({"job_id":job,"frame_count":count,"unique_compositions":compositions.len(),"deduplicated_frames":count-compositions.len(),"component_batch_count":component_batches.len(),"compositions_per_batch":compositions_per_batch,"compose_concurrency":config.compose_concurrency,"unique_component_tasks":tasks.len(),"unique_bounds_states":results.len(),"detected_item_loop":item_loop,"detected_blink_frames":blink,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),
     );
     Ok(
-        json!({"schema_version":1,"job_id":job,"cache_hit":false,"render_hash":prepared["render_hash"],"final_key":prepared["final_key"],"manifest_key":manifest_key,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_task_indices":(0..tasks.len()).collect::<Vec<_>>(),"frame_count":count,"unique_composition_count":compositions.len()}),
+        json!({"schema_version":1,"job_id":job,"cache_hit":false,"render_hash":prepared["render_hash"],"final_key":prepared["final_key"],"manifest_key":manifest_key,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_task_indices":(0..tasks.len()).collect::<Vec<_>>(),"frame_count":count,"unique_composition_count":compositions.len(),"compositions_per_batch":compositions_per_batch}),
     )
 }
 
@@ -371,14 +380,17 @@ mod tests {
     }
 
     #[test]
-    fn batches_unique_compositions_with_zero_based_inclusive_ranges() {
+    fn adaptively_batches_consecutive_unique_compositions() {
         assert_eq!(
             composition_batches(5, 2),
             vec![
-                json!({"index":0,"composition_start":0,"composition_end":1}),
-                json!({"index":1,"composition_start":2,"composition_end":3}),
-                json!({"index":2,"composition_start":4,"composition_end":4}),
+                json!({"index":0,"composition_start":0,"composition_end":2}),
+                json!({"index":1,"composition_start":3,"composition_end":4}),
             ]
         );
+        assert_eq!(composition_batches(40, 40).len(), 40);
+        assert_eq!(composition_batches(41, 40).len(), 21);
+        assert_eq!(composition_batches(120, 40).len(), 40);
+        assert_eq!(composition_batches(400, 40).len(), 40);
     }
 }

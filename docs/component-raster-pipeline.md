@@ -189,9 +189,10 @@ Each successful component task should produce a record similar to:
 ## Parallel frame composition
 
 `PrepareFinish` globally groups logical frames with the same exact ordered
-component-task IDs. Each `ComposeComponentFrameChunk` invocation normally
-processes one unique composition. Development uses Map concurrency 40, so up
-to 40 distinct full-frame recipes encode in one wave.
+component-task IDs. It divides the unique recipes into consecutive batches of
+`ceil(unique recipes / compose concurrency)`. Development uses Map concurrency
+40: up to 40 recipes use one frame per invocation, while 120 unique recipes
+become 40 three-frame invocations.
 
 It will:
 
@@ -202,7 +203,8 @@ It will:
 4. For each unique composition, allocate one transparent output-size RGBA canvas.
 5. Alpha-composite the referenced layers in exact back-to-front order at their
    recorded integer offsets.
-6. Encode each complete frame with the configured WebP settings.
+6. Encode each complete frame with the configured WebP settings, uploading
+   the preceding encoded frame concurrently when the batch has multiple frames.
 7. Upload each unique frame, then emit a logical frame record for every frame
    sharing that recipe while preserving each duration.
 8. Let `FinalizeAnimation` download each unique object once, gather all
@@ -256,7 +258,6 @@ Add explicit development tuning for the experiment:
 componentRasterInlineConcurrency = 40
 componentRasterConcurrency = 200
 componentRasterFrameCap = 120
-componentComposeFramesPerLambda = 1
 componentComposeConcurrency = 40
 ```
 

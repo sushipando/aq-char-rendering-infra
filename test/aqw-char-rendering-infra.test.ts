@@ -28,7 +28,6 @@ test('dev environment targets the dedicated account and exposes tuning in one co
     componentRasterInlineConcurrency: 40,
     componentRasterConcurrency: 200,
     componentRasterFrameCap: 120,
-    componentComposeFramesPerLambda: 1,
     componentComposeConcurrency: 40,
   });
 });
@@ -71,6 +70,23 @@ test('invalid component-raster Inline Map concurrency fails synthesis', () => {
         },
       },
     )).toThrow(/Component-raster Inline Map/);
+  }
+});
+
+test('invalid component-compose Inline Map concurrency fails synthesis', () => {
+  const environment = getEnvironmentConfig('dev');
+  for (const componentComposeConcurrency of [0, 41]) {
+    expect(() => new AqwCharRenderingInfraStack(
+      new cdk.App(),
+      `InvalidCompose${componentComposeConcurrency}`,
+      {
+        stageName: 'dev',
+        tuning: {
+          ...environment.tuning,
+          render: { ...environment.tuning.render, componentComposeConcurrency },
+        },
+      },
+    )).toThrow(/Component-compose Inline Map/);
   }
 });
 
@@ -290,7 +306,7 @@ test('Lambda request defaults come from the centralized environment tuning', () 
         CHAR_RENDER_FRAMES_PER_LAMBDA: '1',
         CHAR_RENDER_SOURCE_BUNDLE_FRAME_COUNT: '4',
         CHAR_RENDER_FINALIZER_DOWNLOAD_CONCURRENCY: '32',
-        CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: '1',
+        CHAR_RENDER_COMPONENT_COMPOSE_CONCURRENCY: '40',
         CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK: 'true',
       }),
     },

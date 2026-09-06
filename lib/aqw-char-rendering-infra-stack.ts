@@ -58,6 +58,12 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     ) {
       throw new Error('Component-raster Inline Map concurrency must be between 1 and 40');
     }
+    if (
+      tuning.render.componentComposeConcurrency < 1
+      || tuning.render.componentComposeConcurrency > 40
+    ) {
+      throw new Error('Component-compose Inline Map concurrency must be between 1 and 40');
+    }
     const removalPolicy = stageName === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
     const sourceBucket = this.createSourceBucket(stageName, removalPolicy);
     const workBucket = this.createWorkBucket(stageName, tuning, removalPolicy);
@@ -356,8 +362,8 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       CHAR_RENDER_COMPONENT_RASTER_FRAME_CAP: String(
         tuning.render.componentRasterFrameCap,
       ),
-      CHAR_RENDER_COMPONENT_COMPOSE_FRAMES_PER_LAMBDA: String(
-        tuning.render.componentComposeFramesPerLambda,
+      CHAR_RENDER_COMPONENT_COMPOSE_CONCURRENCY: String(
+        tuning.render.componentComposeConcurrency,
       ),
       CHAR_RENDER_FFDEC_PATH: '/opt/ffdec/ffdec-cli.jar',
       CHAR_RENDER_CWEBP: '/opt/libwebp/bin/cwebp',
