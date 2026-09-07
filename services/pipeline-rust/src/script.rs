@@ -205,12 +205,63 @@ fn call(statement: &[Token]) -> Result<(Vec<&str>, &[Token])> {
     Ok((path, &statement[open + 1..statement.len() - 1]))
 }
 
+// Registering a callback does not execute it. Recognize only AQW's literal
+// listener-registration block with an empty catch; leave all other try/control
+// flow intact so reachable conditional timeline changes still fail closed.
+fn listener_registration(stmt: &[Token]) -> bool {
+    let Some(at) = stmt.iter().position(|t| t.word() == Some("addAnimationListener")) else { return false; };
+    let receiver = &stmt[..at];
+    let mut spelling = String::new();
+    for token in receiver {
+        match token {
+            Token::Word(w) => spelling.push_str(w),
+            Token::Punct(c) => spelling.push(*c),
+            _ => return false,
+        }
+    }
+    if spelling != "MovieClip(parent.parent.parent)." { return false; }
+    if stmt.get(at + 1) != Some(&Token::Punct('(')) || stmt.last() != Some(&Token::Punct(')')) { return false; }
+    let args = &stmt[at + 2..stmt.len() - 1];
+    let valid = matches!(args, [Token::String(_), Token::Punct(','), Token::Word(this), Token::Punct('.'), Token::Word(_)] if this == "this");
+    let valid_flag = matches!(args, [Token::String(_), Token::Punct(','), Token::Word(this), Token::Punct('.'), Token::Word(_), Token::Punct(','), Token::Word(flag)] if this == "this" && matches!(flag.as_str(), "true" | "false"));
+    valid || valid_flag
+}
+
+fn without_listener_setup(body: &[Token]) -> Result<Vec<Token>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < body.len() {
+        if body[at].word() == Some("try") && body.get(at + 1) == Some(&Token::Punct('{')) {
+            let end = close(body, at + 1, '{', '}')?;
+            let statements: Vec<_> = body[at + 2..end].split(|t| *t == Token::Punct(';')).filter(|s| !s.is_empty()).collect();
+            if !statements.is_empty() && statements.iter().all(|s| listener_registration(s))
+                && body.get(end + 1).and_then(Token::word) == Some("catch")
+                && body.get(end + 2) == Some(&Token::Punct('(')) {
+                let args_end = close(body, end + 2, '(', ')')?;
+                let args = &body[end + 3..args_end];
+                let simple_catch = matches!(args, [Token::Word(_), Token::Punct(':'), Token::Punct('*')])
+                    || matches!(args, [Token::Word(_), Token::Punct(':'), Token::Word(kind)] if kind == "Error");
+                if simple_catch && body.get(args_end + 1) == Some(&Token::Punct('{'))
+                    && body.get(args_end + 2) == Some(&Token::Punct('}')) {
+                    at = args_end + 3;
+                    continue;
+                }
+            }
+        }
+        out.push(body[at].clone());
+        at += 1;
+    }
+    Ok(out)
+}
+
 fn compile(
     body: &[Token],
     methods: &BTreeMap<String, Vec<Token>>,
     active: &mut BTreeSet<String>,
 ) -> Result<Vec<Command>> {
     ensure!(active.len() <= 32, "frame helper recursion limit exceeded");
+    let cleaned = without_listener_setup(body)?;
+    let body = cleaned.as_slice();
     let relevant = body.iter().any(|t| {
         t.word()
             .is_some_and(|w| control(w) || methods.contains_key(w))
@@ -359,16 +410,26 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
         let Some(method) = tokens.get(at + 1).and_then(Token::word) else {
             bail!("missing function name");
         };
+        let accessor = matches!(method, "get" | "set") && tokens.get(at + 2).and_then(Token::word).is_some();
+        let method_key = if accessor {
+            format!("{method}:{}", tokens[at + 2].word().unwrap())
+        } else { method.to_owned() };
         let open = (at + 2..tokens.len())
             .find(|i| tokens[*i] == Token::Punct('{'))
             .context("missing function body")?;
         let end = close(&tokens, open, '{', '}')?;
         ensure!(
             methods
-                .insert(method.into(), tokens[open + 1..end].to_vec())
+                .insert(method_key.clone(), tokens[open + 1..end].to_vec())
                 .is_none(),
-            "duplicate function {method}"
+            "duplicate function {method_key}"
         );
+        if accessor {
+            // Property evaluation is not a helper call. Reject a reachable use
+            // rather than silently discarding possible getter/setter effects.
+            methods.entry(tokens[at + 2].word().unwrap().to_owned())
+                .or_insert_with(|| vec![Token::Word("throw".into()), Token::Word("stop".into())]);
+        }
         at = end + 1;
     }
     let mut class = Class::default();
@@ -449,6 +510,47 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multiple_accessors_are_distinct_and_do_not_execute() {
+        let source = r#"class Avatar {
+            function Avatar(){addFrameScript(0,this.frame1);}
+            function get helmName():String{return this.a ? this.b : this.c;}
+            function get armorName():String{return this.d;}
+            function set helmName(value:String):void{this.b=value;}
+            function frame1(){stop();}
+        }"#;
+        let class = parse(source).unwrap().unwrap().1;
+        assert!(class.unsupported.is_none());
+        assert_eq!(class.frames[&1].commands[0].action, Action::Stop);
+        let accessed = source.replace("function frame1(){stop();}", "function frame1(){var x = this.helmName; stop();}");
+        assert!(parse(&accessed).unwrap().unwrap().1.frames[&1].unsupported.is_some());
+        assert!(parse("class C {function get name(){return 1;} function get name(){return 2;}}").is_err());
+    }
+
+    #[test]
+    fn listener_registration_try_block_does_not_call_conditional_handlers() {
+        let source = r#"class Armor {
+            function Armor(){addFrameScript(1,this.frame2);}
+            function onIdle(){if(!this.idleing){this.gotoAndPlay("Idleing");}}
+            function frame2(){this.walking=false;this.idleing=false;
+                try {MovieClip(parent.parent.parent).addAnimationListener("Idle",this.onIdle,false);
+                     MovieClip(parent.parent.parent).addAnimationListener("Walk",this.onIdle,true);}
+                catch(e:*) {} stop();}
+        }"#;
+        let class = parse(source).unwrap().unwrap().1;
+        assert!(class.frames[&2].unsupported.is_none());
+        assert_eq!(class.frames[&2].commands, vec![Command{child:None,action:Action::Stop}]);
+        for invalid in [
+            source.replace("catch(e:*) {}", "catch(e:*) {gotoAndPlay(9);}"),
+            source.replace("this.onIdle,false", "this.onIdle(),false"),
+            source.replace("try {MovieClip", "try {stop(); MovieClip"),
+            source.replace("stop();}", "if(x) stop();}"),
+            source.replace("parent.parent.parent", "getParent()"),
+        ] {
+            assert!(parse(&invalid).unwrap().unwrap().1.frames[&2].unsupported.is_some());
+        }
+    }
+
     #[test]
     fn registered_callbacks_only_and_comments_are_not_code() {
         let (name, c) = parse(

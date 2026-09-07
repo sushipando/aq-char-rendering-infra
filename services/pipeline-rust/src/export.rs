@@ -1120,6 +1120,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires AQW_TEST_SCRIPT_CORPUS with input.json, source/ and scripts paths; no AWS"]
+    fn saved_scripts_resolve_full_source_context() -> Result<()> {
+        let root = PathBuf::from(std::env::var("AQW_TEST_SCRIPT_CORPUS")?);
+        let input: Value = serde_json::from_slice(&std::fs::read(root.join("input.json"))?)?;
+        for source in input["sources"].as_array().context("missing sources")? {
+            let bytes = std::fs::read(root.join("source").join(source["key"].as_str().unwrap()))?;
+            let swf = Swf::parse(&bytes)?;
+            let mut requests: Vec<SymbolRequest> = serde_json::from_value(source.get("normalization_requests").unwrap_or(&source["requests"]).clone())?;
+            for request in &mut requests { request.frame = swf.timeline(request.character_id)?.0; }
+            let mut metadata = ScriptMetadata::default();
+            for path in script_files(Path::new(source["scripts"].as_str().unwrap()))? {
+                metadata.inspect(&std::fs::read_to_string(&path)?).with_context(|| format!("script {}", path.display()))?;
+            }
+            let normalized = crate::timeline::normalize(&bytes, &swf, &metadata.timelines, &requests)?;
+            Swf::parse(&normalized.bytes)?;
+            assert_eq!(normalized.requests.len(), requests.len());
+            if requests.iter().any(|r| r.class_name.starts_with("SteampunkLandshipUnitArmor") && r.key == "armor_head") {
+                assert!(normalized.decisions.iter().any(|d| d.character_id == 469 && d.selection == crate::timeline::Selection::Hold { frame: 2 }));
+            }
+            println!("full context {}: {} roots, decisions {:?}",source["remote_path"], requests.len(), normalized.decisions);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_SOURCE_CORPUS containing input.json and source/; no AWS"]
     async fn real_source_corpus_resolves_before_export() -> Result<()> {
