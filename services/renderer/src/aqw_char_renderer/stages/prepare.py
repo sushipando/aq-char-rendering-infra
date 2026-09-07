@@ -889,6 +889,10 @@ def prepare_resolve(
     need, then returns the source list to fan out the FFDec export Map. On a
     cache hit returns the cached result immediately.
     """
+    from aqw_char_renderer.contracts import normalize_presentation
+    layout = normalize_presentation(request.render.view, request.render.presentation)
+    if layout["framing"] != "content" or layout["background"] or layout["info"]:
+        raise ValueError("Presentation layouts require the Rust pipeline")
     started = time.perf_counter()
     timings: dict[str, float] = {}
 

@@ -36,3 +36,6 @@ pub fn log(event: &str, fields: serde_json::Value) {
     value["event"] = event.into();
     println!("{value}");
 }
+
+pub mod charpage;
+pub mod presentation;

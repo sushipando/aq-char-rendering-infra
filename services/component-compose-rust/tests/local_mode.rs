@@ -413,3 +413,51 @@ async fn unique_composition_encodes_once_and_emits_every_logical_frame() {
     assert_eq!(batch["frames"][1]["duration"], 55);
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+#[tokio::test]
+async fn charpage_layers_surround_character_for_webp_and_zstd_avif() {
+    let Some(cwebp) = cwebp() else { return; };
+    for (format, background_on, foreground_on) in ["webp", "avif"].into_iter().flat_map(|f| [(f,true,true),(f,true,false),(f,false,true),(f,false,false)]) {
+        let temp = unique_dir("charpage");
+        let mut fixture = Fixture::new(temp.clone());
+        fixture.add("red", 40, 40, [255,0,0,255], 10, 10, false);
+        fixture.write_manifest(&[serde_json::json!({"number":1,"layers":["red"],"duration_ms":40})]);
+        let path = temp.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["settings"]["output_format"] = format.into();
+        manifest["settings"]["rgba_compression"] = "zstd".into();
+        manifest["settings"]["webp_lossless"] = true.into();
+        let background = Fixture::solid("background",256,256,[255,255,255,255],0,0);
+        let mut pixels = vec![0;256*256*4];
+        let offset = (20*256+20)*4;
+        pixels[offset..offset+4].copy_from_slice(&[0,0,255,255]);
+        let foreground = aqw_component_compose::png::encode_rgba8(256,256,&pixels).unwrap();
+        for (name, bytes) in [("background",background),("foreground",foreground)] {
+            if (name == "background" && !background_on) || (name == "foreground" && !foreground_on) { continue; }
+            std::fs::write(fixture.rasters.join(format!("{name}.png")),&bytes).unwrap();
+            manifest["presentation_layers"][name] = serde_json::json!({"key":format!("local://{name}"),"sha256":sha256_hex(&bytes)});
+        }
+        std::fs::write(path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let event = aqw_component_compose::contract::ComposeEvent {
+            job_id:"rust-integration".into(),manifest_key:"local://manifest".into(),
+            component_results:fixture.records.iter().cloned().map(serde_json::from_value).collect::<Result<Vec<_>,_>>().unwrap(),
+            component_results_key:None,benchmark_output_prefix:None,
+            batch:aqw_component_compose::contract::BatchIndex{index:0,frame_start:Some(1),frame_end:Some(1),composition_start:None,composition_end:None},
+        };
+        let output=temp.join("out"); let scratch=temp.join("scratch");std::fs::create_dir_all(&scratch).unwrap();
+        aqw_component_compose::worker::run_chunk(&event,
+            &aqw_component_compose::local::FsSource::new(temp.clone()),
+            &aqw_component_compose::local::FsSink::new(output.clone(),0),
+            &aqw_component_compose::worker::ComposeOptions{download_concurrency:2,cwebp:cwebp.clone().into(),scratch_dir:scratch,retain_png_dir:Some(output.join("frames"))}
+        ).await.unwrap();
+        let pixels = if format == "webp" {
+            aqw_component_compose::png::decode_rgba8(&std::fs::read(output.join("frames/000001.png")).unwrap()).unwrap().pixels
+        } else {
+            zstd::stream::decode_all(std::io::Cursor::new(std::fs::read(output.join("frames/000001.rgba")).unwrap())).unwrap()
+        };
+        assert_eq!(&pixels[0..4], if background_on { &[255,255,255,255] } else { &[0,0,0,0] });
+        assert_eq!(&pixels[(15*256+15)*4..(15*256+15)*4+4], &[255,0,0,255]);
+        assert_eq!(&pixels[offset..offset+4], if foreground_on { &[0,0,255,255] } else { &[255,0,0,255] });
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+}

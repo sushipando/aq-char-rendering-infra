@@ -112,6 +112,12 @@ def parser() -> argparse.ArgumentParser:
         choices=("armor", "weapon", "helm", "cape", "ground"),
         help="slot for --item-id when it cannot be inferred",
     )
+    result.add_argument("--background", action=argparse.BooleanOptionalAction, default=None)
+    result.add_argument("--info", action=argparse.BooleanOptionalAction, default=None)
+    result.add_argument("--framing", choices=("content", "fixed"))
+    result.add_argument("--viewport", type=float, nargs=4, metavar=("X", "Y", "WIDTH", "HEIGHT"))
+    result.add_argument("--character-position", type=float, nargs=2, metavar=("X", "Y"))
+    result.add_argument("--view", choices=("character", "charpage"), default="character", help="Transparent character or full charpage card")
     result.add_argument("--format", dest="output_format", choices=("webp", "avif"), default="webp")
     result.add_argument("--rgba-compression", choices=("zstd", "none"), default="zstd", help="AVIF intermediate compression; zstd level 1 is lossless")
     result.add_argument("--avif-quality", type=int, choices=range(101), default=70, metavar="0..100")
@@ -263,6 +269,11 @@ def queue_one(
             raster_size=args.raster_size,
             output_size=args.output_size,
             padding=args.padding,
+            view=args.view,
+            presentation={key: value for key, value in {
+                "background": args.background, "info": args.info, "framing": args.framing,
+                "viewport": args.viewport, "character_position": args.character_position,
+            }.items() if value is not None},
             output_format=args.output_format,
             rgba_compression=args.rgba_compression,
             avif_quality=args.avif_quality,

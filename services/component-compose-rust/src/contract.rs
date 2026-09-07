@@ -70,6 +70,8 @@ pub struct ComponentResult {
 /// (parts, fields, color rules, batches, ...) are deliberately ignored.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PrepareManifest {
+    #[serde(default)]
+    pub presentation_layers: Option<PresentationLayers>,
     pub job_id: String,
     pub frame_count: i64,
     pub viewbox: Vec<f64>,
@@ -82,6 +84,20 @@ pub struct PrepareManifest {
     pub component_frames: Vec<ComponentFrame>,
     #[serde(default)]
     pub component_compositions: Vec<ComponentComposition>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct StaticLayer {
+    pub key: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PresentationLayers {
+    #[serde(default)]
+    pub background: Option<StaticLayer>,
+    #[serde(default)]
+    pub foreground: Option<StaticLayer>,
 }
 
 fn default_output_format() -> String { "webp".into() }

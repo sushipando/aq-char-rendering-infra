@@ -15,3 +15,24 @@ After owner deployment, render each format with `--no-render-cache`, then use **
 Format references: [WebP XMP container specification](https://developers.google.com/speed/webp/docs/riff_container), [libavif XMP API](https://github.com/AOMediaCodec/libavif/blob/v1.4.2/include/avif/avif.h).
 
 Metadata policy v3 also embeds exact final file size and preparation-through-encoding elapsed time. **View Render Info** displays these in **Render Info**. Timing excludes initial queue time and final upload/delivery; old files show missing values as `N/A`. See [Discord retry and statistics](discord-retry-render.md) for field definitions and deployment checks.
+
+### Animation metadata (2026-09-07)
+
+The `aqw-xmp-v4-animation` policy adds `frameCount` (generated logical timeline
+frames, before identical-frame duration merging) and `loopStatus` to both WebP
+and AVIF. `View Render Info` displays these as **Frames** and **Complete loop**.
+
+`loopStatus` is `complete`, `truncated`, `unknown`, or `still`. It describes
+completion of the renderer's detected animation cycle, not the container's
+infinite-repeat flag or the requested `complete_loop` option. Completion requires
+an integer number of detected item periods, completion of the blink (which the
+renderer plays once and then holds), and full ground/pet ping-pong round trips.
+The actual output count after the component frame cap is used. Missing cycle
+detection reports Unknown; a single frame reports N/A (still image).
+
+For example, 120 generated frames with an item period of 40 and a blink completed
+by frame 100 can be complete; 120 frames with an item period of 50 are truncated.
+These labels rely on the existing schedule-based cycle detector, not a visual
+seam assessment. Older files show Frames: N/A and Complete loop: Unknown.
+The metadata policy changes the final render cache key so newly requested renders
+receive the new fields after deployment.

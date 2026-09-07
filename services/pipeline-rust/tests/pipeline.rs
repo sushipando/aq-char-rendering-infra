@@ -945,3 +945,31 @@ async fn replay_incident_through_all_rust_stages() -> Result<()> {
     println!("incident_replay_result={result}");
     Ok(())
 }
+
+#[tokio::test]
+async fn charpage_finish_keeps_stage_canvas_and_stores_static_layers() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = FsStore(temporary.path().into());
+    let (mut request, planned) = synthetic(&store).await?;
+    request["render"]["view"] = "charpage".into();
+    request["render"]["presentation"] = Value::Null;
+    request = pipeline::contract::request(request, None)?;
+    let mut input: Value = store::read(&store,"work","jobs/input.json").await?;
+    input["settings"] = request["render"].clone();
+    store::write(&store,"work","jobs/input.json",&input,false).await?;
+    let tasks: Vec<ProbeTask> = store::read(&store,"work",planned["tasks_key"].as_str().unwrap()).await?;
+    for task in tasks { bounds::run_probe(&store,"work",&task).await?; }
+    let prepared = finish::finish(&store,&config(),&json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]})).await?;
+    let manifest: Value = store::read(&store,"work",prepared["manifest_key"].as_str().unwrap()).await?;
+    assert_eq!(manifest["viewbox"],json!(pipeline::charpage::VIEWBOX));
+    assert_eq!(manifest["frame_count"],8);
+    let (_, expected) = aqw_component_compose::compositor::frame_canvas_sizes(&pipeline::charpage::VIEWBOX,256,128)?;
+    for name in ["background","foreground"] {
+        let layer = &manifest["presentation_layers"][name];
+        let bytes = store.get("work",layer["key"].as_str().unwrap()).await?.unwrap();
+        assert_eq!(pipeline::sha256(&bytes),layer["sha256"]);
+        let image = aqw_component_compose::png::decode_rgba8(&bytes)?;
+        assert_eq!([image.width as i64,image.height as i64],expected);
+    }
+    Ok(())
+}

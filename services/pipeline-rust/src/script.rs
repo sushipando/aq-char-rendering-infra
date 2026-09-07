@@ -256,12 +256,65 @@ fn without_listener_setup(body: &[Token]) -> Result<Vec<Token>> {
     Ok(out)
 }
 
+// Export policy: bank UI initialization has no rendered effect. Match the entire
+// callback AND helper, not arbitrary initialization conditionals or try blocks.
+// Registering onBankClick does not execute it; the final stop remains effective.
+const BANK_IDLE: &str = "if(!this.petInit){this.petInit=true;this.initPet();}this.stop();";
+const BANK_INIT: &str = r#"
+    try {
+        this.rootClass = stage.getChildAt(0) as MovieClip;
+        MovieClip(parent).mouseEnabled = MovieClip(parent).mouseChildren = true;
+        MovieClip(parent).buttonMode = true;
+        this.btnBank.addEventListener(MouseEvent.CLICK,this.onBankClick,false,0,true);
+        this.avatar = MovieClip(parent).pAV;
+    } catch(e:Error) {}
+"#;
+
+// FFDec emits both explicit and implicit self references, including a mixture
+// within one method. Only qualifiers at known self-reference positions may vary;
+// never strip `this` globally (other.this or a different receiver is not self).
+fn bank_pattern_matches(actual: &[Token], pattern: &str) -> bool {
+    let expected = lex(pattern).expect("literal bank pattern");
+    let (mut a, mut e) = (0, 0);
+    while e < expected.len() {
+        if expected[e].word() == Some("this")
+            && expected.get(e + 1) == Some(&Token::Punct('.')) {
+            e += 2;
+            if actual.get(a).and_then(Token::word) == Some("this")
+                && actual.get(a + 1) == Some(&Token::Punct('.')) {
+                a += 2;
+            }
+        }
+        if actual.get(a) != expected.get(e) { return false; }
+        a += 1;
+        e += 1;
+    }
+    a == actual.len()
+}
+
+fn bank_idle_setup(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> bool {
+    if !bank_pattern_matches(body, BANK_IDLE)
+        || !methods.get("initPet").is_some_and(|helper| bank_pattern_matches(helper, BANK_INIT)) {
+        return false;
+    }
+    // Even an otherwise identical property expression may execute an accessor.
+    // Also reject locally shadowed built-ins used by this recognized idiom.
+    let has_accessor = body.iter().chain(methods["initPet"].iter())
+        .filter_map(Token::word)
+        .any(|name| methods.contains_key(&format!("get:{name}"))
+            || methods.contains_key(&format!("set:{name}")));
+    !has_accessor && !["MovieClip", "stop"].iter().any(|name| methods.contains_key(*name))
+}
+
 fn compile(
     body: &[Token],
     methods: &BTreeMap<String, Vec<Token>>,
     active: &mut BTreeSet<String>,
 ) -> Result<Vec<Command>> {
     ensure!(active.len() <= 32, "frame helper recursion limit exceeded");
+    if bank_idle_setup(body, methods) {
+        return Ok(vec![Command { child: None, action: Action::Stop }]);
+    }
     let cleaned = without_listener_setup(body)?;
     let body = cleaned.as_slice();
     let relevant = body.iter().any(|t| {
@@ -576,6 +629,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bank_idle_preserves_stop_and_rejects_rendering_side_effects() {
+        let fixture = |body: &str, helper: &str, extra: &str| {
+            parse(&format!("class C {{function C(){{addFrameScript(7,this.idle,27,this.walk);}} function idle(){{{body}}} function initPet(){{{helper}}} function walk(){{if(this.onMove){{gotoAndPlay(\"Walk\");}}}} {extra}}}"))
+                .unwrap().unwrap().1
+        };
+        for (body, helper) in [
+            (BANK_IDLE.replace("this.", ""), BANK_INIT.replace("this.", "")),
+            (BANK_IDLE.replace("this.petInit", "petInit"), BANK_INIT.replace("this.avatar", "avatar")),
+        ] {
+            let c = fixture(&body, &helper, "");
+            assert!(c.frames[&8].unsupported.is_none());
+            assert_eq!(c.frames[&8].commands, vec![Command {child:None, action:Action::Stop}]);
+        }
+        let c = fixture(BANK_IDLE, BANK_INIT, "");
+        assert!(c.frames[&8].unsupported.is_none());
+        assert_eq!(c.frames[&8].commands, vec![Command {child:None, action:Action::Stop}]);
+        assert!(c.frames[&28].unsupported.is_some());
+        for helper in [BANK_INIT.replace("buttonMode = true", "visible = false"),
+            BANK_INIT.replace("this.avatar = MovieClip(parent).pAV;", "gotoAndPlay(29);"),
+            BANK_INIT.replace("catch(e:Error) {}", "catch(e:Error) { return; }"),
+            String::new()] {
+            assert!(fixture(BANK_IDLE, &helper, "").frames[&8].unsupported.is_some());
+        }
+        for body in [BANK_IDLE.replace("!this.petInit", "this.petInit"),
+            BANK_IDLE.replace("this.petInit", "other.petInit"),
+            BANK_IDLE.replace("this.initPet", "other.this.initPet"),
+            BANK_IDLE.replace("this.initPet();", "this.initPet();this.visible=false;"),
+            "if(!this.petInit){this.petInit=true;this.initPet();stop();}".into()] {
+            assert!(fixture(&body, BANK_INIT, "").frames[&8].unsupported.is_some());
+        }
+        for name in ["petInit", "rootClass", "avatar", "btnBank", "onBankClick", "stage", "parent"] {
+            for kind in ["get", "set"] {
+                let extra = format!("function {kind} {name}(){{gotoAndPlay(29);}}");
+                assert!(fixture(BANK_IDLE, BANK_INIT, &extra).frames[&8].unsupported.is_some(), "{kind} {name}");
+            }
+        }
+    }
     #[test]
     fn registered_callbacks_only_and_comments_are_not_code() {
         let (name, c) = parse(

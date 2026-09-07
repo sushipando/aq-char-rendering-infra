@@ -733,6 +733,10 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     )?;
     let metadata = crate::metadata::display(&serde_json::to_value(&fields)?, settings)?;
     let hash = crate::digest(&(&hash, aqw_component_raster::region::POLICY, crate::metadata::POLICY, metadata))?;
+    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
+    let hash = if layout["background"] == true || layout["info"] == true {
+        crate::digest(&(&hash, crate::charpage::POLICY, crate::presentation::POLICY, fields.get("bgindex"), fields.get("strFaction")))?
+    } else { hash };
     let avif = settings["output_format"] == "avif";
     let hash = if avif { crate::digest(&(&hash, crate::avif::POLICY))? } else { hash };
     let extension = if avif { "avif" } else { "webp" };

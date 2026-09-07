@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub const POLICY: &str = "aqw-xmp-v3";
+pub const POLICY: &str = "aqw-xmp-v4-animation";
 
 /// Match actual asset selection, including overrides, base-items and visibility.
 /// Resolve has already applied show_hidden and item overrides to these fields.
@@ -94,6 +94,22 @@ fn escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Whether the selected output completes the renderer's item/blink cycle.
+/// Playback repetition is a separate container setting. Missing detection is unknown.
+pub fn loop_status(count: usize, item: Option<usize>, blink: Option<usize>, ground: impl Iterator<Item = usize>) -> &'static str {
+    if count == 1 { return "still"; }
+    let (Some(item), Some(blink)) = (item.filter(|n| *n > 0), blink.filter(|n| *n > 0)) else {
+        return "unknown";
+    };
+    // Blink plays once then holds; other item timelines repeat. Ground/pets
+    // use ping-pong selection and must also finish a full round trip.
+    if count < blink || count % item != 0 || ground.filter(|span| *span >= 2).any(|span| count % (2 * (span - 1)) != 0) {
+        "truncated"
+    } else {
+        "complete"
+    }
+}
+
 pub fn packet(prepared: &Value) -> Result<Vec<u8>> {
     let data = display(&prepared["fields"], &prepared["settings"])?;
     let mut out = String::from("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:aqw=\"http://aqw.char/info/1.0/\">");
@@ -109,6 +125,11 @@ pub fn packet(prepared: &Value) -> Result<Vec<u8>> {
             escape(prepared[key].as_str().unwrap_or(""))
         ));
     }
+    if let Some(count) = prepared["frame_count"].as_u64() {
+        out.push_str(&format!("<aqw:frameCount>{count}</aqw:frameCount>"));
+    }
+    let status = prepared["loop_status"].as_str().unwrap_or("unknown");
+    out.push_str(&format!("<aqw:loopStatus>{}</aqw:loopStatus>", escape(status)));
     // Fixed-width fields can be filled after encoding without remuxing or
     // changing container offsets, and include their own bytes in file size.
     out.push_str("<aqw:renderTimeMs>                    </aqw:renderTimeMs><aqw:fileSizeBytes>00000000000000000000</aqw:fileSizeBytes><aqw:renderTimeScope>prepare-to-encoded-file</aqw:renderTimeScope>");
@@ -159,6 +180,21 @@ pub fn complete_stats(bytes: &mut [u8], packet: &[u8], prepared: &Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reports_cycle_completion_independently_of_requested_cap() {
+        assert_eq!(loop_status(120, Some(40), Some(100), [].into_iter()), "complete");
+        assert_eq!(loop_status(120, Some(50), Some(100), [].into_iter()), "truncated");
+        assert_eq!(loop_status(120, Some(40), Some(150), [].into_iter()), "truncated");
+        assert_eq!(loop_status(120, None, Some(100), [].into_iter()), "unknown");
+        assert_eq!(loop_status(120, Some(40), Some(100), [26].into_iter()), "truncated");
+        assert_eq!(loop_status(120, Some(40), Some(100), [21].into_iter()), "complete");
+        assert_eq!(loop_status(1, None, None, [].into_iter()), "still");
+        let value = json!({"fields":{}, "settings":{}, "frame_count":120, "loop_status":"complete"});
+        let text = String::from_utf8(packet(&value).unwrap()).unwrap();
+        assert!(text.contains("<aqw:frameCount>120</aqw:frameCount>"));
+        assert!(text.contains("<aqw:loopStatus>complete</aqw:loopStatus>"));
+    }
+
     #[test]
     fn fills_exact_size_and_elapsed_without_changing_length() {
         let prepared = json!({"fields":{},"settings":{},"render_started_at":

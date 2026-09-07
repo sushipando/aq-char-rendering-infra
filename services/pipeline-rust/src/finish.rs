@@ -242,6 +242,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         1
     };
     let count = natural_count.min(config.component_frame_cap);
+    let loop_status = crate::metadata::loop_status(count, item_loop, blink, ground.values().copied());
     ensure!(count > 0, "empty animation");
     let select = |key: &str, index: usize| -> Result<usize> {
         let source = if let Some(span) = ground.get(key) {
@@ -283,7 +284,8 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     let padding = settings["padding"].as_u64().context("missing padding")?;
     let units = w.max(h) / (output - 2 * padding) as f64;
     let margin = padding as f64 * units;
-    let viewbox = [x - margin, y - margin, w + 2.0 * margin, h + 2.0 * margin];
+    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
+    let viewbox = crate::presentation::viewbox(&layout, [x - margin, y - margin, w + 2.0 * margin, h + 2.0 * margin]);
     let frame_rate = if let Some(rate) = prepared["frame_rate"].as_f64() {
         rate
     } else {
@@ -361,6 +363,11 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     if complete && item_loop.is_none() {
         warnings.push("At least one item timeline did not repeat within the frame cap".into());
     }
+    let presentation_layers = if layout["background"] == true || layout["info"] == true {
+        let raster = settings["raster_size"].as_u64().unwrap();
+        let canvas = crate::presentation::canvas(viewbox, raster as u32, output as u32, raster <= output * 2);
+        Some(crate::charpage::prepare(store, &config.work_bucket, job, &prepared["fields"], settings, &layout, canvas).await?)
+    } else { None };
     let manifest_key = format!("jobs/{job}/prepare/manifest.json");
     let batches = batches(count, config.frames_per_lambda);
     let compositions_per_batch = compositions
@@ -368,7 +375,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         .div_ceil(config.compose_concurrency.max(1));
     let component_batches = composition_batches(compositions.len(), config.compose_concurrency);
     let mut manifest = prepared.clone();
-    for (key,value) in json!({"frame_count":count,"frame_rate":frame_rate,"viewbox":viewbox,"frame_durations":durations,"parts":parts,"static_keys":static_keys,"ground_animate":ground,"all_color_rules":all_rules,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_compose_schema":2,"component_raster_space":if settings["raster_size"].as_u64().unwrap()<=output*2 {"output"} else {"raster"},"component_tasks":tasks,"component_frames":frames,"component_compositions":compositions,"warnings":warnings,"detected_loop":detected,"detected_blink_frames":blink,"ignored_loop_keys":ignored,"source_bundles":{},"sources":[]}).as_object().unwrap() {manifest[key]=value.clone();}
+    for (key,value) in json!({"presentation_layers":presentation_layers,"frame_count":count,"loop_status":loop_status,"frame_rate":frame_rate,"viewbox":viewbox,"frame_durations":durations,"parts":parts,"static_keys":static_keys,"ground_animate":ground,"all_color_rules":all_rules,"batches":batches,"component_batches":component_batches,"component_pipeline":true,"component_compose_schema":2,"component_raster_space":if settings["raster_size"].as_u64().unwrap()<=output*2 {"output"} else {"raster"},"component_tasks":tasks,"component_frames":frames,"component_compositions":compositions,"warnings":warnings,"detected_loop":detected,"detected_blink_frames":blink,"ignored_loop_keys":ignored,"source_bundles":{},"sources":[]}).as_object().unwrap() {manifest[key]=value.clone();}
     store::write(store, &config.work_bucket, &manifest_key, &manifest, false).await?;
     crate::log(
         "prepare_profile",

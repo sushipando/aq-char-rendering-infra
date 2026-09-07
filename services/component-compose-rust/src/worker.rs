@@ -377,6 +377,21 @@ pub async fn run_chunk(
         }
     }
 
+    // Presentation layers are downloaded/decoded once per batch, never per frame.
+    let mut presentation = HashMap::new();
+    if let Some(card) = &prepared.presentation_layers {
+        for (name, layer) in [("background", &card.background), ("foreground", &card.foreground)] {
+            let Some(layer) = layer else { continue; };
+            let bytes = source.fetch_bytes(&layer.key, Some(&layer.sha256)).await?;
+            let mut image = png::decode_rgba8(&bytes)?;
+            if [image.width as i64, image.height as i64] != canvas_size {
+                return Err(invalid("Presentation layer canvas mismatch"));
+            }
+            crate::compositor::premultiply_rgba(&mut image.pixels);
+            presentation.insert(name, image);
+        }
+    }
+
     // ---- download unique components --------------------------------------
     let unique_task_ids: Vec<String> = referenced
         .iter()
@@ -427,6 +442,7 @@ pub async fn run_chunk(
         let mut canvas = Canvas::new(canvas_size[0] as u32, canvas_size[1] as u32);
 
         let composite_started = Instant::now();
+        if let Some(background) = presentation.get("background") { canvas.pixels.copy_from_slice(&background.pixels); }
         for raw_task_id in &composition.layers {
             let result = results_by_task.get(raw_task_id);
             match result {
@@ -440,6 +456,7 @@ pub async fn run_chunk(
                 }
             }
         }
+        if let Some(foreground) = presentation.get("foreground") { canvas.composite(foreground, 0, 0); }
         // One unpremultiply per frame (never per layer): the canvas is
         // premultiplied during compositing and converted back to straight
         // alpha once, before the legacy downsample (FIR expects straight
@@ -704,6 +721,7 @@ mod tests {
 
     fn manifest() -> PrepareManifest {
         PrepareManifest {
+            presentation_layers: None,
             job_id: "job-1".to_string(),
             frame_count: 3,
             viewbox: vec![0.0, 0.0, 100.0, 100.0],

@@ -12,7 +12,7 @@ from uuid import UUID
 
 SCHEMA_VERSION = 1
 MAX_USERNAME_LENGTH = 25
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]*$")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9 _-]+$")
 _SNOWFLAKE_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 _APPEARANCE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}$")
 _ALLOWED_SLOTS = frozenset({"armor", "weapon", "helm", "cape", "ground"})
@@ -50,6 +50,33 @@ def normalize_username(value: Any) -> str:
     if _USERNAME_RE.fullmatch(username) is None:
         raise ContractError("render.username contains unsupported characters")
     return username
+
+
+def normalize_presentation(view: str, value: Any) -> dict[str, Any]:
+    if view not in {"character", "charpage"}:
+        raise ContractError("invalid render view")
+    result = dict(framing="fixed" if view == "charpage" else "content",
+                  viewport=[0.0, 0.0, 550.0, 350.0],
+                  character_position=[338.05, 304.2] if view == "charpage" else [0.0, 0.0],
+                  background=view == "charpage", info=view == "charpage")
+    if value is not None:
+        payload = _object(value, "render.presentation")
+        _only_keys(payload, set(result), "render.presentation")
+        result.update(payload)
+    if not isinstance(result["framing"], str) or result["framing"] not in {"content", "fixed"}:
+        raise ContractError("presentation framing must be content or fixed")
+    for key in ("background", "info"):
+        if not isinstance(result[key], bool):
+            raise ContractError(f"presentation {key} must be a boolean")
+    for key, count in (("viewport", 4), ("character_position", 2)):
+        coordinates = result[key]
+        if not isinstance(coordinates, list) or len(coordinates) != count or any(
+            isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) or abs(n) > 10000 for n in coordinates
+        ):
+            raise ContractError(f"invalid presentation {key}")
+    if min(result["viewport"][2:]) < 1:
+        raise ContractError("viewport width and height must be positive")
+    return result
 
 
 def _appearance(value: Any, username: str) -> dict[str, str] | None:
@@ -198,6 +225,8 @@ class RenderSettings:
     raster_size: int = 2048
     output_size: int = 2048
     padding: int = 0
+    presentation: dict[str, Any] | None = None
+    view: str = "character"
     output_format: str = "webp"
     rgba_compression: str = "zstd"
     avif_quality: int = 70
@@ -228,6 +257,8 @@ class RenderSettings:
             # Backward-compatible alias for requests queued before v17.
             "max_size",
             "padding",
+            "view",
+            "presentation",
             "output_format",
             "rgba_compression",
             "avif_quality",
@@ -281,6 +312,8 @@ class RenderSettings:
             raster_size=raster_size,
             output_size=output_size,
             padding=padding,
+            presentation=normalize_presentation(str(payload.get("view", "character")).casefold(), payload.get("presentation")),
+            view=_choice(payload.get("view", "character"), "render.view", {"character", "charpage"}),
             output_format=_choice(payload.get("output_format", "webp"), "render.output_format", {"webp", "avif"}),
             rgba_compression=_choice(payload.get("rgba_compression", "zstd"), "render.rgba_compression", {"none", "zstd"}),
             avif_quality=_integer(payload.get("avif_quality", 70), "render.avif_quality", 0, 100),

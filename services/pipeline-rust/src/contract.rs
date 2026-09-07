@@ -85,6 +85,8 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
             "output_size",
             "max_size",
             "padding",
+            "view",
+            "presentation",
             "output_format",
             "rgba_compression",
             "avif_quality",
@@ -127,13 +129,15 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
         .join(" ");
     ensure!(
         (1..=25).contains(&username.len())
-            && username.as_bytes()[0].is_ascii_alphanumeric()
             && username
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b" _-".contains(&c)),
         "invalid username"
     );
     render["username"] = username.clone().into();
+    if render["view"].is_null() { render["view"] = "character".into(); }
+    ensure!(matches!(render["view"].as_str(), Some("character" | "charpage")), "invalid render view");
+    render["presentation"] = crate::presentation::normalize(render["view"].as_str().unwrap(), &render["presentation"])?;
     let facing = string(render, "facing")?.to_lowercase();
     ensure!(
         matches!(facing.as_str(), "left" | "right"),
@@ -252,6 +256,19 @@ mod tests {
     use super::*;
     fn sample() -> Value {
         json!({"schema_version":1,"job_id":"45cfafbd-5089-4f6d-850a-caa798ec1fcb","created_at":"2026-09-05T01:02:03Z","discord":{"user_id":"1","channel_id":"2"},"render":{"username":"Test"}})
+    }
+    #[test]
+    fn username_accepts_leading_underscores_and_hyphens() {
+        for name in ["___cj", "-cj", "  ___cj  "] {
+            let mut value = sample();
+            value["render"]["username"] = name.into();
+            assert_eq!(request(value, None).unwrap()["render"]["username"], name.trim());
+        }
+        for name in ["", "   ", "cj/name", "cj@example", "abcdefghijklmnopqrstuvwxyz"] {
+            let mut value = sample();
+            value["render"]["username"] = name.into();
+            assert!(request(value, None).is_err());
+        }
     }
     #[test]
     fn normalizes_defaults_and_rejects_unknown_fields() {

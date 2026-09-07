@@ -8,12 +8,23 @@ import pytest
 
 from aqw_char_renderer.batching import partition_frames
 from aqw_char_renderer.config import RuntimeConfig
-from aqw_char_renderer.contracts import CacheSettings, ContractError, JobRequest
+from aqw_char_renderer.contracts import CacheSettings, ContractError, JobRequest, normalize_username
 from aqw_char_renderer.geometry import shared_canvas, union_bounds
 from aqw_char_renderer.handlers.launcher import hydrate_request_defaults
 from aqw_char_renderer.hashing import canonical_sha256, render_key
 from aqw_char_renderer.source_assets import SourceAssetCatalog, SourceAssetError
 from aqw_char_renderer.storage import FilesystemObjectStore, StorageError, validate_key
+
+
+@pytest.mark.parametrize("name", ["___cj", "-cj", "  ___cj  "])
+def test_username_accepts_leading_underscores_and_hyphens(name):
+    assert normalize_username(name) == name.strip()
+
+
+@pytest.mark.parametrize("name", ["", "   ", "a" * 26, "cj/name", "cj@example"])
+def test_username_rejects_empty_oversized_and_unsupported_names(name):
+    with pytest.raises(ContractError):
+        normalize_username(name)
 
 
 class DynamicAssetStore:
@@ -404,3 +415,16 @@ def test_invalid_avif_controls(field, value):
     payload["render"][field] = value
     with pytest.raises(ContractError):
         JobRequest.from_dict(payload)
+
+
+def test_presentation_presets_and_overrides():
+    from aqw_char_renderer.contracts import normalize_presentation
+    content = normalize_presentation("character", {"background": True})
+    assert content["framing"] == "content"
+    assert content["background"] and not content["info"]
+    card = normalize_presentation("charpage", {"info": False, "character_position": [400, 300]})
+    assert card["framing"] == "fixed" and card["viewport"] == [0, 0, 550, 350]
+    assert card["character_position"] == [400, 300] and not card["info"]
+    for bad in ({"framing": []}, {"viewport": [0, 0, -1, 350]}, {"info": "true"}, {"character_position": [True, 1]}, {"extra": True}):
+        with pytest.raises(ContractError):
+            normalize_presentation("character", bad)

@@ -1081,6 +1081,58 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_BANK_DUCK_SWF; local FFDec regression, no AWS"]
+    async fn real_bank_duck_exports_idle_and_reuses_cache() -> Result<()> {
+        bank_pet_export_regression("AQW_TEST_BANK_DUCK_SWF", "641431a984dd3f1cfe84ac0524eebb037796367462d1092d4bae9bc4a0021cab", "FrostvalWaddlesTheBankDuck", 21).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_BANK_QUIBBLE_SWF; local FFDec regression, no AWS"]
+    async fn real_bank_quibble_exports_idle_and_reuses_cache() -> Result<()> {
+        bank_pet_export_regression("AQW_TEST_BANK_QUIBBLE_SWF", "2843f1a4d086f49cee561d0de574ec96b730ecd8b93519339e9e6adcdab2ecff", "QuibXmasBank", 43).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_BANK_ALVARO_SWF; local FFDec regression, no AWS"]
+    async fn real_bank_alvaro_exports_idle_and_reuses_cache() -> Result<()> {
+        bank_pet_export_regression("AQW_TEST_BANK_ALVARO_SWF", "5ac2e45bcbde94084b93cdd90dd016174c5ffabf2ea720414d27904a49a97590", "AlvaroPetNXBank", 104).await
+    }
+
+    async fn bank_pet_export_regression(asset_env: &str, sha: &str, class_name: &str, character_id: u16) -> Result<()> {
+        let jar = PathBuf::from(std::env::var("AQW_TEST_FFDEC")?);
+        let bytes = std::fs::read(std::env::var(asset_env)?)?;
+        ensure!(crate::sha256(&bytes) == sha, "wrong regression asset");
+        let root = tempfile::tempdir()?;
+        let store = FsStore(root.path().join("objects"));
+        let source = json!({"idx":3,"key":"pet.swf","sha256":crate::sha256(&bytes),"requests":[{"key":"pet","class_name":class_name,"character_id":character_id,"frame":8,"root_timeline_frames":1}]});
+        store.put("source", "pet.swf", bytes, "application/octet-stream", true).await?;
+        store::write(&store,"work","input.json", &json!({"job_id":"bank-pet-fixture","sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":120}), false).await?;
+        let event = json!({"job_id":"bank-pet-fixture","input_key":"input.json","source":source});
+        let options = || ExportOptions { jar: jar.clone(), timeout: Duration::from_secs(180), bounds_prefetch: None };
+        let result = export_source(&store,"work","source",&event,options()).await?;
+        let manifest: SourceManifest = store::read(&store,"work",result["manifest_key"].as_str().unwrap()).await?;
+        assert_eq!(manifest.timeline_decisions.iter().find(|d| d.character_id == character_id).unwrap().selection, crate::timeline::Selection::Hold { frame:8 });
+        assert_eq!(manifest.symbols["pet"].schedule.len(), 120);
+        assert!(!manifest.states.is_empty());
+        let mut pixel_hashes = BTreeSet::new();
+        for state in manifest.states.values() {
+            let svg = store.get("work", &state.svg_key).await?.unwrap();
+            let tree = resvg::usvg::Tree::from_data(&svg,&resvg::usvg::Options::default())?;
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(256,256).unwrap();
+            let scale = 256.0/tree.size().width().max(tree.size().height());
+            resvg::render(&tree,resvg::tiny_skia::Transform::from_scale(scale,scale),&mut pixmap.as_mut());
+            pixel_hashes.insert(crate::sha256(pixmap.data()));
+            assert!(pixmap.data().chunks_exact(4).any(|p|p[3]>0), "normalized idle rendered transparent");
+        }
+        if class_name == "QuibXmasBank" {
+            assert!(pixel_hashes.len() > 1, "Quibble child animation must remain visibly animated");
+        }
+        assert_eq!(export_source(&store,"work","source",&event,options()).await?["vector_cache_hit"], true);
+        println!("{class_name}: 120 scheduled frames, {} unique SVGs; decisions {:?}; nonempty raster and cache hit verified", manifest.states.len(), manifest.timeline_decisions);
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_MOGLIN_SWF; local FFDec regression, no AWS"]
     async fn real_moglin_export_keeps_idle_animated_without_walking() -> Result<()> {
         let jar = PathBuf::from(std::env::var("AQW_TEST_FFDEC")?);
