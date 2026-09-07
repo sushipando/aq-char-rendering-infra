@@ -13,3 +13,5 @@ Local validation covers actual still/animated WebP and AVIF extraction in the bo
 After owner deployment, render each format with `--no-render-cache`, then use **Apps → View Render Info** on its Discord message. Compare the displayed job ID with the job that generated the file and the listed items with the image. Repeat without bypassing the cache to check that the original generating ID remains intact.
 
 Format references: [WebP XMP container specification](https://developers.google.com/speed/webp/docs/riff_container), [libavif XMP API](https://github.com/AOMediaCodec/libavif/blob/v1.4.2/include/avif/avif.h).
+
+Metadata policy v3 also embeds exact final file size and preparation-through-encoding elapsed time. **View Render Info** displays these in **Render Info**. Timing excludes initial queue time and final upload/delivery; old files show missing values as `N/A`. See [Discord retry and statistics](discord-retry-render.md) for field definitions and deployment checks.

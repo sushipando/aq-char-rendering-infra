@@ -577,6 +577,8 @@ im=Image.open(sys.argv[1]); xmp=im.info['xmp']
 root=ET.fromstring(xmp); ns={'a':'http://aqw.char/info/1.0/','r':'http://www.w3.org/1999/02/22-rdf-syntax-ns#'}
 d=root.find('.//r:Description',ns)
 assert d.find('a:jobId',ns).text==sys.argv[2]
+assert int(d.find('a:fileSizeBytes',ns).text)==__import__('os').path.getsize(sys.argv[1])
+assert d.find('a:renderTimeScope',ns).text=='prepare-to-encoded-file'
 assert d.find('a:name',ns).text=='Test & Character'
 assert d.find('a:level',ns).text=='42'
 assert d.find('a:items/r:Seq/r:li[a:slot="Cape"]/a:name',ns).text=='Cape <Blue>'

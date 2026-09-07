@@ -218,7 +218,8 @@ pub async fn finalize(
     let temporary = tempfile::tempdir()?;
     let output = temporary.path().join("result.avif");
     let xmp = temporary.path().join("render.xmp");
-    tokio::fs::write(&xmp, crate::metadata::packet(prepared)?).await?;
+    let packet = crate::metadata::packet(prepared)?;
+    tokio::fs::write(&xmp, &packet).await?;
     let stderr = std::fs::File::create(temporary.path().join("encoder.stderr"))?;
     let stdout = std::fs::File::create(temporary.path().join("encoder.json"))?;
     let mut child = tokio::process::Command::new(crate::config::env(
@@ -293,7 +294,8 @@ pub async fn finalize(
             _ => anyhow::bail!("AVIF encoding timed out: {details}"),
         };
     }
-    let bytes = tokio::fs::read(output).await?;
+    let mut bytes = tokio::fs::read(output).await?;
+    crate::metadata::complete_stats(&mut bytes, &packet, prepared)?;
     let report: Value =
         serde_json::from_slice(&tokio::fs::read(temporary.path().join("encoder.json")).await?)?;
     let duration: u64 = durations.iter().map(|n| *n as u64).sum();

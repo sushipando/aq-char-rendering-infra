@@ -197,6 +197,7 @@ CHAR_RENDER_JOB_TABLE=<JobTableName>
 CHAR_RENDER_ENABLED_PARAMETER=<RenderEnabledParameterName>
 CHAR_RENDER_MAX_ACTIVE_PARAMETER=<MaximumActivePerUserParameterName>
 CHAR_RENDER_SOURCE_BUCKET=<SourceAssetBucketName>
+CHAR_RENDER_WORK_BUCKET=<WorkResultBucketName> # saved appearance fallback for /retry-render
 CHAR_RENDER_ASSET_DATASET_VERSION=<AssetDatasetVersion>
 CHAR_RENDER_SOURCE_TIMEOUT_SECONDS=15
 ```

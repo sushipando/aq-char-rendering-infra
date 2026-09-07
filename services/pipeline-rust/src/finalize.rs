@@ -351,7 +351,9 @@ pub async fn finalize(store: &dyn Store, config: &Config, event: &Value) -> Resu
         );
         tokio::fs::read(&output).await?
     };
-    let bytes = webp::with_xmp(&bytes, &crate::metadata::packet(&prepared)?)?;
+    let xmp = crate::metadata::packet(&prepared)?;
+    let mut bytes = webp::with_xmp(&bytes, &xmp)?;
+    crate::metadata::complete_stats(&mut bytes, &xmp, &prepared)?;
     let mux_ms = mux_started.elapsed().as_secs_f64() * 1000.0;
     validate_schedule(
         &bytes,

@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub const POLICY: &str = "aqw-xmp-v2";
+pub const POLICY: &str = "aqw-xmp-v3";
 
 /// Match actual asset selection, including overrides, base-items and visibility.
 /// Resolve has already applied show_hidden and item overrides to these fields.
@@ -109,6 +109,9 @@ pub fn packet(prepared: &Value) -> Result<Vec<u8>> {
             escape(prepared[key].as_str().unwrap_or(""))
         ));
     }
+    // Fixed-width fields can be filled after encoding without remuxing or
+    // changing container offsets, and include their own bytes in file size.
+    out.push_str("<aqw:renderTimeMs>                    </aqw:renderTimeMs><aqw:fileSizeBytes>00000000000000000000</aqw:fileSizeBytes><aqw:renderTimeScope>prepare-to-encoded-file</aqw:renderTimeScope>");
     out.push_str("<aqw:items><rdf:Seq>");
     for item in data["shown_items"].as_array().unwrap() {
         out.push_str(&format!(
@@ -129,9 +132,52 @@ pub fn packet(prepared: &Value) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
+/// Fill only the exact packet we supplied to the encoder; never touch pixels.
+/// Time includes preparation through completed encoding, excluding queueing,
+/// final upload and Discord delivery. Old manifests have no timing origin.
+pub fn complete_stats(bytes: &mut [u8], packet: &[u8], prepared: &Value) -> Result<()> {
+    let mut matches = bytes.windows(packet.len()).enumerate()
+        .filter_map(|(index, value)| (value == packet).then_some(index));
+    let start = matches.next().ok_or_else(|| anyhow::anyhow!("encoded XMP packet missing"))?;
+    ensure!(matches.next().is_none(), "encoded XMP packet is ambiguous");
+    let size = bytes.len() as u64;
+    let elapsed = prepared["render_started_at"].as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .and_then(|t| u64::try_from((chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_milliseconds()).ok());
+    for (tag, value) in [("fileSizeBytes", Some(size)), ("renderTimeMs", elapsed)] {
+        if let Some(value) = value {
+            let marker = format!("<aqw:{tag}>");
+            let offset = packet.windows(marker.len()).position(|s| s == marker.as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("XMP statistics field missing"))? + marker.len();
+            bytes[start + offset..start + offset + 20]
+                .copy_from_slice(format!("{value:020}").as_bytes());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fills_exact_size_and_elapsed_without_changing_length() {
+        let prepared = json!({"fields":{},"settings":{},"render_started_at":
+            (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339()});
+        let xmp = packet(&prepared).unwrap();
+        let mut bytes = [b"prefix".as_slice(), &xmp, b"suffix".as_slice()].concat();
+        let length = bytes.len();
+        complete_stats(&mut bytes, &xmp, &prepared).unwrap();
+        assert_eq!(bytes.len(), length);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(&format!("<aqw:fileSizeBytes>{:020}</aqw:fileSizeBytes>", length)));
+        let ms: u64 = text.split("<aqw:renderTimeMs>").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
+        assert!((5000..10000).contains(&ms));
+        let mut absent = xmp.clone();
+        complete_stats(&mut absent, &xmp, &json!({})).unwrap();
+        assert!(String::from_utf8(absent).unwrap().contains("<aqw:renderTimeMs>                    </aqw:renderTimeMs>"));
+        assert!(complete_stats(&mut [0; 50], &xmp, &prepared).is_err());
+    }
+
     #[test]
     fn respects_rendered_items_visibility_and_base_selection() {
         let mut fields = json!({"strName":"A & B","strClassName":"Mage","strArmorName":"Base armor","strClassFile":"base.swf",

@@ -492,6 +492,7 @@ fn apply_override(
 
 pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Result<Value> {
     let started = Instant::now();
+    let render_started_at = chrono::Utc::now().to_rfc3339();
     let job = string(request, "job_id")?;
     let manifest: Value =
         store::read(store, &config.source_bucket, &config.asset_manifest_key).await?;
@@ -779,7 +780,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     };
     let export_count = if complete { count + 8.min(count) } else { 1 };
     let input_key = format!("jobs/{job}/prepare/input.json");
-    store::write(store,&config.work_bucket,&input_key,&json!({"schema_version":1,"job_id":job,"render_hash":hash,"final_key":final_key,"export_frame_count":export_count,"precomputed_loop":precomputed,"fields":fields,"aliases":aliases,"weapon_type":weapon_type,"settings":settings,"bounds_mode":request["bounds_mode"],"component_raster_mode":request["component_raster_mode"],"cache":request["cache"],"warnings":warnings,"character_renderer":character,"frame_rate":character_swf.frame_rate,"sources":sources}),false).await?;
+    store::write(store,&config.work_bucket,&input_key,&json!({"schema_version":1,"job_id":job,"render_started_at":render_started_at,"render_hash":hash,"final_key":final_key,"export_frame_count":export_count,"precomputed_loop":precomputed,"fields":fields,"aliases":aliases,"weapon_type":weapon_type,"settings":settings,"bounds_mode":request["bounds_mode"],"component_raster_mode":request["component_raster_mode"],"cache":request["cache"],"warnings":warnings,"character_renderer":character,"frame_rate":character_swf.frame_rate,"sources":sources}),false).await?;
     crate::log(
         "prepare_resolve_profile",
         json!({"job_id":job,"cache_hit":false,"cache":request["cache"],"source_count":source_count,"export_unit_count":sources.len(),"export_frame_count":export_count,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),

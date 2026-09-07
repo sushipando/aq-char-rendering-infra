@@ -158,6 +158,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       maximumActivePerUser,
       sourceBucket,
       tuning.render.assetDatasetVersion,
+      workBucket,
     );
 
     new cdk.CfnOutput(this, 'DeploymentEnvironment', { value: stageName });
@@ -998,6 +999,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     maximumActivePerUser: ssm.StringParameter,
     sourceBucket: s3.Bucket,
     assetDatasetVersion: string,
+    workBucket: s3.Bucket,
   ): iam.ManagedPolicy {
     const manifestArn = sourceBucket.arnForObjects(
       `datasets/${assetDatasetVersion}/manifest.json`,
@@ -1034,7 +1036,9 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
         }),
         new iam.PolicyStatement({
           actions: ['s3:GetObject'],
-          resources: [manifestArn, dynamicAssetArn],
+          resources: [manifestArn, dynamicAssetArn,
+            workBucket.arnForObjects('jobs/*/prepare/input.json'),
+            workBucket.arnForObjects('jobs/*/prepare/manifest.json')],
         }),
         // s3:ListBucket lets HeadObject/GetObject on a not-yet-seeded
         // dynamic-assets key receive a 404 instead of a 403, so the bot can
