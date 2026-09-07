@@ -37,6 +37,8 @@ pub struct Program {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Class {
+    #[serde(default)]
+    pub hidden_in_hand: Option<String>,
     pub frames: BTreeMap<usize, Program>,
     pub constructor: Program,
     pub unsupported: Option<String>,
@@ -362,6 +364,17 @@ fn compile(
     Ok(commands)
 }
 
+/// Recognize only the complete first-frame hand-holder visibility idiom.
+fn hidden_in_hand(body: &[Token]) -> Option<String> {
+    for hand in ["fronthand", "backhand"] {
+        for target in ["visible", "this.visible"] {
+            let expected = lex(&format!("if(MovieClip(parent.parent).name == \"{hand}\") {{{target} = false;}}" )).ok()?;
+            if body == expected { return Some(hand.into()); }
+        }
+    }
+    None
+}
+
 fn program(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> Program {
     match compile(body, methods, &mut BTreeSet::new()) {
         Ok(commands) => Program {
@@ -473,6 +486,7 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
                 let body = methods
                     .get(method)
                     .context("missing registered frame callback")?;
+                if frame == 1 { class.hidden_in_hand = hidden_in_hand(body); }
                 ensure!(
                     class
                         .frames
@@ -504,12 +518,23 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
             .collect();
         class.constructor = program(&filtered, &methods);
     }
+    if class.frames.len() != 1 || class.unsupported.is_some() { class.hidden_in_hand = None; }
     Ok(Some((name, class)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hand_visibility_requires_exact_registered_first_frame_rule() {
+        let source = r#"class Clip {function Clip(){addFrameScript(0,this.frame1);}
+            function frame1(){if(MovieClip(parent.parent).name == "fronthand"){visible=false;}}}"#;
+        assert_eq!(parse(source).unwrap().unwrap().1.hidden_in_hand.as_deref(), Some("fronthand"));
+        for invalid in [source.replace("parent.parent", "parent"), source.replace("false", "true"), source.replace("fronthand", "weapon"), source.replace("addFrameScript(0", "addFrameScript(1"), source.replace("visible=false;", "visible=false;play();")] {
+            assert!(parse(&invalid).unwrap().unwrap().1.hidden_in_hand.is_none());
+        }
+    }
+
     #[test]
     fn multiple_accessors_are_distinct_and_do_not_execute() {
         let source = r#"class Avatar {

@@ -135,6 +135,8 @@ impl RasterBounds {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Part {
     #[serde(default)]
+    pub hand_visibility: HashMap<String, String>,
+    #[serde(default)]
     pub root_class: String,
     #[serde(default)]
     pub character_id: Option<i64>,

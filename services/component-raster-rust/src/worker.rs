@@ -8,7 +8,7 @@ use crate::component_svg::{build_component_svg, filter_count};
 use crate::compositor::RgbaImage;
 use crate::contract::{PrepareManifest, RasterEvent, RasterResult};
 use crate::error::RasterError;
-use crate::import::{import_ffdec_symbol, AuthoredColorTransform};
+use crate::import::{import_ffdec_symbol_with_visibility, AuthoredColorTransform};
 use crate::raster::{downsample_component_to_output_grid, encode_rgba8, render_svg_bounded};
 use crate::storage::{Sink, Source};
 use crate::telemetry::{log_raster_profile, sha256_hex, RasterStats, RasterTimings};
@@ -354,7 +354,7 @@ pub async fn run_raster_task(
 
     // ---- import + assembly --------------------------------------------------
     let import_started = Instant::now();
-    let imported = import_ffdec_symbol(
+    let imported = import_ffdec_symbol_with_visibility(
         &symbol_key,
         &state_svg,
         zoom,
@@ -362,6 +362,8 @@ pub async fn run_raster_task(
         &part.root_class,
         &placement_colors,
         part.character_id,
+        &part.hand_visibility,
+        match task.layer_name.as_str() { "gauntlet_front" => Some("fronthand"), "gauntlet_back" => Some("backhand"), _ => None },
     )?;
     let import_ms = elapsed_ms(import_started);
 

@@ -160,7 +160,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
                     .all(|hash| results.contains_key(hash)),
                 "missing symbol bounds"
             );
-            parts.insert(key.clone(),json!({"source_idx":index,"root_class":symbol.request.class_name,"character_id":symbol.request.character_id,"frame_count":symbol.schedule.len(),"root_timeline_frames":symbol.request.root_timeline_frames,"settled_stop_frame":symbol.settled_stop_frame,"color_rules":source.color_rules,"placement_colors":source.placement_colors}));
+            parts.insert(key.clone(),json!({"source_idx":index,"root_class":symbol.request.class_name,"character_id":symbol.request.character_id,"frame_count":symbol.schedule.len(),"root_timeline_frames":symbol.request.root_timeline_frames,"settled_stop_frame":symbol.settled_stop_frame,"color_rules":source.color_rules,"hand_visibility":source.hand_visibility,"placement_colors":source.placement_colors}));
             symbols.insert(key, symbol);
         }
     }

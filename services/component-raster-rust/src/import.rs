@@ -519,6 +519,18 @@ pub fn apply_color_rules(root: &mut Node, rules: &HashMap<String, (String, Strin
     visit(root, rules);
 }
 
+/// Only placements directly inside the exported gauntlet have the hand holder
+/// at parent.parent. Do not descend through another placed SWF character.
+fn apply_hand_visibility(node: &mut Node, rules: &HashMap<String, String>, hand: &str) {
+    node.children.retain(|child| !child.get_in("characterName", FFDEC_NS)
+        .is_some_and(|name| rules.get(&name.to_lowercase()).is_some_and(|hidden| hidden == hand)));
+    for child in &mut node.children {
+        if child.get_in("characterId", FFDEC_NS).is_none() && child.local() == "g" {
+            apply_hand_visibility(child, rules, hand);
+        }
+    }
+}
+
 /// Port of `import_ffdec_symbol`.
 pub fn import_ffdec_symbol(
     key: &str,
@@ -528,6 +540,20 @@ pub fn import_ffdec_symbol(
     root_class: &str,
     placement_colors: &HashMap<(i64, i64), AuthoredColorTransform>,
     root_character_id: Option<i64>,
+) -> Result<ImportedSymbol, RasterError> {
+    import_ffdec_symbol_with_visibility(key, source_svg, zoom, color_rules, root_class, placement_colors, root_character_id, &HashMap::new(), None)
+}
+
+pub fn import_ffdec_symbol_with_visibility(
+    key: &str,
+    source_svg: &str,
+    zoom: f64,
+    color_rules: &HashMap<String, (String, String)>,
+    root_class: &str,
+    placement_colors: &HashMap<(i64, i64), AuthoredColorTransform>,
+    root_character_id: Option<i64>,
+    hand_visibility: &HashMap<String, String>,
+    hand: Option<&str>,
 ) -> Result<ImportedSymbol, RasterError> {
     let document = crate::svg::parse(source_svg.as_bytes())
         .map_err(|error| RasterError::Svg(format!("Invalid FFDec SVG: {error}")))?;
@@ -594,6 +620,7 @@ pub fn import_ffdec_symbol(
         )));
     }
     frame.remove_attr("transform");
+    if let Some(hand) = hand { apply_hand_visibility(&mut frame, hand_visibility, hand); }
     let symbol_bounds = [-e / zoom, -f / zoom, width / zoom, height / zoom];
 
     let mut root_definition = Node::elem("g");
@@ -859,6 +886,20 @@ mod tests {
     </g>
   </defs>
 </svg>"##
+    }
+
+    #[test]
+    fn hand_rules_hide_only_direct_placements_for_matching_holder() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:f="https://www.free-decompiler.com/flash"><g><use f:characterId="12" f:characterName="Back"/><use f:characterId="13" f:characterName="Front"/><g f:characterId="20"><use f:characterName="Back"/></g></g></svg>"#;
+        let rules = HashMap::from([("back".into(),"fronthand".into()),("front".into(),"backhand".into())]);
+        for (hand, remaining) in [("fronthand", "Front"), ("backhand", "Back"), ("weapon", "Back")] {
+            let mut node = crate::svg::parse(svg.as_bytes()).unwrap().root;
+            apply_hand_visibility(&mut node, &rules, hand);
+            let children = &node.children[0].children;
+            assert_eq!(children.len(), if hand == "weapon" {3} else {2});
+            assert_eq!(children[0].get_in("characterName",FFDEC_NS),Some(remaining));
+            assert_eq!(children.last().unwrap().children.len(),1);
+        }
     }
 
     #[test]

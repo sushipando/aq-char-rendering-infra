@@ -44,6 +44,7 @@ async fn fixture(store: &FsStore, count: usize) -> Result<()> {
             },
         )]),
         states,
+        hand_visibility: Default::default(),
         color_rules: BTreeMap::new(),
         placement_colors: BTreeMap::new(),
         timeline_decisions: Vec::new(),

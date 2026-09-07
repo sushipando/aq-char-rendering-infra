@@ -147,6 +147,7 @@ async fn synthetic(store: &dyn Store) -> Result<(Value, Value)> {
         export_identity: "fixture".into(),
         symbols,
         states,
+        hand_visibility: Default::default(),
         color_rules: BTreeMap::new(),
         placement_colors: BTreeMap::new(),
         timeline_decisions: Vec::new(),

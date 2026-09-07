@@ -48,9 +48,10 @@ pub fn bounds_key(
     ))?))
 }
 
-/// A part is appearance-independent iff it has no color customization.
+/// Shared entries omit script visibility inputs, so keep hand-dependent parts
+/// on the job-scoped cache path along with color-customized parts.
 pub fn is_no_cc(part: &Part) -> bool {
-    part.color_rules.is_empty() && part.placement_colors.is_empty()
+    part.color_rules.is_empty() && part.placement_colors.is_empty() && part.hand_visibility.is_empty()
 }
 
 /// Canonical, deterministic inputs that fully determine the output PNG for a
@@ -192,6 +193,7 @@ mod tests {
 
     fn no_cc_part() -> Part {
         Part {
+            hand_visibility: Default::default(),
             root_class: "Armor".to_string(),
             character_id: Some(286),
             color_rules: Default::default(),
@@ -212,6 +214,9 @@ mod tests {
     fn no_cc_detection() {
         assert!(is_no_cc(&no_cc_part()));
         assert!(!is_no_cc(&cc_part()));
+        let mut hand_dependent = no_cc_part();
+        hand_dependent.hand_visibility.insert("clip".into(), "fronthand".into());
+        assert!(!is_no_cc(&hand_dependent));
     }
 
     #[test]

@@ -427,6 +427,8 @@ fn ranges(values: &[usize]) -> String {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct ScriptMetadata {
+    #[serde(default)]
+    pub hand_visibility: BTreeMap<String, String>,
     pub color_rules: BTreeMap<String, Vec<String>>,
     pub timelines: BTreeMap<String, crate::script::Class>,
     pub random_pose: bool,
@@ -443,6 +445,7 @@ impl ScriptMetadata {
         let Some((name, timeline)) = crate::script::parse(text)? else {
             return Ok(());
         };
+        if let Some(hand) = &timeline.hidden_in_hand { self.hand_visibility.insert(name.clone(), hand.clone()); }
         ensure!(self.timelines.insert(name.clone(), timeline).is_none(), "duplicate decompiled class {name}");
         let color = Regex::new(
             r#"(?:mcSetColor|setColor)\s*\(\s*this\s*,\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"#,
@@ -862,6 +865,7 @@ pub async fn export_source(
         export_identity: identity,
         symbols: BTreeMap::new(),
         states: BTreeMap::new(),
+        hand_visibility: metadata.hand_visibility,
         color_rules: metadata.color_rules,
         placement_colors: swf.placement_colors()?,
         timeline_decisions: normalized.decisions.clone(),
@@ -1117,6 +1121,38 @@ mod tests {
         assert_eq!(queued, manifest.states.keys().cloned().collect(), "prefetch must publish only corrected SVGs");
         assert_eq!(export_source(&store,"work","source",&event,options()).await?["vector_cache_hit"], true);
         println!("moglin regression: 76 frames, {} unique animated idle SVGs, no walking IDs, cache hit verified", manifest.states.len());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires AQW_TEST_GAUNTLET_DIR with saved SVG and decompiled scripts; local only"]
+    fn actual_gauntlet_visibility_and_pixels() -> Result<()> {
+        use aqw_component_raster::{import, component_svg, svg, raster};
+        use std::collections::HashMap;
+        let root = PathBuf::from(std::env::var("AQW_TEST_GAUNTLET_DIR")?);
+        let mut meta = ScriptMetadata::default();
+        for path in script_files(&root.join("6d63be22eea7105f80a998cb24795629300bfd6a27734ad60cb9bfae42c48137-scripts"))? {
+            meta.inspect(&std::fs::read_to_string(path)?)?;
+        }
+        assert_eq!(meta.hand_visibility.len(),2);
+        let rules: HashMap<_,_> = meta.hand_visibility.into_iter().collect();
+        let colors: HashMap<_,_> = meta.color_rules.into_iter().map(|(k,v)|(k,(v[0].clone(),v[1].clone()))).collect();
+        let source = std::fs::read_to_string(root.join("gauntlet_front.svg"))?;
+        let mut pixels = Vec::new();
+        for (label, hand) in [("before",None),("front",Some("fronthand")),("back",Some("backhand"))] {
+            let imported = import::import_ffdec_symbol_with_visibility("weapon",&source,1.0,&colors,"FurryofRisen",&HashMap::new(),Some(14),&rules,hand)?;
+            let count = imported.definition.children[0].children.len();
+            assert_eq!(count, if hand.is_none(){2}else{1});
+            let all_rules = colors.values().cloned().collect::<Vec<_>>();
+            let built = component_svg::build_component_svg(&imported,import::IDENTITY,false,"weapon",label,imported.bounds,700,&HashMap::from([("intColorAccessory".into(),"16711680".into()),("intColorBase".into(),"16711680".into()),("intColorTrim".into(),"16711680".into())]),&all_rules);
+            let encoded = svg::serialize(&svg::Document{root:built.root,namespaces:built.namespaces});
+            let image = raster::render_svg_resvg(encoded.as_bytes(),((built.page[2]-built.page[0]) as u32,(built.page[3]-built.page[1]) as u32))?;
+            std::fs::write(root.join(format!("{label}.png")), raster::encode_rgba8(image.width,image.height,&image.pixels)?)?;
+            pixels.push(image.pixels);
+        }
+        assert_ne!(pixels[0],pixels[1]);
+        assert_ne!(pixels[0],pixels[2]);
+        assert_ne!(pixels[1],pixels[2]);
         Ok(())
     }
 
