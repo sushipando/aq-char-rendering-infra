@@ -15,7 +15,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import boto3
-from aqw_char_renderer.contracts import JobRequest, utc_now
+from aqw_char_renderer.contracts import JobRequest, RenderSettings, utc_now
 from aqw_char_renderer.jobs import JobStore
 from botocore.exceptions import ClientError
 from smoke_test_deployment import load_outputs
@@ -95,7 +95,7 @@ def load_original_request(
                 raise
             if (
                 saved.get("job_id") != request.job_id
-                or saved.get("settings") != request.render.to_dict()
+                or RenderSettings.from_dict(saved.get("settings")) != request.render
             ):
                 raise ValueError(
                     "Saved appearance snapshot does not match the original job/settings"

@@ -147,6 +147,16 @@ class RestartTests(unittest.TestCase):
             Bucket="work", Key=f"jobs/{SOURCE}/prepare/input.json"
         )
 
+    def test_legacy_snapshot_normalizes_new_render_defaults(self):
+        payload = self.original.to_dict()
+        payload["appearance"] = None
+        self.set_execution(payload)
+        settings = self.original.render.to_dict()
+        for key in ("output_format", "rgba_compression", "avif_quality", "avif_speed"):
+            settings.pop(key, None)
+        self.s3.get_object.return_value = self.saved(settings=settings)
+        self.assertEqual(self.load()[0], self.original)
+
     def test_snapshot_falls_back_to_finish_manifest(self):
         payload = self.original.to_dict()
         payload["appearance"] = None

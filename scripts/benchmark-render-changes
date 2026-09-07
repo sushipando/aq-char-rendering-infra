@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Reads historical evidence by default. --run opts into normal CLI submissions.
+set -euo pipefail
+BENCH_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$BENCH_REPO_ROOT"
+exec uv run --package aqw-char-renderer python scripts/benchmark_render_changes.py "$@"
