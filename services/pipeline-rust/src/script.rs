@@ -47,12 +47,13 @@ pub struct Class {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Word(String),
+    Identifier(String),
     String(String),
     Punct(char),
 }
 impl Token {
     fn word(&self) -> Option<&str> {
-        if let Self::Word(s) = self {
+        if let Self::Word(s) | Self::Identifier(s) = self {
             Some(s)
         } else {
             None
@@ -116,6 +117,26 @@ fn lex(text: &str) -> Result<Vec<Token>> {
                 ensure!(closed, "unterminated ActionScript string");
                 tokens.push(Token::String(s));
             }
+            '§' => {
+                // FFDec quotes identifiers that cannot be written as ordinary
+                // ActionScript names. The delimiters are not part of the SWF name.
+                ensure!(chars.peek() != Some(&'§'), "unsupported FFDec pseudoinstruction");
+                let mut name = String::new();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    if c == '§' { closed = true; break; }
+                    if c == '\\' {
+                        let escaped = chars.next().context("truncated identifier escape")?;
+                        name.push(match escaped {
+                            '\\' => '\\', '§' => '§',
+                            'n' => '\n', 'r' => '\r', 't' => '\t',
+                            _ => bail!("unsupported FFDec identifier escape"),
+                        });
+                    } else { name.push(c); }
+                }
+                ensure!(closed && !name.is_empty(), "unterminated or empty FFDec identifier");
+                tokens.push(Token::Identifier(name));
+            }
             c if c.is_alphanumeric() || c == '_' || c == '$' => {
                 let mut s = c.to_string();
                 while chars
@@ -131,6 +152,20 @@ fn lex(text: &str) -> Result<Vec<Token>> {
         ensure!(tokens.len() <= 500_000, "ActionScript token limit exceeded");
     }
     Ok(tokens)
+}
+
+/// Background export keeps authored colors. AVM1 content cannot call the AS3
+/// host's MovieClip API; these guarded host hooks have no exported color effect.
+/// Match complete decompiled programs, never a substring or arbitrary try body.
+pub(crate) fn inert_background_avm1(text: &str) -> Result<bool> {
+    let tokens = lex(text)?;
+    for pattern in [
+        r#"try { MovieClip(this.stage.getChildAt(0)).mcSetColor(this,"Trim","None"); } catch(e:Error) {}"#,
+        "var isProp = true; mouseEnabled = false; mouseChildren = false;",
+    ] {
+        if tokens == lex(pattern)? { return Ok(true); }
+    }
+    Ok(false)
 }
 
 fn close(tokens: &[Token], start: usize, left: char, right: char) -> Result<usize> {
@@ -174,7 +209,7 @@ fn uniform_random_pose(args: &[Token]) -> bool {
         match t {
             Token::Word(s) => spelling.push_str(s),
             Token::Punct(c) => spelling.push(*c),
-            Token::String(_) => return false,
+            Token::String(_) | Token::Identifier(_) => return false,
         }
     }
     let spelling = spelling.replace("this.totalFrames", "totalFrames");
@@ -442,16 +477,22 @@ fn program(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> Program {
 }
 
 pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
-    let tokens = lex(text)?;
-    let Some(class_at) = tokens.iter().position(|t| t.word() == Some("class")) else {
+    let mut tokens = lex(text)?;
+    let Some(class_at) = tokens.iter().position(|t| *t == Token::Word("class".into())) else {
         return Ok(None);
     };
+    let package_at = tokens.iter().position(|t| *t == Token::Word("package".into()));
+    // Once declaration keywords are located, quoted and unquoted references
+    // must resolve to the same underlying identifier throughout compilation.
+    for token in &mut tokens {
+        if let Token::Identifier(name) = token { *token = Token::Word(std::mem::take(name)); }
+    }
     let class_name = tokens
         .get(class_at + 1)
         .and_then(Token::word)
         .context("missing class name")?;
     let mut package = String::new();
-    if let Some(p) = tokens.iter().position(|t| t.word() == Some("package")) {
+    if let Some(p) = package_at {
         for t in &tokens[p + 1..] {
             match t {
                 Token::Word(s) => package.push_str(s),
@@ -578,6 +619,33 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffdec_identifiers_keep_constructor_and_callback_identity() {
+        for name in ["013BlackSkullsScythe", "has space", "s-r/rg", "日本語"] {
+            let source = format!("package {{ public class §{name}§ extends MovieClip {{ function §{name}§() {{super(); addFrameScript(0,this.§idle-callback§);}} function §idle-callback§() {{stop();}} }} }}");
+            let (parsed, class) = parse(&source).unwrap().unwrap();
+            assert_eq!(parsed, name.to_lowercase());
+            assert!(class.unsupported.is_none(), "{:?}", class.unsupported);
+            assert!(class.constructor.unsupported.is_none());
+            assert_eq!(class.frames[&1].commands[0].action, Action::Stop);
+        }
+        let (name, _) = parse("package §class§ {class §package§ extends MovieClip {function §package§(){super();}}}").unwrap().unwrap();
+        assert_eq!(name, "class.package");
+        for source in ["class §broken", "class §§pop()", r"class §bad\q§"] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn background_avm1_requires_entire_known_program() {
+        let color = r#"try { MovieClip(this.stage.getChildAt(0)).mcSetColor(this,"Trim","None"); } catch(e:Error) {}"#;
+        assert!(inert_background_avm1(color).unwrap());
+        assert!(inert_background_avm1("var isProp=true; mouseEnabled=false; mouseChildren=false;").unwrap());
+        for text in [format!("{color} stop();"), color.replace("mcSetColor", "gotoAndStop"), color.replace("{}", "{play();}"), "_visible=false;".into(), "gotoAndStop(2);".into()] {
+            assert!(!inert_background_avm1(&text).unwrap(), "{text}");
+        }
+    }
     #[test]
     fn hand_visibility_requires_exact_registered_first_frame_rule() {
         let source = r#"class Clip {function Clip(){addFrameScript(0,this.frame1);}

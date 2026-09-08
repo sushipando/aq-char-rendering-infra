@@ -38,7 +38,7 @@ import tempfile
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode
-from urllib.request import Request, urlopen
+from aqw_char_renderer.source_http import fetch_bytes
 import uuid
 import zlib
 
@@ -97,9 +97,8 @@ class FlashVarsParser(HTMLParser):
 
 
 def fetch_text(url: str, *, timeout: float) -> str:
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", errors="replace")
+    return fetch_bytes(url, timeout=timeout, maximum_bytes=512 * 1024,
+                       user_agent=USER_AGENT).decode("utf-8", errors="replace")
 
 
 def parse_flashvars(encoded: str, username: str) -> dict[str, str]:
@@ -180,19 +179,10 @@ def download_swf(url: str, destination: Path, *, timeout: float) -> None:
     """Download one validated SWF, replacing the destination atomically."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.part")
-    request = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": (
-                "application/x-shockwave-flash,"
-                "application/octet-stream;q=0.9,*/*;q=0.1"
-            ),
-        },
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = response.read()
+        payload = fetch_bytes(url, timeout=timeout, maximum_bytes=16 * 1024 * 1024,
+                              user_agent=USER_AGENT,
+                              accept="application/x-shockwave-flash,application/octet-stream;q=0.9,*/*;q=0.1")
         if len(payload) < 8 or payload[:3] not in SWF_SIGNATURES:
             raise TryOnError(f"Downloaded response is not a SWF: {url}")
         temporary.write_bytes(payload)

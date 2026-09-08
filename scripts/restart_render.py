@@ -78,37 +78,6 @@ def load_original_request(
     # preserves the original defaults even when fleet defaults have changed.
     original = json.loads(execution["input"])["request"]
     request = JobRequest.from_dict(original)
-    if request.appearance is None:
-        # Some callers originally let PrepareResolve fetch the appearance.
-        # Recover its saved snapshot, never today's equipment/CC from AQW.
-        bucket = outputs["WorkResultBucketName"]
-        for filename in ("input.json", "manifest.json"):
-            try:
-                saved = json.loads(
-                    s3.get_object(
-                        Bucket=bucket, Key=f"jobs/{request.job_id}/prepare/{filename}"
-                    )["Body"].read()
-                )
-            except ClientError as error:
-                if error.response["Error"]["Code"] in {"NoSuchKey", "404", "NotFound"}:
-                    continue
-                raise
-            if (
-                saved.get("job_id") != request.job_id
-                or RenderSettings.from_dict(saved.get("settings")) != request.render
-            ):
-                raise ValueError(
-                    "Saved appearance snapshot does not match the original job/settings"
-                )
-            if not saved.get("fields"):
-                continue
-            original["appearance"] = saved["fields"]
-            request = JobRequest.from_dict(original)
-            break
-        if request.appearance is None:
-            raise RuntimeError(
-                "Original appearance was not in the request and its saved snapshot is unavailable. Cannot restart with identical assets; submit a username to render today's appearance instead."
-            )
     return request, arn
 
 
@@ -121,6 +90,9 @@ def fresh_request(original: JobRequest, args: argparse.Namespace) -> JobRequest:
         copy.deepcopy(original),
         job_id=str(uuid4()),
         created_at=utc_now(),
+        appearance=None,
+        source_job_id=original.job_id,
+        appearance_overrides=None,
         cache=replace(original.cache, **cache),
     )
 

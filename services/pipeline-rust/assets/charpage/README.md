@@ -6,7 +6,8 @@ licensed project artwork. Source URLs and SHA-256 checksums are in
 `character-source.json` and `sources.json`.
 
 `background.svgz` is the default background. Backgrounds 1–35 match characterB's
-background array; `bgindex` is base 36. Each background uses its first frame.
+background array; `bgindex` is base 36. These SVGZ files are first-frame previews. Runtime selectable backgrounds use
+the complete pinned source SWFs through the distributed render pipeline.
 The card uses the original 550×350 stage, fade artwork, equipment/guild/faction
 icons, and embedded BD Merced / Arial Black fonts. No profile/cosmetics controls
 are included. SVGZ keeps these vector assets compact in the pipeline binary.

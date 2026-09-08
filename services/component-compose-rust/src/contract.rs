@@ -94,6 +94,9 @@ pub struct StaticLayer {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PresentationLayers {
+    /// Composited after the first (background) component, before the character.
+    #[serde(default)]
+    pub background_overlay: Option<StaticLayer>,
     #[serde(default)]
     pub background: Option<StaticLayer>,
     #[serde(default)]

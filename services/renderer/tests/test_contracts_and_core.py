@@ -428,3 +428,13 @@ def test_presentation_presets_and_overrides():
     for bad in ({"framing": []}, {"viewport": [0, 0, -1, 350]}, {"info": "true"}, {"character_position": [True, 1]}, {"extra": True}):
         with pytest.raises(ContractError):
             normalize_presentation("character", bad)
+
+
+def test_border_fade_and_hex_color_normalization():
+    from aqw_char_renderer.contracts import normalize_presentation, ContractError
+    result = normalize_presentation("charpage", {"border_fade": False, "border_color": " aa00ff "})
+    assert result["border_fade"] is False
+    assert result["border_color"] == "#AA00FF"
+    for color in ("red", "#123", "#11223344", "##112233", 123, "#GG0000"):
+        with pytest.raises(ContractError):
+            normalize_presentation("charpage", {"border_color": color})

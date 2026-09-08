@@ -53,6 +53,8 @@ character rasterization, and the Discord command name.
 | `character_position` | `[0,0]` | `[338.05,304.2]` |
 | `background` | false | true |
 | `info` | false | true |
+| `border_fade` | true (when background enabled) | true |
+| `border_color` | `#FEF0C1` | `#FEF0C1` |
 
 Example request fragment for the existing fitted view with a background:
 
@@ -93,20 +95,36 @@ fonts and equipment/guild/faction icons, with XML escaping and shrinking for lon
 text. Equipment labels reflect the same base/cosmetic and visibility selections
 as the character metadata. Profile Pic and Cosmetics controls are excluded.
 
-The static layers are rasterized once per job, stored as PNG, and referenced as
-optional `presentation_layers.background` / `.foreground` in the prepare
-manifest. The compositor has no charpage-specific logic: it downloads/decodes
-each optional layer once per batch, copies the background, composites character
-layers, then composites the foreground. Both existing output paths consume
-that final canvas. No GPU, browser session, additional workflow node, or runtime
-background download is needed.
+Selectable backgrounds now use their original SWF timelines. Resolve fetches the
+pinned official SWF through the existing source cache, wraps its complete stage
+as a nested sprite, and adds it to the ordinary export/bounds/raster pipeline.
+Each distinct background state is rasterized by the existing distributed
+component workers and reused through their cache. Background frames participate
+in composition deduplication, so character repeats cannot freeze a moving scene.
 
-The asset bundle contains the default background plus all 35 official selectable
-backgrounds (selected by base-36 `bgindex`). Background artwork uses the first
-frame; character/equipment animation remains supported. Source checksums and a
-rebuild script are included under `assets/charpage` and
-`scripts/build_charpage_assets.py`. Layout and artwork policy versions plus
-presentation settings/background/faction participate in the final cache key.
+Character bounds determine fitted framing; the background covers that viewport
+independently and never mirrors with the character. The beige base, edge fade,
+and information overlay remain static PNG layers, decoded once per compose
+batch. `presentation_layers.background_overlay` is composited after the first
+background component and before the character; `.foreground` follows all
+components. No additional workflow node, GPU, or browser is needed. The pipeline
+and compose images both require updating for this manifest extension.
+
+The embedded bundle still supplies the default background, information artwork,
+and static preview fallbacks for all 35 selections (base-36 `bgindex`). Runtime
+selectable backgrounds use the pinned source files in `assets/charpage/sources.json`,
+not these first-frame previews. Missing uncached SWFs require official asset
+fallback to be enabled, as with character items. The builder continues to rebuild
+preview artwork; it does not flatten runtime animation. Layout/artwork policies,
+presentation settings, source checksums, and faction participate in cache keys.
+
+Authored background timeline lengths participate in frame-count and loop metadata.
+A quiet initial span is not evidence of a static background. `max_frames` and the
+component frame cap still apply; long effects or complete cycles can require a
+larger cap. Adding actual motion can increase encoded size and raster work, but
+format, quality, lossless controls, and zstd frame transport remain unchanged.
+Metadata includes the rendered background selection under General Info (for
+example `Background W (32)`), or `None` when backgrounds are disabled.
 Legacy Python rendering stages reject custom presentation rather than silently
 producing the wrong view; production uses the Rust pipeline.
 
@@ -134,3 +152,29 @@ Local still-frame preview of `___cj` (1024-pixel output, original assets;
 animated items are sampled at their first frame):
 
 ![Local charpage preview](images/charpage-preview.png)
+
+
+## Border fade controls
+
+`/render-charpage` accepts `border_color` (six hex digits, optionally prefixed
+with `#`) and `border_fade` (boolean). The default remains a pale yellow fade.
+Examples:
+
+```text
+/render-charpage username:fleki border_color:#112233
+/render-charpage username:fleki border_fade:false
+```
+
+These map to `render.presentation.border_color` and `.border_fade`. Colors
+normalize to uppercase `#RRGGBB`, so equivalent spellings share request/cache
+identity. Invalid colors are rejected before Discord admission. The command
+now has 25 options, within Discord's limit.
+
+Both static and animated backgrounds use the same authored fade geometry and
+opacity, recolored to the selected RGB. Disabling the fade also removes its
+colored backing; uncovered artwork areas can be transparent. Border controls
+have no visible effect when the background itself is disabled. Neither character
+pixels nor information text are recolored. Retries preserve these settings.
+
+CLI equivalents are `--border-color '#112233'` and `--no-border-fade`.
+The presentation artwork policy is `charpage-v3-border-options`.

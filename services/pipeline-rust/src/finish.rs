@@ -196,7 +196,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     }
     let mut item_loop = Some(1usize);
     for (key, symbol) in &symbols {
-        if !ignored.contains(key) && !static_keys.contains(key) {
+        if key != crate::background::KEY && !ignored.contains(key) && !static_keys.contains(key) {
             item_loop = item_loop
                 .zip(geometry::period(&symbol.schedule, max))
                 .and_then(|(a, b)| geometry::lcm(a, b));
@@ -225,6 +225,10 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
                 }
             }
         }
+    }
+    if symbols.contains_key(crate::background::KEY) {
+        item_loop = item_loop.zip(prepared["background_period"].as_u64().map(|n| n as usize))
+            .and_then(|(a,b)| geometry::lcm(a,b));
     }
     let detected = item_loop.zip(blink).and_then(|(a, b)| {
         if a > 0 && b > 0 {
@@ -261,7 +265,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         Ok(source)
     };
     let aliases: BTreeMap<String, String> = serde_json::from_value(prepared["aliases"].clone())?;
-    let layers = geometry::layers(
+    let mut layers = geometry::layers(
         &aliases,
         string(&prepared, "weapon_type")?,
         string(settings, "facing")?,
@@ -286,6 +290,11 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     let margin = padding as f64 * units;
     let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
     let viewbox = crate::presentation::viewbox(&layout, [x - margin, y - margin, w + 2.0 * margin, h + 2.0 * margin]);
+    if symbols.contains_key(crate::background::KEY) {
+        let scale = (viewbox[2] / 550.0).max(viewbox[3] / 350.0);
+        layers.insert(0, geometry::Layer { name:crate::background::KEY.into(), symbol_key:crate::background::KEY.into(), darken:false,
+            matrix:[scale,0.0,0.0,scale,viewbox[0]+(viewbox[2]-550.0*scale)/2.0+5.0*scale,viewbox[1]+(viewbox[3]-350.0*scale)/2.0] });
+    }
     let frame_rate = if let Some(rate) = prepared["frame_rate"].as_f64() {
         rate
     } else {

@@ -39,7 +39,8 @@ class BenchmarkTests(unittest.TestCase):
         original=request()
         for mode in ("matched","export-cold","avif-raw","avif-zstd","avif-lossless"):
             candidate=bench.candidate(original,mode,70,8)
-            self.assertEqual(candidate.appearance,original.appearance)
+            self.assertIsNone(candidate.appearance)
+            self.assertEqual(candidate.source_job_id,original.job_id)
             self.assertEqual(candidate.render.output_size,2048)
             self.assertEqual(candidate.render.raster_size,4096)
             self.assertFalse(candidate.cache.render)

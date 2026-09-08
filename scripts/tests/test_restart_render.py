@@ -94,9 +94,10 @@ class RestartTests(unittest.TestCase):
         before, after = original.to_dict(), fresh.to_dict()
         self.assertEqual(
             {key for key in before if before[key] != after[key]},
-            {"job_id", "created_at"},
+            {"job_id", "created_at", "appearance"},
         )
-        fresh.appearance["intColorHair"] = "0"
+        self.assertIsNone(fresh.appearance)
+        self.assertEqual(fresh.source_job_id, original.job_id)
         self.assertEqual(original.appearance["intColorHair"], "10066329")
         self.s3.get_object.assert_not_called()
 
@@ -137,53 +138,15 @@ class RestartTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "configured render state machine"):
             self.load(ARN.replace(":execution:test:", ":execution:other:"))
 
-    def test_missing_appearance_uses_saved_snapshot_not_live_character(self):
+    def test_missing_appearance_is_resolved_in_aws_not_on_cli(self):
         payload = self.original.to_dict()
         payload["appearance"] = None
         self.set_execution(payload)
-        self.s3.get_object.return_value = self.saved()
-        self.assertEqual(self.load()[0], self.original)
-        self.s3.get_object.assert_called_once_with(
-            Bucket="work", Key=f"jobs/{SOURCE}/prepare/input.json"
-        )
-
-    def test_legacy_snapshot_normalizes_new_render_defaults(self):
-        payload = self.original.to_dict()
-        payload["appearance"] = None
-        self.set_execution(payload)
-        settings = self.original.render.to_dict()
-        for key in ("output_format", "rgba_compression", "avif_quality", "avif_speed"):
-            settings.pop(key, None)
-        self.s3.get_object.return_value = self.saved(settings=settings)
-        self.assertEqual(self.load()[0], self.original)
-
-    def test_snapshot_falls_back_to_finish_manifest(self):
-        payload = self.original.to_dict()
-        payload["appearance"] = None
-        self.set_execution(payload)
-        self.s3.get_object.side_effect = [
-            ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject"),
-            self.saved(),
-        ]
-        self.assertEqual(self.load()[0], self.original)
-        self.assertEqual(
-            self.s3.get_object.call_args.kwargs["Key"],
-            f"jobs/{SOURCE}/prepare/manifest.json",
-        )
-
-    def test_missing_or_mismatched_snapshot_fails_instead_of_changing_assets(self):
-        payload = self.original.to_dict()
-        payload["appearance"] = None
-        self.set_execution(payload)
-        self.s3.get_object.side_effect = ClientError(
-            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
-        )
-        with self.assertRaisesRegex(RuntimeError, "identical assets"):
-            self.load()
-        self.s3.get_object.side_effect = None
-        self.s3.get_object.return_value = self.saved(job_id=MANUAL)
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            self.load()
+        original, _ = self.load()
+        fresh = restart.fresh_request(original, self.args)
+        self.assertIsNone(fresh.appearance)
+        self.assertEqual(fresh.source_job_id, SOURCE)
+        self.s3.get_object.assert_not_called()
 
     def test_shared_enqueue_creates_new_admission_then_queues_identical_request(self):
         fresh = restart.fresh_request(self.original, self.args)

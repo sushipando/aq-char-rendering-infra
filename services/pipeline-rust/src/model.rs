@@ -7,7 +7,7 @@ use serde_json::Value;
 pub const VECTOR_SCHEMA: u32 = 6;
 pub const FFDEC_VERSION: &str = "26.2.1";
 // Bump whenever effective-export corrections or the pinned renderer change.
-pub const EXPORT_POLICY: &str = "rust-effective-svg-v5-bank-pet-idle";
+pub const EXPORT_POLICY: &str = "rust-effective-svg-v6-escaped-names-avm1-background";
 pub const BOUNDS_POLICY: &str = "resvg-0.48.1-aqw-v1-cells-v2-visibility";
 // Final-container changes must not invalidate immutable intermediate caches.
 pub const FINALIZE_POLICY: &str = "webp-adjacent-runs-v1";

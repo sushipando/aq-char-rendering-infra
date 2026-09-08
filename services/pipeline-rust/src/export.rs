@@ -428,6 +428,8 @@ fn ranges(values: &[usize]) -> String {
 #[derive(Default, Serialize, Deserialize)]
 pub struct ScriptMetadata {
     #[serde(default)]
+    pub inert_background_actions: BTreeSet<String>,
+    #[serde(default)]
     pub hand_visibility: BTreeMap<String, String>,
     pub color_rules: BTreeMap<String, Vec<String>>,
     pub timelines: BTreeMap<String, crate::script::Class>,
@@ -435,6 +437,31 @@ pub struct ScriptMetadata {
 }
 
 impl ScriptMetadata {
+    fn inspect_file(&mut self, path: &Path, swf: &Swf) -> Result<()> {
+        let text = std::fs::read_to_string(path)?;
+        self.inspect(&text)?;
+        // FFDec's AVM1 filenames identify a sprite and frame, not an AS3 class.
+        // Only approve an unambiguous, single DoAction on that exact frame and
+        // bind approval to its bytes. Missing/unrecognized scripts stay rejected.
+        if path.file_name().and_then(|s| s.to_str()) != Some("DoAction.as")
+            || !crate::script::inert_background_avm1(&text)? { return Ok(()); }
+        let frame_dir = path.parent().context("missing AVM1 frame directory")?;
+        let frame: usize = frame_dir.file_name().and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("frame_")).context("invalid AVM1 frame path")?.parse()?;
+        let id: u16 = frame_dir.parent().and_then(Path::file_name).and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("DefineSprite_")).context("invalid AVM1 sprite path")?.parse()?;
+        let payload = swf.sprites.get(&id).context("missing AVM1 sprite")?;
+        let mut current = 1;
+        let mut actions = Vec::new();
+        for (code, data) in crate::swf::tags(payload, 4)? {
+            if code == 12 && current == frame { actions.push(data); }
+            if code == 1 { current += 1; }
+        }
+        ensure!(actions.len() == 1, "ambiguous AVM1 frame script");
+        self.inert_background_actions.insert(crate::sha256(actions[0]));
+        Ok(())
+    }
+
     pub fn inspect(&mut self, text: &str) -> Result<()> {
         let folded = text.to_lowercase();
         self.random_pose |= Regex::new(r"(?is)gotoAndStop\s*\([^)]*Math\.random[^)]*\)")?
@@ -832,14 +859,23 @@ pub async fn export_source(
             .await?;
         let mut computed = ScriptMetadata::default();
         for path in script_files(&output)? {
-            computed.inspect(&String::from_utf8_lossy(&std::fs::read(&path)?)).with_context(|| format!("decompiled script {}", path.display()))?;
+            computed.inspect_file(&path, &swf).with_context(|| format!("decompiled script {}", path.display()))?;
         }
         if vector_cache {
             store::write(store, work_bucket, &metadata_key, &computed, true).await?;
         }
         computed
     };
-    let normalized = crate::timeline::normalize(&bytes, &swf, &metadata.timelines, &normalization_requests)?;
+    let mut allowed_actions = BTreeSet::new();
+    if !metadata.inert_background_actions.is_empty()
+        && normalization_requests.iter().all(|r| r.key == crate::background::KEY) {
+        let body = crate::swf::decompress(&bytes)?;
+        let stage_offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
+        let as3 = crate::swf::tags(&body, stage_offset)?.iter().any(|(code, data)|
+            *code == 69 && data.first().is_some_and(|flags| flags & 8 != 0));
+        if !as3 { allowed_actions.clone_from(&metadata.inert_background_actions); }
+    }
+    let normalized = crate::timeline::normalize_with_avm1(&bytes, &swf, &metadata.timelines, &normalization_requests, &allowed_actions)?;
     let selected: BTreeSet<_> = requests.iter().map(|r| r.key.as_str()).collect();
     let effective_requests: Vec<_> = normalized.requests.iter()
         .filter(|r| selected.contains(r.key.as_str())).cloned().collect();
@@ -1078,6 +1114,101 @@ mod tests {
     #[test]
     fn root_selection_ranges_are_deterministic() {
         assert_eq!(ranges(&[3, 1, 2, 3, 8, 9]), "1-3,8-9");
+    }
+
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC, AQW_TEST_SCYTHE_SWF, AQW_TEST_BG18_WRAPPED_SWF; no AWS"]
+    async fn real_escaped_scythe_and_avm1_background_export() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FsStore(root.path().join("objects"));
+        for (env, key, id, class, count) in [
+            ("AQW_TEST_SCYTHE_SWF", "weapon", 14, "013BlackSkullsScythe", 1),
+            ("AQW_TEST_BG18_WRAPPED_SWF", crate::background::KEY, 65533, "CharpageBackgroundStage", 50),
+        ] {
+            let bytes = std::fs::read(std::env::var(env)?)?;
+            let source = json!({"idx":0,"key":key,"sha256":crate::sha256(&bytes),"requests":[{"key":key,"class_name":class,"character_id":id,"frame":1,"root_timeline_frames":1}]});
+            store.put("source",key,bytes.clone(),"application/octet-stream",true).await?;
+            store::write(&store,"work",key,&json!({"job_id":key,"sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":count}),false).await?;
+            let event = json!({"job_id":key,"input_key":key,"source":source});
+            let options = || ExportOptions {jar:std::env::var("AQW_TEST_FFDEC").unwrap().into(),timeout:Duration::from_secs(240),bounds_prefetch:None};
+            let result = export_source(&store,"work","source",&event,options()).await?;
+            let manifest: SourceManifest = store::read(&store,"work",result["manifest_key"].as_str().unwrap()).await?;
+            assert_eq!(manifest.symbols[key].schedule.len(),count);
+            assert!(!manifest.states.is_empty());
+            for state in manifest.states.values() {
+                let svg = store.get("work",&state.svg_key).await?.unwrap();
+                let tree = resvg::usvg::Tree::from_data(&svg,&resvg::usvg::Options::default())?;
+                let mut pixels = resvg::tiny_skia::Pixmap::new(128,128).unwrap();
+                resvg::render(&tree,resvg::tiny_skia::Transform::from_scale(128.0/tree.size().width().max(tree.size().height()),128.0/tree.size().width().max(tree.size().height())),&mut pixels.as_mut());
+                assert!(pixels.data().chunks_exact(4).any(|p|p[3]>0));
+            }
+            let metadata_key = format!("source-metadata/{EXPORT_POLICY}/{FFDEC_VERSION}/{}.json",crate::sha256(&bytes));
+            let meta: ScriptMetadata = store::read(&store,"work",&metadata_key).await?;
+            if key == crate::background::KEY {
+                assert_eq!(meta.inert_background_actions.len(),2); // two identical color hooks
+                let swf = Swf::parse(&bytes)?;
+                let requests: Vec<SymbolRequest> = serde_json::from_value(event["source"]["requests"].clone())?;
+                assert!(crate::timeline::normalize(&bytes,&swf,&meta.timelines,&requests).is_err(),"non-background exports must still reject AVM1");
+                let normalized = crate::timeline::normalize_with_avm1(&bytes,&swf,&meta.timelines,&requests,&meta.inert_background_actions)?;
+                let updated = Swf::parse(&normalized.bytes)?;
+                assert_eq!(updated.sprites[&52],swf.sprites[&52],"authored 50-frame timeline must be untouched");
+                assert_eq!(normalized.bytes,bytes,"background artwork, colors and all timelines must be unchanged");
+            } else {
+                assert!(meta.timelines.contains_key("013blackskullsscythe"));
+            }
+            assert_eq!(export_source(&store,"work","source",&event,options()).await?["vector_cache_hit"],true);
+            println!("{key}: {count} frames, {} SVG states, nontransparent raster and warm cache verified",manifest.states.len());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_BACKGROUND_DIR and AQW_TEST_FFDEC; exact official SWFs, no AWS"]
+    async fn real_background_timelines_preserve_motion() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = FsStore(root.path().join("objects"));
+        for index in [32,34] {
+            let original = std::fs::read(PathBuf::from(std::env::var("AQW_TEST_BACKGROUND_DIR")?).join(format!("bg{index}.swf")))?;
+            let catalog = crate::background::record(index).unwrap();
+            ensure!(crate::sha256(&original) == catalog["sha256"].as_str().unwrap(), "wrong background fixture");
+            let (bytes,id,period) = crate::background::wrap(&original)?;
+            assert!(period.is_none_or(|n| n > 1));
+            let source = json!({"idx":index,"key":format!("bg{index}.swf"),"sha256":crate::sha256(&bytes),"requests":[{"key":crate::background::KEY,"class_name":"CharpageBackgroundStage","character_id":id,"frame":1,"root_timeline_frames":1}]});
+            store.put("source",source["key"].as_str().unwrap(),bytes,"application/octet-stream",true).await?;
+            let job = format!("bg{index}");
+            let input = format!("{job}.json");
+            store::write(&store,"work",&input,&json!({"job_id":job,"sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":210}),false).await?;
+            let event = json!({"job_id":job,"input_key":input,"source":source});
+            let options = || ExportOptions {jar:std::env::var("AQW_TEST_FFDEC").unwrap().into(),timeout:Duration::from_secs(240),bounds_prefetch:None};
+            let result = export_source(&store,"work","source",&event,options()).await?;
+            let manifest:SourceManifest = store::read(&store,"work",result["manifest_key"].as_str().unwrap()).await?;
+            assert_eq!(manifest.symbols[crate::background::KEY].schedule.len(),210);
+            assert!(manifest.states.len()>1,"background animation froze");
+            let mut pixels = BTreeSet::new();
+            for frame in [0,15,60,90] {
+                let state = &manifest.states[&manifest.symbols[crate::background::KEY].schedule[frame]];
+                let svg = store.get("work",&state.svg_key).await?.unwrap();
+                if let Ok(dir) = std::env::var("AQW_TEST_BACKGROUND_PREVIEWS") { std::fs::create_dir_all(&dir)?; std::fs::write(PathBuf::from(dir).join(format!("bg{index}-{frame}.svg")),&svg)?; }
+                // FFDec sprite SVGs are tightly cropped, whereas backgrounds use
+                // their authored stage origin. Import removes that crop matrix.
+                let imported = aqw_component_raster::import::import_ffdec_symbol(crate::background::KEY, std::str::from_utf8(&svg)?,1.0,&Default::default(),"CharpageBackgroundStage",&Default::default(),Some(id as i64))?;
+                let component = aqw_component_raster::component_svg::build_component_svg(&imported,[1.0,0.0,0.0,1.0,0.0,0.0],false,"background",crate::background::KEY,[0.0,0.0,550.0,350.0],550,&Default::default(),&[]);
+                let mut doc = svg::Document {root:component.root,namespaces:component.namespaces};
+                doc.root.set("viewBox","0 0 550 350");
+                doc.root.set("width","550"); doc.root.set("height","350");
+                let tree = resvg::usvg::Tree::from_data(svg::serialize(&doc).as_bytes(),&resvg::usvg::Options::default())?;
+                let mut pixmap = resvg::tiny_skia::Pixmap::new(275,175).unwrap();
+                resvg::render(&tree,resvg::tiny_skia::Transform::from_scale(0.5,0.5),&mut pixmap.as_mut());
+                assert!(pixmap.data().chunks_exact(4).any(|p|p[3]>0));
+                pixels.insert(crate::sha256(pixmap.data()));
+                if let Ok(dir) = std::env::var("AQW_TEST_BACKGROUND_PREVIEWS") { std::fs::create_dir_all(&dir)?; pixmap.save_png(PathBuf::from(dir).join(format!("bg{index}-{frame}.png")))?; }
+            }
+            assert!(pixels.len()>1,"SVG differences must produce visible motion");
+            assert_eq!(export_source(&store,"work","source",&event,options()).await?["vector_cache_hit"],true);
+            println!("background {index}: period {period:?}, {} SVG states, {} sampled pixel states",manifest.states.len(),pixels.len());
+        }
+        Ok(())
     }
 
     #[tokio::test]

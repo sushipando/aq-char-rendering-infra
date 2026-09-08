@@ -12,9 +12,9 @@ pub fn normalize(view: &str, overrides: &Value) -> Result<Value> {
         "invalid render view"
     );
     let mut result = if view == "charpage" {
-        json!({"framing":"fixed","viewport":[0.0,0.0,550.0,350.0],"character_position":[338.05,304.2],"background":true,"info":true})
+        json!({"framing":"fixed","viewport":[0.0,0.0,550.0,350.0],"character_position":[338.05,304.2],"background":true,"info":true,"border_fade":true,"border_color":"#FEF0C1"})
     } else {
-        json!({"framing":"content","viewport":[0.0,0.0,550.0,350.0],"character_position":[0.0,0.0],"background":false,"info":false})
+        json!({"framing":"content","viewport":[0.0,0.0,550.0,350.0],"character_position":[0.0,0.0],"background":false,"info":false,"border_fade":true,"border_color":"#FEF0C1"})
     };
     if !overrides.is_null() {
         for (key, value) in overrides
@@ -32,9 +32,13 @@ pub fn normalize(view: &str, overrides: &Value) -> Result<Value> {
         matches!(result["framing"].as_str(), Some("content" | "fixed")),
         "invalid presentation framing"
     );
-    for key in ["background", "info"] {
+    for key in ["background", "info", "border_fade"] {
         ensure!(result[key].is_boolean(), "invalid presentation {key}");
     }
+    let color = result["border_color"].as_str().context("border_color must be a hex RGB color")?.trim();
+    let color = color.strip_prefix('#').unwrap_or(color);
+    ensure!(color.len() == 6 && color.bytes().all(|c| c.is_ascii_hexdigit()), "border_color must contain six hex digits, e.g. #FEF0C1");
+    result["border_color"] = format!("#{}",color.to_ascii_uppercase()).into();
     for (key, len) in [("viewport", 4), ("character_position", 2)] {
         let values = result[key]
             .as_array()
@@ -89,6 +93,16 @@ pub fn canvas(viewbox: [f64; 4], raster: u32, output: u32, output_space: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn border_options_are_canonical_and_reject_invalid_colors() {
+        let plain = normalize("charpage", &json!({"border_fade":false,"border_color":" aa00ff "})).unwrap();
+        assert_eq!(plain["border_color"],"#AA00FF");
+        assert_eq!(plain["border_fade"],false);
+        for color in [json!("red"),json!("#123"),json!("#11223344"),json!("##112233"),json!(123),json!("#GG0000")] {
+            assert!(normalize("charpage",&json!({"border_color":color})).is_err());
+        }
+        assert!(normalize("charpage",&json!({"border_fade":"false"})).is_err());
+    }
     #[test]
     fn presets_and_independent_overrides() {
         let content = [-20.0, -80.0, 100.0, 200.0];

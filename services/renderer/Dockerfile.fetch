@@ -1,0 +1,6 @@
+FROM public.ecr.aws/lambda/python:3.13
+COPY pyproject.toml README.md /opt/renderer/
+COPY src /opt/renderer/src
+# No Rust compiler, resvg, FFDec or JVM in the fetch image.
+RUN pip install --no-cache-dir /opt/renderer
+CMD ["aqw_char_renderer.fetch_sources.handler"]

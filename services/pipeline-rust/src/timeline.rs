@@ -49,7 +49,7 @@ struct Clip {
     labels: BTreeMap<String, usize>,
 }
 impl Clip {
-    fn read(payload: &[u8], budget: &mut usize) -> Result<Self> {
+    fn read(payload: &[u8], budget: &mut usize, inert_actions: &BTreeSet<String>) -> Result<Self> {
         let mut frames = Vec::new();
         let mut labels = BTreeMap::new();
         let mut display: BTreeMap<u16, Instance> = BTreeMap::new();
@@ -102,7 +102,8 @@ impl Clip {
                         "duplicate frame label"
                     );
                 }
-                // This resolver handles AS3 callbacks, not legacy AVM1 bytecode.
+                // Only explicitly classified background setup can bypass AVM1 rejection.
+                12 if inert_actions.contains(&crate::sha256(data)) => (),
                 12 | 59 => bail!("AVM1 timeline actions are unsupported"),
                 _ => (),
             }
@@ -142,6 +143,7 @@ struct Entry {
 struct Resolver<'a> {
     swf: &'a Swf,
     scripts: &'a BTreeMap<String, Class>,
+    inert_actions: &'a BTreeSet<String>,
     selections: BTreeMap<u16, Selection>,
     active: BTreeSet<u16>,
     // Same symbol used with incompatible per-instance state must not be globally rewritten.
@@ -167,7 +169,7 @@ impl Resolver<'_> {
         ensure!(!self.active.contains(&id), "cyclic sprite hierarchy");
         if let Some(previous) = self.entries.get(&id) {
             if *previous != entry {
-                let clip = Clip::read(&self.swf.sprites[&id], &mut self.budget)?;
+                let clip = Clip::read(&self.swf.sprites[&id], &mut self.budget, self.inert_actions)?;
                 ensure!(
                     previous.play == entry.play
                         && clip.target(&previous.target)? == clip.target(&entry.target)?,
@@ -182,7 +184,7 @@ impl Resolver<'_> {
         );
         self.entries.insert(id, entry.clone());
         self.active.insert(id);
-        let clip = Clip::read(&self.swf.sprites[&id], &mut self.budget)?;
+        let clip = Clip::read(&self.swf.sprites[&id], &mut self.budget, self.inert_actions)?;
         let name = self
             .swf
             .symbols
@@ -380,9 +382,17 @@ pub fn normalize(
     scripts: &BTreeMap<String, Class>,
     requests: &[SymbolRequest],
 ) -> Result<Normalized> {
+    normalize_with_avm1(source, swf, scripts, requests, &BTreeSet::new())
+}
+
+pub(crate) fn normalize_with_avm1(
+    source: &[u8], swf: &Swf, scripts: &BTreeMap<String, Class>,
+    requests: &[SymbolRequest], inert_actions: &BTreeSet<String>,
+) -> Result<Normalized> {
     let mut resolver = Resolver {
         swf,
         scripts,
+        inert_actions,
         selections: BTreeMap::new(),
         active: BTreeSet::new(),
         entries: BTreeMap::new(),
@@ -453,6 +463,23 @@ pub fn normalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn avm1_approval_is_bound_to_action_bytes_and_tag_kind() {
+        let action = b"recognized background action fixture";
+        let allowed = BTreeSet::from([crate::sha256(action)]);
+        let clip = |code, data: &[u8]| {
+            let mut payload = vec![1,0,1,0];
+            payload.extend(tag(code,data));
+            payload.extend(tag(1,&[]));
+            payload.extend(tag(0,&[]));
+            payload
+        };
+        assert!(Clip::read(&clip(12,action), &mut 1000, &allowed).is_ok());
+        assert!(Clip::read(&clip(12,action), &mut 1000, &BTreeSet::new()).is_err());
+        assert!(Clip::read(&clip(12,b"other action"), &mut 1000, &allowed).is_err());
+        assert!(Clip::read(&clip(59,action), &mut 1000, &allowed).is_err());
+    }
+
     fn tag(code: u16, data: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         swf::write_tag(&mut b, code, data);
@@ -555,10 +582,10 @@ mod tests {
                 .selection,
             Selection::Hold { frame: 2 }
         );
-        let child = Clip::read(&updated.sprites[&2], &mut 1000).unwrap();
+        let child = Clip::read(&updated.sprites[&2], &mut 1000, &BTreeSet::new()).unwrap();
         assert_eq!(child.frames.len(), 1);
         assert_eq!(child.frames[0].display[&1].id, 3);
-        let root = Clip::read(&updated.sprites[&1], &mut 1000).unwrap();
+        let root = Clip::read(&updated.sprites[&1], &mut 1000, &BTreeSet::new()).unwrap();
         assert_eq!(
             root.frames[0].display.len(),
             2,
@@ -647,7 +674,7 @@ mod tests {
         };
         assert_eq!(controls(&swf.sprites[&1]), controls(&updated.sprites[&1]));
         assert_eq!(
-            Clip::read(&updated.sprites[&1], &mut 1000).unwrap().frames[0]
+            Clip::read(&updated.sprites[&1], &mut 1000, &BTreeSet::new()).unwrap().frames[0]
                 .display
                 .len(),
             1

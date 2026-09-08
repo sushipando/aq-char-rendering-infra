@@ -37,9 +37,23 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
             "component_raster_mode",
             "cache",
             "appearance",
+            "source_job_id",
+            "appearance_overrides",
         ],
     )?;
     ensure!(value["schema_version"] == 1, "unsupported request schema");
+    if !value["source_job_id"].is_null() {
+        let raw = string(&value, "source_job_id")?;
+        ensure!(uuid::Uuid::parse_str(raw)?.to_string() == raw, "invalid source_job_id");
+    }
+    if !value["appearance_overrides"].is_null() {
+        let fields = value["appearance_overrides"].as_object().context("invalid appearance_overrides")?;
+        ensure!(fields.len() <= 128 && serde_json::to_vec(fields)?.len() <= 32768, "appearance_overrides too large");
+        for (key, value) in fields {
+            ensure!(!key.is_empty() && key.len() <= 64 && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'), "invalid appearance override key");
+            ensure!(value.as_str().is_some_and(|v| v.len() <= 2048), "invalid appearance override value");
+        }
+    }
     let raw = string(&value, "job_id")?;
     let id = uuid::Uuid::parse_str(raw)?.to_string();
     ensure!(raw.to_lowercase() == id, "job_id must be a canonical UUID");

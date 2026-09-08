@@ -380,7 +380,7 @@ pub async fn run_chunk(
     // Presentation layers are downloaded/decoded once per batch, never per frame.
     let mut presentation = HashMap::new();
     if let Some(card) = &prepared.presentation_layers {
-        for (name, layer) in [("background", &card.background), ("foreground", &card.foreground)] {
+        for (name, layer) in [("background", &card.background), ("background_overlay", &card.background_overlay), ("foreground", &card.foreground)] {
             let Some(layer) = layer else { continue; };
             let bytes = source.fetch_bytes(&layer.key, Some(&layer.sha256)).await?;
             let mut image = png::decode_rgba8(&bytes)?;
@@ -443,17 +443,20 @@ pub async fn run_chunk(
 
         let composite_started = Instant::now();
         if let Some(background) = presentation.get("background") { canvas.pixels.copy_from_slice(&background.pixels); }
-        for raw_task_id in &composition.layers {
+        for (layer_index, raw_task_id) in composition.layers.iter().enumerate() {
             let result = results_by_task.get(raw_task_id);
             match result {
                 None => continue, // unreachable after the missing-results check
-                Some(result) if result.empty => continue,
+                Some(result) if result.empty => {},
                 Some(result) => {
                     let layer = images
                         .get(raw_task_id)
                         .ok_or_else(|| ComposeError::missing_png(raw_task_id.clone()))?;
                     canvas.composite(layer, result.x, result.y);
                 }
+            }
+            if layer_index == 0 {
+                if let Some(overlay) = presentation.get("background_overlay") { canvas.composite(overlay, 0, 0); }
             }
         }
         if let Some(foreground) = presentation.get("foreground") { canvas.composite(foreground, 0, 0); }

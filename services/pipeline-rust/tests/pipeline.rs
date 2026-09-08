@@ -973,3 +973,46 @@ async fn charpage_finish_keeps_stage_canvas_and_stores_static_layers() -> Result
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn animated_background_affects_duration_and_recipes_but_not_character_framing() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = FsStore(temporary.path().into());
+    let (mut request, planned) = synthetic(&store).await?;
+    let mut source: SourceManifest = store::read(&store,"work","vector-manifests/fixture.json").await?;
+    let mut bg = source.symbols["cape"].clone();
+    bg.request.key = pipeline::background::KEY.into();
+    // A quiet prefix must not shorten a background whose effect begins later.
+    let first = bg.schedule[0].clone();
+    bg.schedule = vec![first;16];
+    source.symbols.insert(pipeline::background::KEY.into(),bg);
+    store::write(&store,"work","vector-manifests/fixture.json",&source,false).await?;
+    request["render"]["view"] = "charpage".into();
+    request["render"]["presentation"] = Value::Null;
+    request = pipeline::contract::request(request,None)?;
+    let mut input:Value = store::read(&store,"work","jobs/input.json").await?;
+    input["settings"] = request["render"].clone();
+    input["fields"]["bgindex"] = "W".into();
+    input["background_period"] = 197.into();
+    store::write(&store,"work","jobs/input.json",&input,false).await?;
+    let tasks:Vec<ProbeTask> = store::read(&store,"work",planned["tasks_key"].as_str().unwrap()).await?;
+    for task in tasks { bounds::run_probe(&store,"work",&task).await?; }
+    let mut bg_matrix = None;
+    for facing in ["left","right"] {
+        request["render"]["facing"] = facing.into();
+        input["settings"] = request["render"].clone();
+        store::write(&store,"work","jobs/input.json",&input,false).await?;
+        let prepared = finish::finish(&store,&config(),&json!({"request":request,"input_key":"jobs/input.json","bounds_plan_key":planned["plan_key"]})).await?;
+        let manifest:Value = store::read(&store,"work",prepared["manifest_key"].as_str().unwrap()).await?;
+        assert_eq!(manifest["viewbox"],json!(pipeline::charpage::VIEWBOX));
+        assert_eq!(manifest["frame_count"],8);
+        assert_ne!(manifest["loop_status"],"complete");
+        assert!(manifest["presentation_layers"]["background_overlay"]["key"].is_string());
+        let task = manifest["component_tasks"].as_array().unwrap().iter().find(|v|v["symbol_key"]==pipeline::background::KEY).unwrap();
+        assert_eq!(task["layer_index"],0);
+        if let Some(matrix) = &bg_matrix { assert_eq!(&task["matrix"],matrix); }
+        bg_matrix = Some(task["matrix"].clone());
+        for frame in manifest["component_frames"].as_array().unwrap() { assert_eq!(frame["layers"][0],task["task_id"]); }
+    }
+    Ok(())
+}

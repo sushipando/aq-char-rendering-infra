@@ -162,7 +162,8 @@ def candidate(original, variant, quality, speed):
                          rgba_compression="none" if variant == "avif-raw" else "zstd")
     elif variant != "matched":
         raise ValueError(f"Unknown variant {variant}")
-    return replace(request, job_id=str(uuid4()), created_at=utc_now(), render=render, cache=cache)
+    return replace(request, job_id=str(uuid4()), created_at=utc_now(), render=render, cache=cache,
+                   appearance=None, source_job_id=request.job_id, appearance_overrides=None)
 
 
 class Evidence:

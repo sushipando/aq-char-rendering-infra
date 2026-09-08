@@ -1,3 +1,4 @@
+import { sourceFetch } from './source-fetch';
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import * as budgets from 'aws-cdk-lib/aws-budgets';
@@ -28,6 +29,7 @@ export interface AqwCharRenderingInfraStackProps extends cdk.StackProps {
 interface RendererFunctions {
   readonly launcher: lambda.DockerImageFunction;
   readonly prepare: lambda.DockerImageFunction;
+  readonly sourceFetch: lambda.DockerImageFunction;
   readonly exportSource: lambda.DockerImageFunction;
   readonly bounds: lambda.DockerImageFunction;
   readonly finalizer: lambda.DockerImageFunction;
@@ -406,7 +408,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       });
     };
 
-    // Existing Rust frame compositor; no Python handlers are deployed.
+    // Frame composition stays in Rust; only source fetching uses Python.
     const rustContext = path.join(__dirname, '..', 'services', 'component-compose-rust');
     const componentComposeRustName = `aqw-char-${stageName}-componentcompose-rust`;
     const componentComposeRustLogGroup = new logs.LogGroup(this, 'ComponentComposeRustLogGroup', {
@@ -438,9 +440,21 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
       tracing: lambda.Tracing.ACTIVE,
     });
 
+    const prepare = make('Prepare', 'prepare', tuning.functions.prepare);
+    const fetch = sourceFetch(this, 'SourceFetchFunction', {
+      name: `aqw-char-${stageName}-source-fetch`, sourceBucket, workBucket,
+      dataset: tuning.render.assetDatasetVersion,
+      parameterName: this.node.tryGetContext('brightDataConfigParameter') ?? `/aqw-char/${stageName}/brightdata`,
+    });
+
+    jobTable.grantReadData(fetch);
+    fetch.addEnvironment('CHAR_RENDER_JOB_TABLE', jobTable.tableName);
+    fetch.addEnvironment('CHAR_RENDER_ALLOW_OFFICIAL_ASSET_FALLBACK', String(tuning.render.allowOfficialAssetFallback));
+
     return {
       launcher: make('Launcher', 'launcher', tuning.functions.launcher),
-      prepare: make('Prepare', 'prepare', tuning.functions.prepare),
+      prepare,
+      sourceFetch: fetch,
       exportSource: make('ExportSource', 'export', tuning.functions.prepare),
       bounds: make('BoundsProbe', 'bounds', tuning.functions.bounds),
       finalizer: make('Finalizer', 'finalize', tuning.functions.finalizer),
@@ -504,6 +518,13 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     // Each independently placed symbol exports in its own invocation and
     // immediately prefetches its bounds, including multipart source SWFs.
     // This planner is still the barrier and dispatches only unfinished states.
+    const fetchSources = new tasks.LambdaInvoke(this, 'FetchSources', {
+      lambdaFunction: functions.sourceFetch,
+      payload: sfn.TaskInput.fromObject({ request: sfn.JsonPath.objectAt('$.request') }),
+      payloadResponseOnly: true,
+      resultPath: '$.request',
+    }).addRetry(lambdaRetry);
+
     const prepareResolve = new tasks.LambdaInvoke(this, 'PrepareResolve', {
       lambdaFunction: functions.prepare,
       payload: sfn.TaskInput.fromObject({ request: sfn.JsonPath.objectAt('$.request') }),
@@ -753,7 +774,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     const cacheChoice = new sfn.Choice(this, 'CachedResultExists')
       .when(sfn.Condition.booleanEquals('$.prepare.cache_hit', true), completeCached)
       .otherwise(renderMiss);
-    const branch = prepareResolve.next(cacheChoice);
+    const branch = fetchSources.next(prepareResolve).next(cacheChoice);
     const protectedWorkflow = new sfn.Parallel(this, 'ProtectedRenderWorkflow');
     protectedWorkflow.branch(branch);
 
@@ -831,6 +852,7 @@ export class AqwCharRenderingInfraStack extends cdk.Stack {
     const concurrency = {
       [functions.launcher.functionName]: tuning.functions.launcher.reservedConcurrency,
       [functions.prepare.functionName]: tuning.functions.prepare.reservedConcurrency,
+      [functions.sourceFetch.functionName]: tuning.functions.prepare.reservedConcurrency,
       [functions.exportSource.functionName]: tuning.functions.prepare.reservedConcurrency,
       [functions.bounds.functionName]: tuning.functions.bounds.reservedConcurrency,
       [functions.finalizer.functionName]: tuning.functions.finalizer.reservedConcurrency,

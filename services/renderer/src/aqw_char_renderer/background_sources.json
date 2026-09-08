@@ -1,0 +1,177 @@
+[
+  {
+    "index": 1,
+    "file": "cp-doomwood.swf",
+    "sha256": "decec5196ee195f57320d77f1805b233982e179244e10496399926a241b4ecca"
+  },
+  {
+    "index": 2,
+    "file": "cp-ledgermayne.swf",
+    "sha256": "e55f77264bc9ba6d4c297faa262090fbfb4e51acf8b3e6712e1999c08543a759"
+  },
+  {
+    "index": 3,
+    "file": "cp-lightguard.swf",
+    "sha256": "e31bf58f0fd4b653f0ff1ac57283a2d8c736256d248f97af025c81573f84e0b5"
+  },
+  {
+    "index": 4,
+    "file": "cp-northernlights.swf",
+    "sha256": "055bd5a56f44f3924ef7a4bcaa12e8a7e8343ca3b26eed4e51fd271222eab3fb"
+  },
+  {
+    "index": 5,
+    "file": "cp-sandsea.swf",
+    "sha256": "a0228f98d3a156b314b242506deb2a3c15ff26cf89827a50b3468fb9bdbf87e7"
+  },
+  {
+    "index": 6,
+    "file": "cp-shadowfall.swf",
+    "sha256": "5899f8f0cb1906c68c25b0a39991e343389ff470102d3fa79cbb1a0cbe949d08"
+  },
+  {
+    "index": 7,
+    "file": "cp-skyguard.swf",
+    "sha256": "c9588f706a02a7f73fbd7d052721fdd2830577d511741abb7272f237c6f6224c"
+  },
+  {
+    "index": 8,
+    "file": "cp-void.swf",
+    "sha256": "a3b53dd23c4c05c1f798b54e0f8bdcca452db51712b319ced91e2f9d26a993ce"
+  },
+  {
+    "index": 9,
+    "file": "cp-yulgar.swf",
+    "sha256": "91948024781c6b91d6cca353143a19e1a0488403d0534e4df71fdd694d7bd4de"
+  },
+  {
+    "index": 10,
+    "file": "cp-mogloween.swf",
+    "sha256": "b266dca087cbaccf8584bab32c8451aafaac6d489382156d5c38d078de1743c0"
+  },
+  {
+    "index": 11,
+    "file": "CP-Frostvale.swf",
+    "sha256": "260d1ffddb44923f16db269addab74b3a4ac474cd596ec837e22c3a5c6572921"
+  },
+  {
+    "index": 12,
+    "file": "CP-Love.swf",
+    "sha256": "79ba52aa3441efcfc5aab1aca21da29293e8d382b032e76f7f406924377af067"
+  },
+  {
+    "index": 13,
+    "file": "cp-battleon2.swf",
+    "sha256": "b36672790f5ad83b0fd8477cde651c8053e023a40b91bdfbbd4bb04585b05590"
+  },
+  {
+    "index": 14,
+    "file": "cp-chaos.swf",
+    "sha256": "910b37dde01471787a0b25993776002605eba3863e775b0ac48a8262643cacbf"
+  },
+  {
+    "index": 15,
+    "file": "cp-river.swf",
+    "sha256": "4668757b0bfad79cb1a079495af781dd4e8b5b2a20a58b9d4d2c0c7aab49d875"
+  },
+  {
+    "index": 16,
+    "file": "cp-whitemap.swf",
+    "sha256": "3aa2c475974e727a2cfa7690fa735d4f55d1811e8e0773f58dca01efb76a8027"
+  },
+  {
+    "index": 17,
+    "file": "CP-Underworld2r1.swf",
+    "sha256": "e75a213bf88f1a14e4033619cc115bc9b08fdeabc238488ddf0c563975269622"
+  },
+  {
+    "index": 18,
+    "file": "cp-bg18.swf",
+    "sha256": "61dd7d75322bd3b5c05bca701845d9ad7edfb89c4e218948336ae1cb75b520dc"
+  },
+  {
+    "index": 19,
+    "file": "cp-bg19.swf",
+    "sha256": "a9a16204d5b599600f056d42e3f3c6a71c8f19929ba33478e33add3c328016c9"
+  },
+  {
+    "index": 20,
+    "file": "cp-bg20.swf",
+    "sha256": "4e0bb572388f2ea580901dd6c848d5a5b573c9ec431a151b13b469cd9551bb2a"
+  },
+  {
+    "index": 21,
+    "file": "cp-bg21.swf",
+    "sha256": "047aac9f7d69ccc23705b3e5f23e15b306e815f9fa8ca4c2dfd9cbe231179c69"
+  },
+  {
+    "index": 22,
+    "file": "cp-bg22.swf",
+    "sha256": "83b38571e77bdbb8cd0ac8f48a2f415c2e8b130042dd238d6a1daa0235228948"
+  },
+  {
+    "index": 23,
+    "file": "cp-bg23.swf",
+    "sha256": "59c079e84b20dc47358ad4ddf5f325031a29c134bee2f38d18b4b666379bd11b"
+  },
+  {
+    "index": 24,
+    "file": "cp-bg24.swf",
+    "sha256": "a2b9cddb8937fb46fc5ea7201f9473d7763b9ad44345c19dc2ee1ca9ca4c70ff"
+  },
+  {
+    "index": 25,
+    "file": "cp-bg25.swf",
+    "sha256": "dd1d6115a9882603a554d1ec181c5eefffe1e6e262937411375a9988ef597b94"
+  },
+  {
+    "index": 26,
+    "file": "cp-bg26.swf",
+    "sha256": "9c454ef541fb4bb06d4588bf6020789449a44a2c84062685d8f934083131cb63"
+  },
+  {
+    "index": 27,
+    "file": "cp-bg27.swf",
+    "sha256": "937e9269e02b1df076f6fef9a961b0b5a5111beeaf45bd4935f1fe92914193c9"
+  },
+  {
+    "index": 28,
+    "file": "cp-bg28.swf",
+    "sha256": "2cbc3b24affbe16e39e126b929b6d85993106c6c79636912e9b8ae2c2cf5fde9"
+  },
+  {
+    "index": 29,
+    "file": "cp-bg29.swf",
+    "sha256": "a1c7d4b87d0520dfeabe92a70694abd01ef16d520dbf518a5fc76c8130282cec"
+  },
+  {
+    "index": 30,
+    "file": "cp-bg30.swf",
+    "sha256": "51df65a69cf2d42885e881557df478155ae4a9cc23feb1cda3074e9292e32760"
+  },
+  {
+    "index": 31,
+    "file": "cp-bg31.swf",
+    "sha256": "adbce7d81206ea7428307610b860bb914b1b3b490f7fe86c089668ea2f4baeb7"
+  },
+  {
+    "index": 32,
+    "file": "cp-bg32.swf",
+    "sha256": "2ab6ba230ef678d92059e9e21603792a6bcbda77754898d72928baa68320b6c5"
+  },
+  {
+    "index": 33,
+    "file": "cp-bg33.swf",
+    "sha256": "8ffba9569104f8d06839a7642a929aadfa336f77fe78a47baabdbe539825e295"
+  },
+  {
+    "index": 34,
+    "file": "cp-bg34.swf",
+    "sha256": "22991199910e5d25f408b09db0aa284668f9b90ff0ffdd9367765be0cb735d98"
+  },
+  {
+    "index": 35,
+    "file": "cp-bg35.swf",
+    "sha256": "c5f733f7a04aa42c7f257aead9f053a5fe544a62160e6e5fdfe279a8d197b162"
+  }
+]

@@ -1,8 +1,7 @@
 """Queue AQW character renders through the deployed workflow and wait for them.
 
 A thin, ergonomic wrapper around the same SQS / DynamoDB admission path the
-Discord bot uses: it fetches the character's equipped flashvars, seeds any
-missing source assets, reserves a per-user slot, enqueues the render job, and
+Discord bot uses: it reserves a per-user slot, enqueues render inputs, and
 polls the job table until each job reaches a terminal state. It prints one
 compact result row per character and (optionally) verifies the delivered WebP
 on CloudFront. CLI successes and failures never post to Discord.
@@ -45,10 +44,9 @@ from aqw_char_renderer.contracts import (
     utc_now,
 )
 from aqw_char_renderer.jobs import TERMINAL_STATUSES, JobStore
-from aqw_char_renderer.legacy import preview_aqw_tryon as tryon
 
 # Proven helpers from the smoke harness (same repo, importable module).
-from smoke_test_deployment import load_outputs, seed_missing_assets, verify_image
+from smoke_test_deployment import load_outputs, verify_image
 
 
 def parser() -> argparse.ArgumentParser:
@@ -114,6 +112,8 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--background", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--info", action=argparse.BooleanOptionalAction, default=None)
+    result.add_argument("--border-fade", action=argparse.BooleanOptionalAction, default=None)
+    result.add_argument("--border-color", help="Border fade color as six hex digits, e.g. #112233")
     result.add_argument("--framing", choices=("content", "fixed"))
     result.add_argument("--viewport", type=float, nargs=4, metavar=("X", "Y", "WIDTH", "HEIGHT"))
     result.add_argument("--character-position", type=float, nargs=2, metavar=("X", "Y"))
@@ -232,16 +232,10 @@ def queue_one(
     username: str,
     args: argparse.Namespace,
 ) -> tuple[str, dict[str, Any]]:
-    """Fetch appearance, seed assets, reserve a slot, and enqueue one job.
+    """Reserve a slot and enqueue render inputs; AWS fetches character data and SWFs.
 
     Returns (job_id, queue_payload).
     """
-    appearance = tryon.fetch_character_flashvars(username, timeout=15)
-    seed_missing_assets(
-        outputs,
-        appearance,
-        dataset_version=args.dataset_version,
-    )
     job_id = str(uuid4())
     override = (
         ItemOverride(item_id=args.override_item_id, slot=args.override_slot)
@@ -272,6 +266,7 @@ def queue_one(
             view=args.view,
             presentation={key: value for key, value in {
                 "background": args.background, "info": args.info, "framing": args.framing,
+                "border_fade": args.border_fade, "border_color": args.border_color,
                 "viewport": args.viewport, "character_position": args.character_position,
             }.items() if value is not None},
             output_format=args.output_format,
@@ -292,7 +287,6 @@ def queue_one(
             bounds=not (args.no_cache or args.no_bounds_cache),
             components=not (args.no_cache or args.no_component_cache),
         ),
-        appearance=appearance,
     )
     return enqueue_request(outputs, request, args.max_active)
 

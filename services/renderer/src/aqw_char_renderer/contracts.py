@@ -58,16 +58,22 @@ def normalize_presentation(view: str, value: Any) -> dict[str, Any]:
     result = dict(framing="fixed" if view == "charpage" else "content",
                   viewport=[0.0, 0.0, 550.0, 350.0],
                   character_position=[338.05, 304.2] if view == "charpage" else [0.0, 0.0],
-                  background=view == "charpage", info=view == "charpage")
+                  background=view == "charpage", info=view == "charpage",
+                  border_fade=True, border_color="#FEF0C1")
     if value is not None:
         payload = _object(value, "render.presentation")
         _only_keys(payload, set(result), "render.presentation")
         result.update(payload)
     if not isinstance(result["framing"], str) or result["framing"] not in {"content", "fixed"}:
         raise ContractError("presentation framing must be content or fixed")
-    for key in ("background", "info"):
+    for key in ("background", "info", "border_fade"):
         if not isinstance(result[key], bool):
             raise ContractError(f"presentation {key} must be a boolean")
+    color = result["border_color"]
+    color = color.strip().removeprefix("#") if isinstance(color, str) else ""
+    if len(color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in color):
+        raise ContractError("border_color must contain six hex digits, e.g. #FEF0C1")
+    result["border_color"] = "#" + color.upper()
     for key, count in (("viewport", 4), ("character_position", 2)):
         coordinates = result[key]
         if not isinstance(coordinates, list) or len(coordinates) != count or any(
@@ -336,6 +342,28 @@ class RenderSettings:
         return asdict(self)
 
 
+def _source_job_id(value):
+    if value is None:
+        return None
+    try:
+        parsed = str(UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        raise ContractError("source_job_id must be a canonical UUID") from None
+    if parsed != value:
+        raise ContractError("source_job_id must be a canonical UUID")
+    return parsed
+
+
+def _appearance_patch(value):
+    if value is None:
+        return None
+    # Reuse appearance size/key validation without requiring callers to supply a name.
+    patch = _object(value, "appearance_overrides")
+    name = patch.get("strName", "Patch")
+    _appearance({**patch, "strName": name}, name)
+    return dict(patch)
+
+
 @dataclass(frozen=True)
 class JobRequest:
     job_id: str
@@ -346,6 +374,8 @@ class JobRequest:
     component_raster_mode: str = "inline"
     cache: CacheSettings = field(default_factory=CacheSettings)
     appearance: dict[str, str] | None = None
+    source_job_id: str | None = None
+    appearance_overrides: dict[str, str] | None = None
     schema_version: int = field(default=SCHEMA_VERSION, init=False)
 
     @classmethod
@@ -363,6 +393,8 @@ class JobRequest:
                 "component_raster_mode",
                 "cache",
                 "appearance",
+                "source_job_id",
+                "appearance_overrides",
             },
             "job request",
         )
@@ -406,6 +438,8 @@ class JobRequest:
             ),
             cache=CacheSettings.from_dict(payload.get("cache")),
             appearance=_appearance(payload.get("appearance"), render.username),
+            source_job_id=_source_job_id(payload.get("source_job_id")),
+            appearance_overrides=_appearance_patch(payload.get("appearance_overrides")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -419,6 +453,10 @@ class JobRequest:
             "component_raster_mode": self.component_raster_mode,
             "appearance": self.appearance,
         }
+        if self.source_job_id is not None:
+            payload["source_job_id"] = self.source_job_id
+        if self.appearance_overrides is not None:
+            payload["appearance_overrides"] = self.appearance_overrides
         # Keep default requests compatible with launchers deployed before the
         # optional cache-control extension was introduced.
         if self.cache != CacheSettings():

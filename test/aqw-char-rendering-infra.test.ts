@@ -1,3 +1,4 @@
+import { SourceFetchTestStack } from '../lib/source-fetch';
 import * as cdk from 'aws-cdk-lib/core';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as fs from 'node:fs';
@@ -153,7 +154,9 @@ test('bounds delivery is batch-one, bounded, retry-aware, and included in shutdo
   const functions = Object.values(template.findResources('AWS::Lambda::Function'));
   for (const resource of functions) {
     expect(resource.Properties.Architectures).toEqual(['arm64']);
-    expect(JSON.stringify(resource.Properties.ImageConfig)).not.toContain('aqw_char_renderer');
+    if (resource.Properties.FunctionName !== 'aqw-char-dev-source-fetch') {
+      expect(JSON.stringify(resource.Properties.ImageConfig)).not.toContain('aqw_char_renderer');
+    }
   }
   const shutdown = functions.find((fn) => fn.Properties.FunctionName === 'aqw-char-dev-shutdown')!;
   expect(JSON.stringify(shutdown.Properties.Environment.Variables.CHAR_RENDER_STOP_FUNCTIONS)).toContain('BoundsProbeFunction');
@@ -201,7 +204,7 @@ test('stack contains the complete private rendering pipeline', () => {
   template.resourceCountIs('AWS::S3::Bucket', 2);
   template.resourceCountIs('AWS::SQS::Queue', 6);
   template.resourceCountIs('AWS::DynamoDB::Table', 1);
-  template.resourceCountIs('AWS::Lambda::Function', 10);
+  template.resourceCountIs('AWS::Lambda::Function', 11);
   template.resourceCountIs('AWS::StepFunctions::StateMachine', 1);
   template.resourceCountIs('AWS::CloudFront::Distribution', 1);
   template.resourceCountIs('AWS::SSM::Parameter', 2);
@@ -256,7 +259,10 @@ test('component rasterization uses the request-selected Inline or Distributed Ma
   expect(states.ComposeComponentFrameChunks.ItemSelector['component_results_key.$']).toBe('$.components.manifest_key');
   expect(states.ComposeComponentFrameChunks.ItemSelector.component_results).toBeUndefined();
   expect(states.ComposeComponentFrameChunks.ItemSelector['component_results.$']).toBeUndefined();
-  expect(definition.States.ProtectedRenderWorkflow.Branches[0].StartAt).toBe('PrepareResolve');
+  expect(definition.States.ProtectedRenderWorkflow.Branches[0].StartAt).toBe('FetchSources');
+  expect(states.FetchSources.Next).toBe('PrepareResolve');
+  expect(states.FetchSources.ResultPath).toBe('$.request');
+  expect(definition.States.ProtectedRenderWorkflow.Catch[0].Next).toBe('CompleteFailedJob');
   expect(states.PrepareResume).toBeUndefined();
   expect(states.SelectRenderEntry).toBeUndefined();
 
@@ -287,7 +293,7 @@ test('component rasterization uses the request-selected Inline or Distributed Ma
 
 test('the Rust component-raster worker is the live backend with 3008 MiB and no reserve cap', () => {
   const template = synthesize();
-  template.resourceCountIs('AWS::Lambda::Function', 10);
+  template.resourceCountIs('AWS::Lambda::Function', 11);
   // The active backend shares the account concurrency pool (no reserved cap).
   const functions = template.findResources('AWS::Lambda::Function');
   const rust = Object.values(functions).find((resource: any) =>
@@ -389,4 +395,42 @@ test('budget shutdown is automatic at the configured threshold', () => {
       }),
     ]),
   });
+});
+
+test('Bright Data credentials are runtime SecureString reads scoped to source fetch', () => {
+  const app = new cdk.App({ context: { brightDataConfigParameter: '/aqw-char/dev/brightdata' } });
+  const stack = new AqwCharRenderingInfraStack(app, 'ProxyTest', {
+    stageName: 'dev', tuning: getEnvironmentConfig('dev').tuning,
+  });
+  const template = Template.fromStack(stack);
+  const functions = template.findResources('AWS::Lambda::Function');
+  const configured = Object.values(functions).filter((resource: any) =>
+    resource.Properties.Environment?.Variables?.AQW_BRIGHTDATA_CONFIG_PARAMETER !== undefined);
+  expect(configured).toHaveLength(1);
+  expect(configured[0].Properties.FunctionName).toBe('aqw-char-dev-source-fetch');
+  expect(configured[0].Properties.Environment.Variables.AQW_BRIGHTDATA_CONFIG_PARAMETER)
+    .toBe('/aqw-char/dev/brightdata');
+  const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
+  expect(policies).toContain('parameter/aqw-char/dev/brightdata');
+  expect(JSON.stringify(template.toJSON())).not.toContain('resolve:ssm-secure');
+});
+
+
+test('standalone fetch test stack has no renderer workflow or job admission resources', () => {
+  const app = new cdk.App({ context: { sourceBucketName: 'test-source', workBucketName: 'test-work' } });
+  const stack = new SourceFetchTestStack(app, 'FetchOnly', { stageName: 'dev', dataset: 'test' });
+  const template = Template.fromStack(stack);
+  template.resourceCountIs('AWS::Lambda::Function', 1);
+  template.resourceCountIs('AWS::StepFunctions::StateMachine', 0);
+  template.resourceCountIs('AWS::DynamoDB::Table', 0);
+  template.resourceCountIs('AWS::S3::Bucket', 0);
+  expect(JSON.stringify(template.toJSON())).not.toContain('pipeline-rust');
+  const assembly = app.synth();
+  const staged = fs.readdirSync(assembly.directory).filter((name) => name.startsWith('asset.'));
+  expect(staged.some((name) => {
+    const root = path.join(assembly.directory, name);
+    return fs.existsSync(path.join(root, 'Dockerfile.fetch')) &&
+      fs.existsSync(path.join(root, 'src/aqw_char_renderer/fetch_sources.py')) &&
+      fs.existsSync(path.join(root, 'src/aqw_char_renderer/background_sources.json'));
+  })).toBe(true);
 });

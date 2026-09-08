@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,85 +173,17 @@ pub fn parse_flashvars(text: &str) -> Result<BTreeMap<String, String>> {
     Ok(fields)
 }
 
-fn page_flashvars(page: &str) -> Result<Option<String>> {
-    let attrs = Regex::new(r#"(?is)([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)?;
-    for tag in Regex::new(r"(?is)<(?:param|embed)\b[^>]*>")?.find_iter(page) {
-        let attributes: BTreeMap<_, _> = attrs
-            .captures_iter(tag.as_str())
-            .map(|c| {
-                (
-                    c[1].to_lowercase(),
-                    html_escape::decode_html_entities(
-                        c.get(2)
-                            .or_else(|| c.get(3))
-                            .or_else(|| c.get(4))
-                            .unwrap()
-                            .as_str(),
-                    )
-                    .into_owned(),
-                )
-            })
-            .collect();
-        if attributes
-            .get("name")
-            .is_some_and(|v| v.eq_ignore_ascii_case("flashvars"))
-        {
-            return Ok(attributes.get("value").cloned());
-        }
-        if let Some(value) = attributes.get("flashvars") {
-            return Ok(Some(value.clone()));
-        }
-    }
-    Ok(None)
-}
-
-async fn fetch_fields(
-    client: &reqwest::Client,
-    username: &str,
-) -> Result<BTreeMap<String, String>> {
-    let response = client
-        .get("https://account.aq.com/CharPage")
-        .query(&[("id", username)])
-        .send()
-        .await?;
-    if response.status().is_success() {
-        if let Some(encoded) = page_flashvars(&response.text().await?)? {
-            return parse_flashvars(&encoded);
-        }
-    } else {
-        ensure!(
-            [403, 404].contains(&response.status().as_u16()),
-            "character page request failed: {}",
-            response.status()
-        );
-    }
-    let text = client
-        .get("https://game.aq.com/game/api/charpage/fvars")
-        .query(&[("id", username)])
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    parse_flashvars(&text)
-}
-
 async fn source(
     store: &dyn Store,
     config: &Config,
     catalog: &BTreeMap<String, SourceObject>,
     remote: &str,
-    client: &reqwest::Client,
 ) -> Result<(SourceObject, Vec<u8>)> {
     let remote = normalize_path(remote)?;
     if let Some(record) = catalog.get(&remote.to_lowercase()) {
         let bytes = download(store, &config.source_bucket, record).await?;
         return Ok((record.clone(), bytes));
     }
-    ensure!(
-        config.official_fallback,
-        "asset absent from immutable dataset: {remote}"
-    );
     let hash = crate::sha256(remote.to_lowercase().as_bytes());
     let key = format!(
         "dynamic-assets/{}/{}/{}.swf",
@@ -259,37 +191,8 @@ async fn source(
         &hash[..2],
         hash
     );
-    let bytes = if let Some(bytes) = store.get(&config.source_bucket, &key).await? {
-        bytes
-    } else {
-        let mut url = reqwest::Url::parse("https://game.aq.com/game/gamefiles/")?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("invalid asset base URL"))?
-            .pop_if_empty()
-            .extend(remote.split('/'));
-        let bytes = client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec();
-        Swf::parse(&bytes)?;
-        store
-            .put(
-                &config.source_bucket,
-                &key,
-                bytes,
-                "application/x-shockwave-flash",
-                true,
-            )
-            .await?;
-        store
-            .get(&config.source_bucket, &key)
-            .await?
-            .context("dynamic source publish missing")?
-    };
+    let bytes = store.get(&config.source_bucket, &key).await?
+        .with_context(|| format!("SourceFetch did not cache required asset: {remote}"))?;
     Ok((
         SourceObject {
             key,
@@ -518,24 +421,12 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
             "duplicate case-insensitive source path"
         );
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(crate::config::number(
-            "CHAR_RENDER_OFFICIAL_ASSET_TIMEOUT_SECONDS",
-            15,
-            1,
-            60,
-        )? as u64))
-        .user_agent("AQWCharacterRenderer/1.0")
-        .build()?;
     let settings = &request["render"];
     let cosmetics = !settings["base_items"]
         .as_bool()
         .context("invalid base_items")?;
-    let mut fields: BTreeMap<String, String> = if request["appearance"].is_null() {
-        fetch_fields(&client, string(settings, "username")?).await?
-    } else {
-        serde_json::from_value(request["appearance"].clone())?
-    };
+    ensure!(!request["appearance"].is_null(), "SourceFetch must populate appearance before prepare");
+    let mut fields: BTreeMap<String, String> = serde_json::from_value(request["appearance"].clone())?;
     if settings["show_hidden"] == true {
         let flags = field(&fields, "ia1", "0").parse::<u32>().unwrap_or(0);
         fields.insert("ia1".into(), (flags & !7).to_string());
@@ -571,7 +462,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         } else {
             raw.into()
         })?;
-        let (record, bytes) = source(store, config, &catalog, &remote, &client).await?;
+        let (record, bytes) = source(store, config, &catalog, &remote).await?;
         let swf = Swf::parse(&bytes)?;
         let link = infer_link(&swf, &remote, slot, &gender)?;
         let weapon = if database_slot == "gauntlet"
@@ -604,7 +495,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     let mut source_swfs = BTreeMap::new();
     let mut records = BTreeMap::new();
     for (slot, asset) in &assets {
-        let (record, bytes) = source(store, config, &catalog, &asset.remote_path, &client).await?;
+        let (record, bytes) = source(store, config, &catalog, &asset.remote_path).await?;
         source_swfs.insert(slot.clone(), Swf::parse(&bytes)?);
         records.insert(slot.clone(), record);
     }
@@ -685,6 +576,24 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
                 },
             ));
             aliases.insert("backhair".into(), "backhair".into());
+        }
+    }
+    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
+    let bg_index = crate::charpage::background_index(&serde_json::to_value(&fields)?);
+    let mut background_period = None;
+    if layout["background"] == true {
+        if let Some(bg) = crate::background::record(bg_index) {
+            let remote = format!("etc/chardetail/bgs/{}", bg["file"].as_str().unwrap());
+            let (original, bytes) = source(store, config, &catalog, &remote).await?;
+            ensure!(original.sha256 == bg["sha256"].as_str().unwrap(), "background source checksum mismatch");
+            let (bytes, id, period) = crate::background::wrap(&bytes)?;
+            background_period = period;
+            let sha = crate::sha256(&bytes);
+            let key = format!("dynamic-assets/{}/presentation/{}/{sha}.swf", config.dataset_version, crate::background::POLICY);
+            let record = SourceObject { key:key.clone(), sha256:sha, size:bytes.len(), remote_path:remote };
+            store.put(&config.source_bucket, &key, bytes, "application/x-shockwave-flash", true).await?;
+            records.insert(crate::background::KEY.into(), record);
+            requests.push((crate::background::KEY.into(), SymbolRequest {key:crate::background::KEY.into(), class_name:"CharpageBackgroundStage".into(), character_id:id, frame:1, root_timeline_frames:1}));
         }
     }
     records.insert("character".into(), character.clone());
@@ -768,7 +677,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         .as_u64()
         .context("invalid max_frames")? as usize;
     let complete = settings["complete_loop"] == true;
-    let precomputed = if complete && request["cache"]["animation"] == true {
+    let precomputed = if complete && request["cache"]["animation"] == true && !(layout["background"] == true && bg_index > 0) {
         precomputed_loop(store, &config.source_bucket, &sources, max).await?
     } else {
         None
@@ -784,7 +693,7 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     };
     let export_count = if complete { count + 8.min(count) } else { 1 };
     let input_key = format!("jobs/{job}/prepare/input.json");
-    store::write(store,&config.work_bucket,&input_key,&json!({"schema_version":1,"job_id":job,"render_started_at":render_started_at,"render_hash":hash,"final_key":final_key,"export_frame_count":export_count,"precomputed_loop":precomputed,"fields":fields,"aliases":aliases,"weapon_type":weapon_type,"settings":settings,"bounds_mode":request["bounds_mode"],"component_raster_mode":request["component_raster_mode"],"cache":request["cache"],"warnings":warnings,"character_renderer":character,"frame_rate":character_swf.frame_rate,"sources":sources}),false).await?;
+    store::write(store,&config.work_bucket,&input_key,&json!({"schema_version":1,"job_id":job,"render_started_at":render_started_at,"render_hash":hash,"final_key":final_key,"export_frame_count":export_count,"precomputed_loop":precomputed,"fields":fields,"aliases":aliases,"weapon_type":weapon_type,"settings":settings,"bounds_mode":request["bounds_mode"],"component_raster_mode":request["component_raster_mode"],"cache":request["cache"],"warnings":warnings,"character_renderer":character,"frame_rate":character_swf.frame_rate,"background_period":background_period,"sources":sources}),false).await?;
     crate::log(
         "prepare_resolve_profile",
         json!({"job_id":job,"cache_hit":false,"cache":request["cache"],"source_count":source_count,"export_unit_count":sources.len(),"export_frame_count":export_count,"duration_ms":started.elapsed().as_secs_f64()*1000.0}),

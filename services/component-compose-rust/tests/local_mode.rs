@@ -421,7 +421,8 @@ async fn charpage_layers_surround_character_for_webp_and_zstd_avif() {
         let temp = unique_dir("charpage");
         let mut fixture = Fixture::new(temp.clone());
         fixture.add("red", 40, 40, [255,0,0,255], 10, 10, false);
-        fixture.write_manifest(&[serde_json::json!({"number":1,"layers":["red"],"duration_ms":40})]);
+        if background_on { fixture.add("scene",256,256,[255,255,255,255],0,0,false); }
+        fixture.write_manifest(&[serde_json::json!({"number":1,"layers":if background_on {vec!["scene","red"]} else {vec!["red"]},"duration_ms":40})]);
         let path = temp.join("manifest.json");
         let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         manifest["settings"]["output_format"] = format.into();
@@ -436,6 +437,13 @@ async fn charpage_layers_surround_character_for_webp_and_zstd_avif() {
             if (name == "background" && !background_on) || (name == "foreground" && !foreground_on) { continue; }
             std::fs::write(fixture.rasters.join(format!("{name}.png")),&bytes).unwrap();
             manifest["presentation_layers"][name] = serde_json::json!({"key":format!("local://{name}"),"sha256":sha256_hex(&bytes)});
+        }
+        if background_on {
+            let mut pixels = vec![0;256*256*4];
+            for (x,y) in [(15,15),(60,60)] { pixels[(y*256+x)*4..(y*256+x)*4+4].copy_from_slice(&[0,255,0,255]); }
+            let overlay = aqw_component_compose::png::encode_rgba8(256,256,&pixels).unwrap();
+            std::fs::write(fixture.rasters.join("overlay.png"),&overlay).unwrap();
+            manifest["presentation_layers"]["background_overlay"] = serde_json::json!({"key":"local://overlay","sha256":sha256_hex(&overlay)});
         }
         std::fs::write(path,serde_json::to_vec(&manifest).unwrap()).unwrap();
         let event = aqw_component_compose::contract::ComposeEvent {
@@ -458,6 +466,7 @@ async fn charpage_layers_surround_character_for_webp_and_zstd_avif() {
         assert_eq!(&pixels[0..4], if background_on { &[255,255,255,255] } else { &[0,0,0,0] });
         assert_eq!(&pixels[(15*256+15)*4..(15*256+15)*4+4], &[255,0,0,255]);
         assert_eq!(&pixels[offset..offset+4], if foreground_on { &[0,0,255,255] } else { &[255,0,0,255] });
+        if background_on { assert_eq!(&pixels[(60*256+60)*4..(60*256+60)*4+4], &[0,255,0,255]); }
         std::fs::remove_dir_all(temp).unwrap();
     }
 }

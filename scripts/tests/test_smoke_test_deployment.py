@@ -37,8 +37,8 @@ class SmokeNotificationTests(unittest.TestCase):
                     patch.object(smoke.boto3, "client", side_effect={
                         "dynamodb": dynamodb, "sqs": sqs, "ssm": ssm,
                     }.__getitem__),
-                    patch.object(smoke.tryon, "fetch_character_flashvars", return_value={"strName": "Annie"}),
-                    patch.object(smoke, "seed_missing_assets"),
+                    patch.object(smoke.tryon, "fetch_character_flashvars", side_effect=AssertionError("CLI must not fetch AQW")),
+                    patch.object(smoke, "seed_missing_assets", side_effect=AssertionError("CLI must not seed sources")),
                     patch.object(smoke, "verify_webp", return_value={}) as verify,
                     patch.object(sys, "stdout", io.StringIO()),
                 ):

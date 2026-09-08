@@ -203,12 +203,6 @@ def main() -> int:
     if enabled.casefold() != "true":
         raise RuntimeError("The deployed render safety switch is disabled")
 
-    appearance = tryon.fetch_character_flashvars(args.username, timeout=15)
-    seed_missing_assets(
-        outputs,
-        appearance,
-        dataset_version=args.dataset_version,
-    )
     job_id = str(uuid4())
     request = JobRequest(
         job_id=job_id,
@@ -228,7 +222,6 @@ def main() -> int:
             webp_lossless=args.webp_lossless or None,
             raster_backend=args.raster_backend,
         ),
-        appearance=appearance,
     )
     jobs = JobStore(outputs["JobTableName"])
     jobs.acquire(request, args.max_active)

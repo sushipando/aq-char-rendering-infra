@@ -3,7 +3,7 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub const POLICY: &str = "aqw-xmp-v4-animation";
+pub const POLICY: &str = "aqw-xmp-v5-background";
 
 /// Match actual asset selection, including overrides, base-items and visibility.
 /// Resolve has already applied show_hidden and item overrides to these fields.
@@ -77,9 +77,14 @@ pub fn display(fields: &Value, settings: &Value) -> Result<Value> {
             }
         }
     }
+    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
+    let index = crate::charpage::background_index(&serde_json::to_value(&fields)?);
+    let background = if layout["background"] != true { "None".to_owned() }
+        else if index == 0 { "Default (0)".to_owned() }
+        else { format!("Background {} ({index})", char::from_digit(index as u32,36).unwrap().to_ascii_uppercase()) };
     Ok(
         json!({"name":first(&["strName"]),"class":class,"level":first(&["level","intLevel","strLevel"]),
-        "guild":first(&["guild","strGuildName","strGuild"]),"shown_items":items,"colors":colors}),
+        "guild":first(&["guild","strGuildName","strGuild"]),"background":background,"shown_items":items,"colors":colors}),
     )
 }
 
@@ -113,7 +118,7 @@ pub fn loop_status(count: usize, item: Option<usize>, blink: Option<usize>, grou
 pub fn packet(prepared: &Value) -> Result<Vec<u8>> {
     let data = display(&prepared["fields"], &prepared["settings"])?;
     let mut out = String::from("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:aqw=\"http://aqw.char/info/1.0/\">");
-    for tag in ["name", "class", "level", "guild"] {
+    for tag in ["name", "class", "level", "guild", "background"] {
         out.push_str(&format!(
             "<aqw:{tag}>{}</aqw:{tag}>",
             escape(data[tag].as_str().unwrap_or(""))
@@ -180,6 +185,22 @@ pub fn complete_stats(bytes: &mut [u8], packet: &[u8], prepared: &Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn background_metadata_describes_rendered_selection() {
+        for (view, overrides, index, expected) in [
+            ("charpage",json!({}),"W","Background W (32)"),
+            ("charpage",json!({}),"Y","Background Y (34)"),
+            ("charpage",json!({}),"0","Default (0)"),
+            ("charpage",json!({"background":false}),"W","None"),
+            ("character",json!({}),"W","None"),
+        ] {
+            let settings = json!({"view":view,"presentation":overrides});
+            let fields = json!({"bgindex":index});
+            assert_eq!(display(&fields,&settings).unwrap()["background"],expected);
+            let xml = String::from_utf8(packet(&json!({"fields":fields,"settings":settings})).unwrap()).unwrap();
+            assert!(xml.contains(&format!("<aqw:background>{expected}</aqw:background>")));
+        }
+    }
     #[test]
     fn reports_cycle_completion_independently_of_requested_cap() {
         assert_eq!(loop_status(120, Some(40), Some(100), [].into_iter()), "complete");

@@ -36,3 +36,8 @@ These labels rely on the existing schedule-based cycle detector, not a visual
 seam assessment. Older files show Frames: N/A and Complete loop: Unknown.
 The metadata policy changes the final render cache key so newly requested renders
 receive the new fields after deployment.
+
+Background metadata uses `<aqw:background>` in both output formats. It records
+the rendered selection, such as `Background W (32)` or `Default (0)`, and `None`
+when disabled. Discord displays this in General Info. Older files without this
+field remain readable. Metadata policy: `aqw-xmp-v5-background`.
