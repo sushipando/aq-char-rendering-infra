@@ -271,12 +271,15 @@ pub fn layers(aliases: &BTreeMap<String, String>, weapon_type: &str, facing: &st
     order
         .into_iter()
         .filter_map(|(name, alias, darken)| {
-            aliases.get(alias).map(|key| Layer {
-                name: name.into(),
-                symbol_key: key.clone(),
-                matrix: compose(outer, transform(name)),
-                darken,
-            })
+            aliases
+                .get(name)
+                .or_else(|| aliases.get(alias))
+                .map(|key| Layer {
+                    name: name.into(),
+                    symbol_key: key.clone(),
+                    matrix: compose(outer, transform(name)),
+                    darken,
+                })
         })
         .collect()
 }

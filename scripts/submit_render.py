@@ -149,6 +149,7 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use lossless encoding for the selected output format",
     )
+    result.add_argument("--click-assets", nargs="+", choices=["armor", "weapon", "cape", "helm", "pet", "ground", "hair", "background"], help="Click selected assets once after initialization (animation effects only)")
     result.add_argument(
         "-n",
         "--max-frames",
@@ -258,6 +259,7 @@ def queue_one(
             override=override,
             complete_loop=args.complete_loop,
             max_frames=args.max_frames,
+            click_assets=tuple(args.click_assets or []),
             subframe_start=args.subframe_start,
             zoom=args.zoom,
             raster_size=args.raster_size,

@@ -154,6 +154,13 @@ impl Swf {
             .find(|(_, n)| n.eq_ignore_ascii_case(name))
             .cloned()
             .or_else(|| {
+                if let Some(stage) = self
+                    .symbols
+                    .iter()
+                    .find(|(_, n)| n == crate::stage_asset::CLASS)
+                {
+                    return Some(stage.clone());
+                }
                 if !name.is_empty() {
                     return None;
                 }
@@ -276,7 +283,7 @@ impl Bits<'_> {
     }
 }
 
-fn skip_matrix(data: &[u8], offset: usize) -> Result<usize> {
+pub(crate) fn skip_matrix(data: &[u8], offset: usize) -> Result<usize> {
     let mut bits = Bits {
         data,
         offset: offset * 8,
@@ -294,7 +301,21 @@ fn skip_matrix(data: &[u8], offset: usize) -> Result<usize> {
     Ok(bits.bytes())
 }
 
-fn color_transform(data: &[u8], offset: usize, alpha: bool) -> Result<[i64; 8]> {
+pub(crate) fn skip_color(data: &[u8], offset: usize) -> Result<usize> {
+    let mut bits = Bits {
+        data,
+        offset: offset * 8,
+    };
+    let add = bits.unsigned(1)?;
+    let mult = bits.unsigned(1)?;
+    let n = bits.unsigned(4)? as usize;
+    for _ in 0..4 * (add + mult) {
+        bits.signed(n)?;
+    }
+    Ok(bits.bytes())
+}
+
+pub(crate) fn color_transform(data: &[u8], offset: usize, alpha: bool) -> Result<[i64; 8]> {
     let mut bits = Bits {
         data,
         offset: offset * 8,
@@ -384,6 +405,80 @@ pub(crate) fn replace_sprites(source: &[u8], replacements: &BTreeMap<u16, Vec<u8
     }
     let size = u32::try_from(result.len())?;
     result[4..8].copy_from_slice(&size.to_le_bytes());
+    Ok(result)
+}
+
+pub(crate) fn set_placed_id(code: u16, data: &mut [u8], id: u16) -> Result<()> {
+    let mut offset = match code {
+        4 => 0,
+        26 => 3,
+        70 | 94 => 4,
+        _ => anyhow::bail!("not a placement"),
+    };
+    if code != 4 {
+        ensure!(data[0] & 2 != 0, "placement has no character");
+        if code != 26 && (data[1] & 8 != 0 || data[1] & 16 != 0 && data[0] & 2 != 0) {
+            cstring(data, &mut offset)?;
+        }
+    }
+    data.get_mut(offset..offset + 2)
+        .context("truncated placed ID")?
+        .copy_from_slice(&id.to_le_bytes());
+    Ok(())
+}
+
+pub(crate) fn replace_dictionary(
+    source: &[u8],
+    replacements: &BTreeMap<u16, Vec<u8>>,
+    symbols: &[(u16, String)],
+) -> Result<Vec<u8>> {
+    let body = decompress(source)?;
+    let offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
+    let mut result = source[..8].to_vec();
+    result[..3].copy_from_slice(b"FWS");
+    result.extend_from_slice(&body[..offset]);
+    let mut originals = BTreeSet::new();
+    let mut tail = Vec::new();
+    for (code, data) in tags(&body, offset)? {
+        if code == 76 {
+            continue;
+        }
+        if matches!(
+            code,
+            0 | 1 | 4 | 5 | 12 | 15 | 18 | 19 | 26 | 28 | 43 | 45 | 61 | 70 | 89 | 94
+        ) {
+            write_tag(&mut tail, code, data);
+            continue;
+        }
+        if code == 39 {
+            let id = u16_at(data, 0)?;
+            originals.insert(id);
+            write_tag(
+                &mut result,
+                code,
+                replacements.get(&id).map(Vec::as_slice).unwrap_or(data),
+            );
+        } else {
+            write_tag(&mut result, code, data);
+        }
+    }
+    for (id, payload) in replacements {
+        if !originals.contains(id) {
+            write_tag(&mut result, 39, payload);
+        }
+    }
+    if !symbols.is_empty() {
+        let mut names = u16::try_from(symbols.len())?.to_le_bytes().to_vec();
+        for (id, name) in symbols {
+            names.extend(id.to_le_bytes());
+            names.extend(name.as_bytes());
+            names.push(0);
+        }
+        write_tag(&mut result, 76, &names);
+    }
+    result.extend(tail);
+    let len = u32::try_from(result.len())?;
+    result[4..8].copy_from_slice(&len.to_le_bytes());
     Ok(result)
 }
 
@@ -546,5 +641,43 @@ mod tests {
         let mut bytes = source();
         bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decompress(&bytes).is_err());
+    }
+}
+
+/// Some exporters write zero-frame, unbound sprites containing a complete
+/// initial display list. Flash constructs that display list once. Supply the
+/// implicit ShowFrame required by FFDec's SVG exporter; never invent callbacks
+/// for a class-bound clip or repair truncated/action-bearing payloads.
+pub(crate) fn repair_zero_frame_displays(source: &[u8], swf: &Swf) -> Result<Option<Vec<u8>>> {
+    let mut replacements = BTreeMap::new();
+    for (id, payload) in &swf.sprites {
+        if u16_at(payload, 2)? != 0 || swf.symbols.iter().any(|(n, _)| n == id) {
+            continue;
+        }
+        let tags = tags(payload, 4)?;
+        if tags.last() != Some(&(0, &[][..]))
+            || !tags
+                .iter()
+                .all(|(code, _)| matches!(code, 0 | 4 | 5 | 26 | 28 | 70))
+        {
+            continue;
+        }
+        let mut out = id.to_le_bytes().to_vec();
+        out.extend(1u16.to_le_bytes());
+        for (code, data) in tags {
+            if code == 0 {
+                continue;
+            }
+            instance(code, data)?;
+            write_tag(&mut out, code, data);
+        }
+        write_tag(&mut out, 1, &[]);
+        write_tag(&mut out, 0, &[]);
+        replacements.insert(*id, out);
+    }
+    if replacements.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(replace_sprites(source, &replacements)?))
     }
 }

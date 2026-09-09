@@ -11,14 +11,48 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Selection {
-    Hold { frame: usize },
-    Loop { first: usize, last: usize },
+    Hold {
+        frame: usize,
+    },
+    Loop {
+        first: usize,
+        last: usize,
+    },
+    Sequence {
+        frames: Vec<usize>,
+        loop_start: Option<usize>,
+    },
 }
 impl Selection {
     fn range(&self) -> (usize, usize) {
-        match *self {
-            Self::Hold { frame } => (frame, frame),
-            Self::Loop { first, last } => (first, last),
+        match self {
+            Self::Hold { frame } => (*frame, *frame),
+            Self::Loop { first, last } => (*first, *last),
+            Self::Sequence { frames, .. } => {
+                (*frames.iter().min().unwrap(), *frames.iter().max().unwrap())
+            }
+        }
+    }
+    fn length(&self) -> usize {
+        match self {
+            Self::Sequence {
+                frames,
+                loop_start: Some(0),
+            } => frames.len(),
+            Self::Sequence { .. } => 12008,
+            _ => {
+                let (a, b) = self.range();
+                b - a + 1
+            }
+        }
+    }
+    fn indices(&self) -> Vec<usize> {
+        match self {
+            Self::Sequence { frames, .. } => frames.clone(),
+            _ => {
+                let (a, b) = self.range();
+                (a..=b).collect()
+            }
         }
     }
 }
@@ -118,13 +152,20 @@ impl Clip {
         );
         Ok(Self { frames, labels })
     }
-    fn target(&self, target: &Target) -> Result<usize> {
+    fn target(&self, target: &Target, old_labels: bool) -> Result<usize> {
         let frame = match target {
-            Target::Frame(frame) => *frame,
-            Target::Label(label) => *self
-                .labels
-                .get(label)
-                .with_context(|| format!("unknown frame label {label:?}"))?,
+            Target::Frame(frame) => (*frame).max(1).min(self.frames.len()),
+            Target::Label(label) => {
+                if let Ok(n) = label.parse::<usize>() {
+                    n.max(1).min(self.frames.len())
+                } else if let Some(frame) = self.labels.get(label) {
+                    *frame
+                } else if old_labels {
+                    1
+                } else {
+                    bail!("unknown frame label {label:?}")
+                }
+            }
         };
         ensure!(
             (1..=self.frames.len()).contains(&frame),
@@ -149,6 +190,12 @@ struct Resolver<'a> {
     // Same symbol used with incompatible per-instance state must not be globally rewritten.
     entries: BTreeMap<u16, Entry>,
     budget: usize,
+    old_labels: bool,
+    forced: BTreeMap<u16, Selection>,
+    contexts: BTreeMap<u16, Vec<String>>,
+    warnings: Vec<String>,
+    graphic_instances: BTreeSet<u16>,
+    child_values: BTreeMap<u16, BTreeMap<String, crate::script_eval::Value>>,
 }
 impl Resolver<'_> {
     fn visit(&mut self, id: u16, entry: Entry) -> Result<()> {
@@ -169,10 +216,12 @@ impl Resolver<'_> {
         ensure!(!self.active.contains(&id), "cyclic sprite hierarchy");
         if let Some(previous) = self.entries.get(&id) {
             if *previous != entry {
-                let clip = Clip::read(&self.swf.sprites[&id], &mut self.budget, self.inert_actions)?;
+                let clip =
+                    Clip::read(&self.swf.sprites[&id], &mut self.budget, self.inert_actions)?;
                 ensure!(
                     previous.play == entry.play
-                        && clip.target(&previous.target)? == clip.target(&entry.target)?,
+                        && clip.target(&previous.target, self.old_labels)?
+                            == clip.target(&entry.target, self.old_labels)?,
                     "shared sprite has conflicting per-instance timeline states"
                 );
             }
@@ -194,17 +243,21 @@ impl Resolver<'_> {
             .unwrap_or_default();
         let class = self.scripts.get(&name).cloned().unwrap_or_default();
         ensure!(
-            class.unsupported.is_none(),
+            class.unsupported.is_none() || class.runtime.is_some(),
             "unsupported script registration: {:?}",
             class.unsupported
         );
+        let runtime_mode = class.runtime.is_some()
+            && (class.unsupported.is_some()
+                || class.constructor.unsupported.is_some()
+                || class.frames.values().any(|p| p.unsupported.is_some()));
         ensure!(
-            class.constructor.unsupported.is_none(),
+            runtime_mode || class.constructor.unsupported.is_none(),
             "unsupported constructor: {:?}",
             class.constructor.unsupported
         );
-        let mut frame = clip.target(&entry.target)?;
-        let mut named_state = matches!(entry.target, Target::Label(_))
+        let mut frame = clip.target(&entry.target, self.old_labels)?;
+        let mut _named_state = matches!(entry.target, Target::Label(_))
             || clip.labels.iter().any(|(label, at)| {
                 *at == frame
                     && matches!(
@@ -213,6 +266,7 @@ impl Resolver<'_> {
                     )
             });
         let mut playing = entry.play;
+        let mut runtime_state = crate::script_eval::State::default();
         let mut trace = Vec::new();
         let mut seen = BTreeMap::new();
         let mut child_entries: BTreeMap<(u16, usize), Entry> = BTreeMap::new();
@@ -222,33 +276,118 @@ impl Resolver<'_> {
                 .budget
                 .checked_sub(1)
                 .context("timeline execution work limit exceeded")?;
-            if let Some(&start) = seen.get(&frame) {
+            let state_key = (frame, playing, serde_json::to_string(&runtime_state)?);
+            if let Some(&start) = seen.get(&state_key) {
                 ensure!(playing, "nonterminating stopped-frame script cycle");
                 let cycle: &[usize] = &trace[start..];
-                ensure!(
-                    cycle.windows(2).all(|w| w[1] == w[0] + 1),
-                    "non-contiguous scripted timeline loop"
-                );
-                selection = Selection::Loop {
-                    first: cycle[0],
-                    last: *cycle.last().unwrap(),
+                selection = if cycle.windows(2).all(|w| w[1] == w[0] + 1) {
+                    Selection::Loop {
+                        first: cycle[0],
+                        last: *cycle.last().unwrap(),
+                    }
+                } else {
+                    Selection::Sequence {
+                        frames: cycle.to_vec(),
+                        loop_start: Some(0),
+                    }
                 };
                 break;
             }
-            seen.insert(frame, trace.len());
+            seen.insert(state_key, trace.len());
             trace.push(frame);
             let mut destination = frame;
             let mut commands = Vec::<Command>::new();
-            if trace.len() == 1 {
-                commands.extend(class.constructor.commands.clone());
-            }
-            if let Some(program) = class.frames.get(&frame) {
-                ensure!(
-                    program.unsupported.is_none(),
-                    "unsupported control on reachable frame {frame}: {:?}",
-                    program.unsupported
+            if runtime_mode {
+                let context = crate::script_eval::ContextData {
+                    names: self.contexts.get(&id).cloned().unwrap_or_else(|| {
+                        vec![
+                            "asset".into(),
+                            "holder".into(),
+                            "mcChar".into(),
+                            "stage".into(),
+                        ]
+                    }),
+                    children: clip.frames[frame - 1]
+                        .display
+                        .values()
+                        .filter_map(|i| i.name.clone())
+                        .collect(),
+                    foreign: BTreeMap::new(),
+                    labels: Some(clip.labels.keys().cloned().collect()),
+                    old_labels: self.old_labels,
+                    frame,
+                    total_frames: clip.frames.len(),
+                    label: clip
+                        .labels
+                        .iter()
+                        .filter(|(_, f)| **f <= frame)
+                        .max_by_key(|(_, f)| *f)
+                        .map(|(n, _)| n.clone()),
+                };
+                let mut eval = crate::script_eval::Evaluator::new(
+                    class.runtime.as_ref().unwrap(),
+                    &mut runtime_state,
+                    &context,
                 );
-                commands.extend(program.commands.clone());
+                eval.initialize()?;
+                if trace.len() == 1 {
+                    eval.event("Event.ADDED")?;
+                    eval.event("Event.ADDED_TO_STAGE")?;
+                }
+                let mut initialized_commands = eval.commands;
+                if trace.len() == 1 {
+                    runtime_state
+                        .values
+                        .extend(self.child_values.remove(&id).unwrap_or_default());
+                }
+                let mut eval = crate::script_eval::Evaluator::new(
+                    class.runtime.as_ref().unwrap(),
+                    &mut runtime_state,
+                    &context,
+                );
+                eval.commands.append(&mut initialized_commands);
+                if trace.len() > 1 {
+                    eval.event("Event.ENTER_FRAME")?;
+                }
+                eval.frame()?;
+                commands.extend(eval.commands);
+                for child in clip.frames[frame - 1].display.values() {
+                    if let Some(name) = &child.name {
+                        let prefix = format!("{name}.");
+                        for (k, v) in &runtime_state.values {
+                            if let Some(field) = k.strip_prefix(&prefix) {
+                                self.child_values
+                                    .entry(child.id)
+                                    .or_default()
+                                    .insert(field.into(), v.clone());
+                            }
+                        }
+                    }
+                }
+                for fault in &runtime_state.faults {
+                    if !self.warnings.contains(fault) {
+                        self.warnings.push(fault.clone());
+                    }
+                }
+                ensure!(
+                    !runtime_state
+                        .values
+                        .keys()
+                        .any(|k| k == "visible" || k.ends_with(".visible")),
+                    "runtime clip needs visibility normalization"
+                );
+            } else {
+                if trace.len() == 1 {
+                    commands.extend(class.constructor.commands.clone());
+                }
+                if let Some(program) = class.frames.get(&frame) {
+                    ensure!(
+                        program.unsupported.is_none(),
+                        "unsupported control on reachable frame {frame}: {:?}",
+                        program.unsupported
+                    );
+                    commands.extend(program.commands.clone());
+                }
             }
             for command in commands {
                 if let Some(child) = command.child {
@@ -263,7 +402,13 @@ impl Resolver<'_> {
                     );
                     let entry = match command.action {
                         Action::Goto { target, play } => Entry { target, play },
-                        _ => bail!("frame {frame}: child stop/play without an explicit target is unsupported"),
+                        Action::Stop | Action::Play => {
+                            bail!("child stop/play needs the synchronized instance clock")
+                        }
+                        Action::FirstRandomPose => Entry {
+                            target: Target::Frame(1),
+                            play: false,
+                        },
                     };
                     child_entries.insert(matches[0].identity(), entry);
                 } else {
@@ -275,8 +420,18 @@ impl Resolver<'_> {
                             playing = false;
                         }
                         Action::Goto { target, play } => {
-                            named_state |= matches!(target, Target::Label(_));
-                            destination = clip.target(&target)?;
+                            _named_state |= matches!(target, Target::Label(_));
+                            destination = match clip.target(&target, self.old_labels) {
+                                Ok(f) => f,
+                                Err(e) if e.to_string().starts_with("unknown frame label") => {
+                                    let warning = format!("{name}: {e}");
+                                    if !self.warnings.contains(&warning) {
+                                        self.warnings.push(warning);
+                                    }
+                                    break;
+                                }
+                                Err(e) => return Err(e),
+                            };
                             playing = play;
                         }
                     }
@@ -296,41 +451,79 @@ impl Resolver<'_> {
             } else {
                 frame % clip.frames.len() + 1
             };
-            // Never silently run from the selected idle segment into another named state.
-            let state = |label: &str| {
-                matches!(
-                    label.to_ascii_lowercase().as_str(),
-                    "idle"
-                        | "idel"
-                        | "id"
-                        | "ready"
-                        | "walk"
-                        | "run"
-                        | "attack"
-                        | "death"
-                        | "dead"
-                        | "hurt"
-                )
-            };
-            if destination == frame && next != trace[0] {
-                ensure!(!clip.labels.iter().any(|(label, at)| *at == next && (named_state || state(label))), "frame {frame}: implicit transition into another animation state; no proven idle stop/loop");
-            }
+            // Labels do not stop Flash playback. Follow authored control flow.
             frame = next;
         }
-        let (first, last) = selection.range();
+        let selection = if let Some(forced) = self.forced.remove(&id) {
+            ensure!(
+                !runtime_mode
+                    && class
+                        .frames
+                        .values()
+                        .chain([&class.constructor])
+                        .all(|p| p.commands.is_empty()),
+                "generated Graphic controls a child with custom timeline actions"
+            );
+            forced
+        } else {
+            selection
+        };
         let mut children = BTreeSet::new();
-        for f in &clip.frames[first - 1..last] {
-            children.extend(f.display.values().cloned());
+        for frame in selection.indices() {
+            children.extend(clip.frames[frame - 1].display.values().cloned());
         }
         // A child command during a repeating parent would reset its playhead each cycle.
         // Our independent-child export cannot represent that synchronization safely.
-        if matches!(selection, Selection::Loop { .. }) {
+        if matches!(
+            selection,
+            Selection::Loop { .. } | Selection::Sequence { .. }
+        ) {
             ensure!(
                 child_entries.is_empty(),
                 "repeating parent controls child playheads; synchronized timelines are unsupported"
             );
         }
         for child in children {
+            if child
+                .name
+                .as_ref()
+                .is_some_and(|name| class.graphic_children.contains(name))
+            {
+                self.graphic_instances.insert(child.id);
+            }
+            if child
+                .name
+                .as_ref()
+                .is_some_and(|name| class.synchronized_children.contains(name))
+            {
+                let count = swf::u16_at(&self.swf.sprites[&child.id], 2)? as usize;
+                ensure!(count > 0, "empty synchronized layer");
+                let indices: Vec<_> = selection
+                    .indices()
+                    .into_iter()
+                    .map(|f| {
+                        if self.graphic_instances.contains(&id) {
+                            (f - 1) % count + 1
+                        } else {
+                            f.min(count)
+                        }
+                    })
+                    .collect();
+                let forced = if indices.iter().all(|f| *f == indices[0]) {
+                    Selection::Hold { frame: indices[0] }
+                } else if indices.windows(2).all(|w| w[1] == w[0] + 1) {
+                    Selection::Loop {
+                        first: indices[0],
+                        last: *indices.last().unwrap(),
+                    }
+                } else {
+                    Selection::Sequence {
+                        frames: indices,
+                        loop_start: Some(0),
+                    }
+                };
+                self.forced.insert(child.id, forced);
+            }
             let entry = child_entries
                 .get(&child.identity())
                 .cloned()
@@ -347,6 +540,17 @@ impl Resolver<'_> {
 }
 
 fn rewrite(payload: &[u8], selection: &Selection) -> Result<Vec<u8>> {
+    if let Selection::Sequence { frames, loop_start } = selection {
+        let mut indices = frames.clone();
+        while indices.len() < selection.length() {
+            indices.push(if let Some(start) = loop_start {
+                frames[start + (indices.len() - start) % (frames.len() - start)]
+            } else {
+                *frames.last().unwrap()
+            });
+        }
+        return crate::display::sequence(payload, &indices, 0);
+    }
     let (first, last) = selection.range();
     let mut output = Vec::from(&payload[..2]);
     output.extend_from_slice(&u16::try_from(last - first + 1)?.to_le_bytes());
@@ -374,6 +578,9 @@ pub struct Normalized {
     pub bytes: Vec<u8>,
     pub requests: Vec<SymbolRequest>,
     pub decisions: Vec<Decision>,
+    pub symbol_aliases: BTreeMap<String, String>,
+    pub host_visibility: BTreeMap<String, bool>,
+    pub warnings: Vec<String>,
 }
 
 pub fn normalize(
@@ -386,9 +593,81 @@ pub fn normalize(
 }
 
 pub(crate) fn normalize_with_avm1(
-    source: &[u8], swf: &Swf, scripts: &BTreeMap<String, Class>,
-    requests: &[SymbolRequest], inert_actions: &BTreeSet<String>,
+    source: &[u8],
+    swf: &Swf,
+    scripts: &BTreeMap<String, Class>,
+    requests: &[SymbolRequest],
+    inert_actions: &BTreeSet<String>,
 ) -> Result<Normalized> {
+    let repaired = swf::repair_zero_frame_displays(source, swf)?;
+    let parsed = repaired.as_ref().map(|b| Swf::parse(b)).transpose()?;
+    let (source, swf) = if let (Some(b), Some(s)) = (&repaired, &parsed) {
+        (b.as_slice(), s)
+    } else {
+        (source, swf)
+    };
+    if requests.iter().any(|r| r.click)
+        && scripts
+            .values()
+            .any(|c| c.runtime.as_ref().is_some_and(|r| r.has_click_listener()))
+    {
+        ensure!(
+            inert_actions.is_empty(),
+            "animation clicks require AS3 timeline metadata"
+        );
+        return crate::scene_timeline::normalize(source, swf, scripts, requests);
+    }
+    match normalize_static(source, swf, scripts, requests, inert_actions) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let message = format!("{e:#}");
+            if inert_actions.is_empty()
+                && (message.contains("repeating parent controls")
+                    || message.contains("child \"parent\"")
+                    || message.contains("child stop/play")
+                    || message.contains("visibility normalization")
+                    || message.contains("generated Graphic controls"))
+            {
+                crate::scene_timeline::normalize(source, swf, scripts, requests)
+                    .with_context(|| format!("synchronized fallback after {message}"))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn normalize_static(
+    source: &[u8],
+    swf: &Swf,
+    scripts: &BTreeMap<String, Class>,
+    requests: &[SymbolRequest],
+    inert_actions: &BTreeSet<String>,
+) -> Result<Normalized> {
+    let needs_context = requests.len() > 1
+        || requests.iter().any(|r| r.click)
+        || scripts.values().any(|c| {
+            !c.synchronized_children.is_empty()
+                || c.constructor.unsupported.is_some()
+                || c.frames.values().chain([&c.constructor]).any(|p| {
+                    p.unsupported.is_some() || p.commands.iter().any(|cmd| cmd.child.is_some())
+                })
+        });
+    let isolated = if needs_context {
+        Some(crate::instances::isolate(source, swf, scripts, requests)?)
+    } else {
+        None
+    };
+    let (source, swf, scripts, requests) = if let Some(i) = &isolated {
+        (
+            i.bytes.as_slice(),
+            &i.swf,
+            &i.scripts,
+            i.requests.as_slice(),
+        )
+    } else {
+        (source, swf, scripts, requests)
+    };
     let mut resolver = Resolver {
         swf,
         scripts,
@@ -397,6 +676,15 @@ pub(crate) fn normalize_with_avm1(
         active: BTreeSet::new(),
         entries: BTreeMap::new(),
         budget: 2_000_000,
+        old_labels: source[3] < 11,
+        forced: BTreeMap::new(),
+        contexts: isolated
+            .as_ref()
+            .map(|i| i.names.clone())
+            .unwrap_or_default(),
+        warnings: Vec::new(),
+        graphic_instances: BTreeSet::new(),
+        child_values: BTreeMap::new(),
     };
     for request in requests {
         ensure!(
@@ -448,21 +736,150 @@ pub(crate) fn normalize_with_avm1(
     for request in &mut effective {
         if replacements.contains_key(&request.character_id) {
             let selection = &resolver.selections[&request.character_id];
-            let (first, last) = selection.range();
             request.frame = 1;
-            request.root_timeline_frames = last - first + 1;
+            request.root_timeline_frames = selection.length();
         }
     }
     Ok(Normalized {
         bytes: swf::replace_sprites(source, &replacements)?,
         requests: effective,
         decisions,
+        symbol_aliases: isolated
+            .as_ref()
+            .map(|i| i.aliases.clone())
+            .unwrap_or_default(),
+        host_visibility: BTreeMap::new(),
+        warnings: resolver.warnings,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_sprite_uses_each_actual_ancestor_name() {
+        let (bytes, swf) = fixture(vec![(1, "Root", vec![vec![], vec![], vec![]])]);
+        let classes = scripts(
+            r#"class Root {function Root(){addFrameScript(0,frame1);}function frame1(){if(parent.name=="backshoulder"){gotoAndStop(3);}else{stop();}}}"#,
+        );
+        let mut front = request();
+        front.ancestor_names = vec!["frontshoulder".into(), "mcChar".into()];
+        let mut back = front.clone();
+        back.key = "back".into();
+        back.ancestor_names[0] = "backshoulder".into();
+        let result = normalize(&bytes, &swf, &classes, &[front, back]).unwrap();
+        assert_ne!(
+            result.requests[0].character_id,
+            result.requests[1].character_id
+        );
+        assert!(result
+            .decisions
+            .iter()
+            .any(|d| d.selection == Selection::Hold { frame: 1 }));
+        assert!(result
+            .decisions
+            .iter()
+            .any(|d| d.selection == Selection::Hold { frame: 3 }));
+    }
+    #[test]
+    fn click_occurs_once_after_initialization_and_keeps_final_pose() {
+        let (bytes, swf) = fixture(vec![
+            (1, "Root", vec![place(2, 1, "art"), vec![], vec![]]),
+            (2, "Art", vec![vec![]]),
+        ]);
+        let classes=scripts("class Root {public var inits:int=0;public var clicks:int=0;function Root(){inits++;addFrameScript(0,frame1,2,frame3);}function frame1(){addEventListener(MouseEvent.CLICK,onClick);stop();}function onClick(e:Object){clicks++;gotoAndPlay(inits+clicks);}function frame3(){stop();}}");
+        let mut req = request();
+        req.click = true;
+        req.capture_end = 8;
+        let result = normalize(&bytes, &swf, &classes, &[req]).unwrap();
+        let decision = result
+            .decisions
+            .iter()
+            .find(|d| d.character_id == 1)
+            .unwrap();
+        assert_eq!(
+            decision.selection,
+            Selection::Sequence {
+                frames: vec![2, 3],
+                loop_start: Some(1)
+            }
+        );
+        let parsed = Swf::parse(&result.bytes).unwrap();
+        let frames = crate::display::snapshots(&parsed.sprites[&1]).unwrap();
+        // A static parent placement can be collapsed while its child continues.
+        assert!(!frames[0].is_empty());
+    }
+    #[test]
+    fn selecting_later_idle_keeps_initial_click_registration() {
+        let (bytes, swf) = fixture(vec![(1, "Root", vec![vec![], vec![], vec![]])]);
+        let classes=scripts("class Root {function Root(){addFrameScript(0,frame1,1,frame2);}function frame1(){addEventListener(MouseEvent.CLICK,onClick);}function frame2(){stop();}function onClick(e:Object){gotoAndStop(3);}}");
+        let mut req = request();
+        req.frame = 2;
+        req.click = true;
+        req.capture_end = 4;
+        let result = normalize(&bytes, &swf, &classes, &[req]).unwrap();
+        assert_eq!(result.decisions[0].selection, Selection::Hold { frame: 3 });
+    }
+    #[test]
+    fn graphic_loop_wraps_shorter_art_on_the_parent_clock() {
+        let (bytes, swf) = fixture(vec![
+            (
+                1,
+                "Root",
+                vec![
+                    place(2, 1, "wrapper"),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                ],
+            ),
+            (
+                2,
+                "Wrapper",
+                vec![place(3, 1, "art"), vec![], vec![], vec![], vec![], vec![]],
+            ),
+            (3, "Art", vec![vec![], vec![]]),
+        ]);
+        let classes = BTreeMap::from([
+            (
+                "root".into(),
+                Class {
+                    synchronized_children: vec!["wrapper".into()],
+                    graphic_children: vec!["wrapper".into()],
+                    ..Class::default()
+                },
+            ),
+            (
+                "wrapper".into(),
+                Class {
+                    synchronized_children: vec!["art".into()],
+                    ..Class::default()
+                },
+            ),
+        ]);
+        let mut req = request();
+        req.root_timeline_frames = 6;
+        let result = normalize(&bytes, &swf, &classes, &[req]).unwrap();
+        let art = result
+            .decisions
+            .iter()
+            .find(|d| d.character_id == 3)
+            .unwrap();
+        assert_eq!(art.selection.indices(), vec![1, 2, 1, 2, 1, 2]);
+    }
+    #[test]
+    fn ui_only_click_does_not_change_timeline() {
+        let (bytes, swf) = fixture(vec![(1, "Root", vec![vec![], vec![]])]);
+        let classes=scripts("class Root {function Root(){addFrameScript(0,frame1);}function frame1(){stop();addEventListener(MouseEvent.CLICK,shop);}function shop(e:Object){MovieClip(stage.getChildAt(0)).world.openShop(12);}}");
+        let mut req = request();
+        req.click = true;
+        req.capture_end = 4;
+        let result = normalize(&bytes, &swf, &classes, &[req]).unwrap();
+        assert_eq!(result.decisions[0].selection, Selection::Hold { frame: 1 });
+    }
     #[test]
     fn avm1_approval_is_bound_to_action_bytes_and_tag_kind() {
         let action = b"recognized background action fixture";
@@ -532,7 +949,65 @@ mod tests {
             character_id: 1,
             frame: 1,
             root_timeline_frames: 1,
+            click: false,
+            ancestor_names: Vec::new(),
+            capture_end: 2008,
         }
+    }
+
+    #[test]
+    fn bank_child_idle_selects_idle_art_and_keeps_animated_descendants() {
+        let (bytes, swf) = fixture(vec![
+            (1, "Root", vec![place(2, 1, "CCPet"), vec![], vec![]]),
+            (
+                2,
+                "Child",
+                vec![
+                    vec![],
+                    [tag(43, b"Idle\0"), place(3, 1, "idle")].concat(),
+                    [tag(43, b"Walk\0"), place(4, 1, "walk")].concat(),
+                ],
+            ),
+            (3, "Flame", vec![vec![], vec![], vec![]]),
+            (4, "Walking", vec![vec![]]),
+        ]);
+        let mut scripts=scripts("class Root {function Root(){addFrameScript(0,this.frame1);}function initPet(){}function frame1(){this.CCPet.gotoAndPlay(\"Idle\");if(!petInit){petInit=true;initPet();}stop();}}");
+        let child = crate::script::parse(
+            "class Child {function Child(){addFrameScript(1,this.idle);}function idle(){stop();}}",
+        )
+        .unwrap()
+        .unwrap();
+        scripts.insert(child.0, child.1);
+        let normalized = normalize(&bytes, &swf, &scripts, &[request()]).unwrap();
+        let updated = Swf::parse(&normalized.bytes).unwrap();
+        assert!(normalized
+            .decisions
+            .iter()
+            .any(|d| d.character_id == 2 && d.selection == Selection::Hold { frame: 2 }));
+        assert_eq!(
+            updated.sprites[&3], swf.sprites[&3],
+            "nested idle animation must be untouched"
+        );
+        let child = Clip::read(&updated.sprites[&2], &mut 1000, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            child.frames[0].display[&1].id, 3,
+            "walking art must not replace idle art"
+        );
+    }
+
+    #[test]
+    fn randomized_start_policy_preserves_full_child_loop() {
+        let (bytes, swf) = fixture(vec![
+            (1, "Root", vec![place(2, 1, "flame")]),
+            (2, "Flame", vec![vec![], vec![], vec![]]),
+        ]);
+        let scripts=scripts("class Flame extends MovieClip {public var started:*;public function Flame(){super();addFrameScript(0,this.frame1);}internal function frame1():*{if(this.started==undefined){this.started=true;gotoAndPlay(Math.ceil(Math.random()*totalFrames));}}}");
+        let normalized = normalize(&bytes, &swf, &scripts, &[request()]).unwrap();
+        assert_eq!(
+            normalized.bytes, bytes,
+            "the three-frame effect must not freeze or lose frames"
+        );
+        assert!(normalized.decisions.is_empty());
     }
 
     #[test]
@@ -619,12 +1094,12 @@ mod tests {
         let error = normalize(&bytes, &swf, &metadata, &[request()])
             .err()
             .unwrap();
-        assert!(format!("{error:#}").contains("reachable frame 1"));
+        assert!(format!("{error:#}").contains("unknown identifier x"));
     }
 
     #[test]
-    fn no_guessed_state_bleed_missing_labels_or_conflicting_instances() {
-        let (bytes, swf) = fixture(vec![
+    fn modern_missing_labels_are_rejected() {
+        let (mut bytes, swf) = fixture(vec![
             (
                 1,
                 "Root",
@@ -632,11 +1107,8 @@ mod tests {
             ),
             (2, "Child", vec![tag(43, b"Idle\0"), tag(43, b"Walk\0")]),
         ]);
-        for body in [
-            "this.a.gotoAndStop(1);this.b.gotoAndStop(2);stop();",
-            "this.a.gotoAndStop(\"Missing\");stop();",
-            "this.a.gotoAndPlay(\"Idle\");stop();",
-        ] {
+        bytes[3] = 11;
+        for body in ["this.a.gotoAndStop(\"Missing\");stop();"] {
             let metadata = scripts(&format!("class Root {{function Root(){{addFrameScript(0,this.f);}} function f(){{{body}}}}}"));
             assert!(
                 normalize(&bytes, &swf, &metadata, &[request()]).is_err(),
@@ -760,13 +1232,10 @@ mod tests {
         let metadata = scripts(
             r#"class Root {function Root(){addFrameScript(0,this.f);} function f(){this.pet.gotoAndPlay("Resting");stop();}}"#,
         );
-        assert!(format!(
-            "{:#}",
-            normalize(&bytes, &swf, &metadata, &[request()])
-                .err()
-                .unwrap()
-        )
-        .contains("implicit transition"));
+        assert!(
+            normalize(&bytes, &swf, &metadata, &[request()]).is_ok(),
+            "labels do not stop playback"
+        );
         let (bytes, swf) = fixture(vec![
             (1, "Root", vec![place(2, 1, "child"), vec![]]),
             (2, "C2", vec![place(3, 1, "child"), vec![]]),

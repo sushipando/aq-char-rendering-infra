@@ -35,6 +35,9 @@ async fn fixture(store: &FsStore, count: usize) -> Result<()> {
                     character_id: 1,
                     frame: 1,
                     root_timeline_frames: 1,
+                    click: false,
+                    ancestor_names: Vec::new(),
+                    capture_end: 2008,
                 },
                 schedule: states.keys().cloned().collect(),
                 mirror_flip_frame: 0,
@@ -48,6 +51,8 @@ async fn fixture(store: &FsStore, count: usize) -> Result<()> {
         color_rules: BTreeMap::new(),
         placement_colors: BTreeMap::new(),
         timeline_decisions: Vec::new(),
+        host_visibility: BTreeMap::new(),
+        timeline_warnings: Vec::new(),
     };
     store::write(store, "work", "source.json", &manifest, false).await?;
     store::write(

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import tempfile
 import time
@@ -70,6 +71,7 @@ def main():
     parser.add_argument('--timeout', type=int, default=120, help='Per-SWF wall timeout in seconds; FFDec internal limit is 90')
     parser.add_argument('--output', type=Path, help='New results directory; refuses existing paths')
     parser.add_argument('--no-build', action='store_true', help='Use an already built native helper')
+    parser.add_argument("--retry-report", type=Path, help="Recheck non-ok entries in an earlier results.jsonl instead of scanning roots")
     args = parser.parse_args()
     if not 1 <= args.workers <= 8 or args.timeout < 1 or (args.limit is not None and args.limit < 1):
         parser.error('workers must be 1–8; timeout and limit must be positive')
@@ -93,16 +95,29 @@ def main():
     out = args.output.expanduser().resolve() if args.output else Path(tempfile.mkdtemp(prefix='aqw-swf-sanity-'))
     if args.output:
         out.mkdir(parents=True, exist_ok=False)
+    # Every subprocess uses the same executable even if a developer rebuilds locally.
+    snapshot = out/'swf_sanity'
+    shutil.copy2(binary, snapshot)
+    binary = snapshot
     print(f'Results: {out}', flush=True)
     groups, unreadable = {}, []
-    for index, path in enumerate(discover(roots)):
+    if args.retry_report:
+        candidates = []
+        for line in args.retry_report.expanduser().open():
+            row = json.loads(line)
+            if row.get("status") != "ok":
+                candidates.extend(Path(p) for p in row.get("paths", []))
+        inputs = discover(candidates)
+    else:
+        inputs = discover(roots)
+    for index, path in enumerate(inputs):
         if args.limit is not None and index >= args.limit:
             break
         try:
             with path.open('rb') as source:
                 digest = hashlib.file_digest(source,'sha256').hexdigest()
             # Backgrounds use the production wrapper and policy, unlike items.
-            group = (digest, path.name.startswith('cp-bg'))
+            group = (digest, path.name.startswith('cp-'))
             groups.setdefault(group, []).append(str(path))
         except OSError as error:
             unreadable.append({'status':'unreadable','paths':[str(path)],'error':str(error)})
@@ -129,7 +144,15 @@ def main():
                 save({**result,'sha256':digest,'paths':paths})
                 if n % 25 == 0 or n == len(futures):
                     print(f'{n}/{len(futures)} unique files: {dict(counts)}',flush=True)
-    summary = {'created_at':datetime.now().astimezone().isoformat(), 'roots':list(map(str,roots)),
+    def fingerprint(path):
+        with path.open('rb') as stream:
+            return hashlib.file_digest(stream, 'sha256').hexdigest()
+    revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True, text=True)
+    summary = {'helper_sha256': fingerprint(binary), 'ffdec_sha256': fingerprint(jar) if jar else None,
+               'retry_report': str(args.retry_report) if args.retry_report else None,
+               'git_revision': revision.stdout.strip() if revision.returncode == 0 else None,
+               'git_dirty': bool(subprocess.run(['git','status','--porcelain','--untracked-files=no'],cwd=REPO,capture_output=True,text=True).stdout),
+               'created_at':datetime.now().astimezone().isoformat(), 'roots':list(map(str,roots)),
                'mode':'structural' if args.structural_only else 'scripts-and-timelines',
                'ffdec':str(jar) if jar else None, 'counts':dict(counts),
                'files':sum(map(len,groups.values()))+len(unreadable),'unique_checks':len(groups)}

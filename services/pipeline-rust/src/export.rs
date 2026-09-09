@@ -438,18 +438,30 @@ pub struct ScriptMetadata {
 
 impl ScriptMetadata {
     /// Shared production policy for local diagnostics and AWS export.
-    pub fn normalize(&self, source: &[u8], swf: &Swf, requests: &[SymbolRequest]) -> Result<crate::timeline::Normalized> {
+    pub fn normalize(
+        &self,
+        source: &[u8],
+        swf: &Swf,
+        requests: &[SymbolRequest],
+    ) -> Result<crate::timeline::Normalized> {
         let mut allowed_actions = BTreeSet::new();
         if !self.inert_background_actions.is_empty()
-            && requests.iter().all(|r| r.key == crate::background::KEY) {
+            && requests.iter().all(|r| r.key == crate::background::KEY)
+        {
             let body = crate::swf::decompress(source)?;
             let stage_offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
-            let as3 = crate::swf::tags(&body, stage_offset)?.iter().any(|(code, data)|
-                *code == 69 && data.first().is_some_and(|flags| flags & 8 != 0));
-            if !as3 { allowed_actions.clone_from(&self.inert_background_actions); }
+            let as3 = crate::swf::tags(&body, stage_offset)?
+                .iter()
+                .any(|(code, data)| {
+                    *code == 69 && data.first().is_some_and(|flags| flags & 8 != 0)
+                });
+            if !as3 {
+                allowed_actions.clone_from(&self.inert_background_actions);
+            }
         }
-        let scripts = crate::animate::validated_scripts(source, swf, &self.timelines)?;
-        crate::timeline::normalize_with_avm1(source, swf, &scripts, requests, &allowed_actions)
+        let (source, scripts) = crate::animate::prepare(source, swf, &self.timelines)?;
+        let swf = Swf::parse(&source)?;
+        crate::timeline::normalize_with_avm1(&source, &swf, &scripts, requests, &allowed_actions)
     }
 
     pub fn inspect_file(&mut self, path: &Path, swf: &Swf) -> Result<()> {
@@ -775,7 +787,10 @@ pub async fn export_source(
     let bounds_cache = prepared["cache"]["bounds"].as_bool().unwrap_or(true);
     let requests: Vec<SymbolRequest> = serde_json::from_value(source["requests"].clone())?;
     let normalization_requests: Vec<SymbolRequest> = serde_json::from_value(
-        source.get("normalization_requests").unwrap_or(&source["requests"]).clone(),
+        source
+            .get("normalization_requests")
+            .unwrap_or(&source["requests"])
+            .clone(),
     )?;
     ensure!(!requests.is_empty(), "empty export unit");
     let settings = &prepared["settings"];
@@ -855,7 +870,7 @@ pub async fn export_source(
     } else {
         None
     };
-    let metadata = if let Some(cached) = cached_metadata {
+    let mut metadata = if let Some(cached) = cached_metadata {
         cached
     } else {
         let output = temporary.path().join("scripts");
@@ -874,20 +889,36 @@ pub async fn export_source(
             .await?;
         let mut computed = ScriptMetadata::default();
         for path in script_files(&output)? {
-            computed.inspect_file(&path, &swf).with_context(|| format!("decompiled script {}", path.display()))?;
+            computed
+                .inspect_file(&path, &swf)
+                .with_context(|| format!("decompiled script {}", path.display()))?;
         }
         if vector_cache {
             store::write(store, work_bucket, &metadata_key, &computed, true).await?;
         }
         computed
     };
+    let mut normalization_requests = normalization_requests;
+    for request in &mut normalization_requests {
+        request.capture_end = start + count - 1;
+    }
     let normalized = metadata.normalize(&bytes, &swf, &normalization_requests)?;
     let selected: BTreeSet<_> = requests.iter().map(|r| r.key.as_str()).collect();
-    let effective_requests: Vec<_> = normalized.requests.iter()
-        .filter(|r| selected.contains(r.key.as_str())).cloned().collect();
-    ensure!(effective_requests.len() == requests.len(), "export unit is missing from normalization context");
+    let effective_requests: Vec<_> = normalized
+        .requests
+        .iter()
+        .filter(|r| selected.contains(r.key.as_str()))
+        .cloned()
+        .collect();
+    ensure!(
+        effective_requests.len() == requests.len(),
+        "export unit is missing from normalization context"
+    );
     tokio::fs::write(&source_path, &normalized.bytes).await?;
-    crate::log("export_timeline_resolution", json!({"job_id":job,"source_idx":source_idx,"decisions":normalized.decisions}));
+    crate::log(
+        "export_timeline_resolution",
+        json!({"job_id":job,"source_idx":source_idx,"decisions":normalized.decisions}),
+    );
     let metadata_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut exported = ffdec
         .frames(
@@ -900,6 +931,14 @@ pub async fn export_source(
         )
         .await?;
     let ffdec_ms = started.elapsed().as_secs_f64() * 1000.0 - metadata_ms;
+    for (alias, original) in &normalized.symbol_aliases {
+        if let Some(rules) = metadata.color_rules.get(original).cloned() {
+            metadata.color_rules.insert(alias.clone(), rules);
+        }
+        if let Some(hand) = metadata.hand_visibility.get(original).cloned() {
+            metadata.hand_visibility.insert(alias.clone(), hand);
+        }
+    }
     let mut manifest = SourceManifest {
         schema_version: VECTOR_SCHEMA,
         export_policy: EXPORT_POLICY.into(),
@@ -909,8 +948,10 @@ pub async fn export_source(
         states: BTreeMap::new(),
         hand_visibility: metadata.hand_visibility,
         color_rules: metadata.color_rules,
-        placement_colors: swf.placement_colors()?,
+        placement_colors: Swf::parse(&normalized.bytes)?.placement_colors()?,
         timeline_decisions: normalized.decisions.clone(),
+        host_visibility: normalized.host_visibility.clone(),
+        timeline_warnings: normalized.warnings.clone(),
     };
     let mut uploads = BTreeMap::new();
     for request in requests {
@@ -927,11 +968,20 @@ pub async fn export_source(
             uploads.entry(state.svg_key.clone()).or_insert(bytes);
             manifest.states.insert(state.sha256.clone(), state);
         }
-        let effective = normalized.requests.iter().find(|r| r.key == request.key).context("missing normalized export request")?.clone();
-        let stop = normalized.decisions.iter().find(|d| d.character_id == request.character_id).and_then(|d| match d.selection {
-            crate::timeline::Selection::Hold { frame } => Some(frame),
-            _ => None,
-        });
+        let effective = normalized
+            .requests
+            .iter()
+            .find(|r| r.key == request.key)
+            .context("missing normalized export request")?
+            .clone();
+        let stop = normalized
+            .decisions
+            .iter()
+            .find(|d| d.character_id == effective.character_id)
+            .and_then(|d| match d.selection {
+                crate::timeline::Selection::Hold { frame } => Some(frame),
+                _ => None,
+            });
         manifest.symbols.insert(
             request.key.clone(),
             SymbolExport {
@@ -1122,27 +1172,331 @@ mod tests {
         assert_eq!(ranges(&[3, 1, 2, 3, 8, 9]), "1-3,8-9");
     }
 
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_LOCAL_CORPUS; local only"]
+    async fn real_generalized_timeline_exports_preserve_pixels_and_click_animation() -> Result<()> {
+        let corpus = PathBuf::from(std::env::var("AQW_TEST_LOCAL_CORPUS")?);
+        let root = tempfile::Builder::new()
+            .prefix("aqw-generalized-visual-")
+            .tempdir()?
+            .keep();
+        println!("visual regression artifacts: {}", root.display());
+        let store = FsStore(root.join("objects"));
+        let mut click_results = Vec::new();
+        for (index, (path, suffix, click)) in [
+            (
+                "classes/F/DarkBloodEviscerater.swf",
+                "DarkBloodEvisceraterFHand",
+                false,
+            ),
+            (
+                "classes/F/DarkBloodEviscerater.swf",
+                "DarkBloodEvisceraterFHand",
+                true,
+            ),
+            ("items/polearms/Lanceofcthulhu.swf", "Lanceofcthulhu", false),
+            (
+                "items/pets/MutantShadowDragonPet.swf",
+                "MutantShadowDragonPet",
+                false,
+            ),
+            ("items/swords/ArchFMageSword.swf", "ArchFMageSword", false),
+            (
+                "items/Capes/ScarlettaNCMirrorC2.swf",
+                "ScarlettaNCMirrorC2",
+                false,
+            ),
+            ("items/Gauntlets/dBSGauntletsr2.swf", "dBSGauntlets", false),
+            (
+                "items/daggers/Kaharakasandknightslasherdaggers.swf",
+                "Kaharakasandknightslasherdaggers",
+                false,
+            ),
+            ("items/pets/AuraMaxingPetr1.swf", "AuraMaxingPet", false),
+            (
+                "items/swords/SoulDevourerBlade.swf",
+                "SoulDevourerBlade",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = std::fs::read(corpus.join(path))?;
+            let swf = Swf::parse(&bytes)?;
+            let (id, name) = swf.symbol(suffix).context("missing real regression root")?;
+            let (frame, frames) = swf.timeline(id)?;
+            let key = format!("case{index}");
+            let source = json!({"idx":0,"key":key,"sha256":crate::sha256(&bytes),"requests":[{"key":key,"class_name":name,"character_id":id,"frame":frame,"root_timeline_frames":frames,"click":click,"ancestor_names":["head","mcChar","stage"]}]});
+            store
+                .put("source", &key, bytes, "application/octet-stream", true)
+                .await?;
+            store::write(&store,"work",&key,&json!({"job_id":key,"sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":36}),false).await?;
+            let result = export_source(
+                &store,
+                "work",
+                "source",
+                &json!({"job_id":key,"input_key":key,"source":source}),
+                ExportOptions::without_prefetch(
+                    std::env::var("AQW_TEST_FFDEC")?.into(),
+                    Duration::from_secs(240),
+                ),
+            )
+            .await?;
+            let manifest: SourceManifest =
+                store::read(&store, "work", result["manifest_key"].as_str().unwrap()).await?;
+            let mut pixels = BTreeSet::new();
+            let mut nonempty = 0;
+            for (n, state) in manifest.states.values().enumerate() {
+                let svg = store.get("work", &state.svg_key).await?.unwrap();
+                let tree = resvg::usvg::Tree::from_data(&svg, &resvg::usvg::Options::default())?;
+                let mut pixmap = resvg::tiny_skia::Pixmap::new(384, 384).unwrap();
+                let scale = 384.0 / tree.size().width().max(tree.size().height());
+                resvg::render(
+                    &tree,
+                    resvg::tiny_skia::Transform::from_scale(scale, scale),
+                    &mut pixmap.as_mut(),
+                );
+                nonempty += usize::from(pixmap.data().chunks_exact(4).any(|p| p[3] > 0));
+                pixels.insert(crate::sha256(pixmap.data()));
+                if n < 3 {
+                    pixmap.save_png(root.join(format!("{key}-{n}.png")))?;
+                }
+            }
+            ensure!(nonempty > 0, "empty real render for {path}");
+            if index < 2 {
+                click_results.push(pixels.clone());
+            }
+            println!(
+                "{path}, click={click}: {} distinct raster states",
+                pixels.len()
+            );
+        }
+        ensure!(
+            click_results[0] != click_results[1],
+            "click must change the real hand animation"
+        );
+        println!("visual regression artifacts: {}", root.display());
+        Ok(())
+    }
 
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_LOCAL_CORPUS; local only"]
+    async fn real_bank_cape_and_chest_export_keep_idle_artwork() -> Result<()> {
+        let corpus = PathBuf::from(std::env::var("AQW_TEST_LOCAL_CORPUS")?);
+        let root = tempfile::tempdir()?;
+        let store = FsStore(root.path().join("objects"));
+        for (path, class, key) in [
+            (
+                "items/Capes/ALCThroneBankCape.swf",
+                "ALCThroneBankCape",
+                "cape",
+            ),
+            (
+                "items/pets/16Birthday10kCollectionChest.swf",
+                "16Birthday10kCollectionChest",
+                "pet",
+            ),
+        ] {
+            let bytes = std::fs::read(corpus.join(path))?;
+            let swf = Swf::parse(&bytes)?;
+            let (id, name) = swf.symbol(class).context("missing regression root")?;
+            let (frame, frames) = swf.timeline(id)?;
+            let source = json!({"idx":0,"key":key,"sha256":crate::sha256(&bytes),"requests":[{"key":key,"class_name":name,"character_id":id,"frame":frame,"root_timeline_frames":frames}]});
+            store
+                .put("source", key, bytes, "application/octet-stream", true)
+                .await?;
+            store::write(&store,"work",key,&json!({"job_id":key,"sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":12}),false).await?;
+            let event = json!({"job_id":key,"input_key":key,"source":source});
+            let options = || {
+                ExportOptions::without_prefetch(
+                    std::env::var("AQW_TEST_FFDEC").unwrap().into(),
+                    Duration::from_secs(180),
+                )
+            };
+            let result = export_source(&store, "work", "source", &event, options()).await?;
+            let manifest: SourceManifest =
+                store::read(&store, "work", result["manifest_key"].as_str().unwrap()).await?;
+            assert_eq!(manifest.symbols[key].schedule.len(), 12);
+            assert!(manifest
+                .timeline_decisions
+                .iter()
+                .any(|d| d.character_id == id
+                    && d.selection == crate::timeline::Selection::Hold { frame }));
+            if key == "pet" {
+                assert!(
+                    manifest
+                        .timeline_decisions
+                        .iter()
+                        .any(|d| d.class_name.ends_with("CCPet_2")
+                            && d.selection == crate::timeline::Selection::Hold { frame: 16 }),
+                    "chest child must settle on authored idle, not walking"
+                );
+            }
+            let mut pixels = BTreeSet::new();
+            for state in manifest.states.values() {
+                let svg = store.get("work", &state.svg_key).await?.unwrap();
+                let tree = resvg::usvg::Tree::from_data(&svg, &resvg::usvg::Options::default())?;
+                let mut pixmap = resvg::tiny_skia::Pixmap::new(256, 256).unwrap();
+                let scale = 256.0 / tree.size().width().max(tree.size().height());
+                resvg::render(
+                    &tree,
+                    resvg::tiny_skia::Transform::from_scale(scale, scale),
+                    &mut pixmap.as_mut(),
+                );
+                assert!(pixmap.data().chunks_exact(4).any(|p| p[3] > 0));
+                pixels.insert(crate::sha256(pixmap.data()));
+            }
+            assert!(
+                pixels.len() > 1,
+                "bank UI initialization must not freeze nested idle effects"
+            );
+            assert_eq!(
+                export_source(&store, "work", "source", &event, options()).await?
+                    ["vector_cache_hit"],
+                true
+            );
+            println!(
+                "{path}: {} distinct raster states; decisions {:?}",
+                pixels.len(),
+                manifest.timeline_decisions
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_LOCAL_CORPUS; local only"]
+    async fn real_conditional_batch_keeps_flames_animated_and_weapons_idle() -> Result<()> {
+        let corpus = PathBuf::from(std::env::var("AQW_TEST_LOCAL_CORPUS")?);
+        let root = tempfile::tempdir()?;
+        let store = FsStore(root.path().join("objects"));
+        for (path, class, key, count) in [
+            (
+                "items/Helms/2016DCBlackSpiritHead.swf",
+                "2016DCBlackSpiritHead",
+                "helm",
+                12,
+            ),
+            (
+                "items/swords/ApocrphyalGreatsword.swf",
+                "ApocrphyalGreatsword",
+                "weapon",
+                1,
+            ),
+        ] {
+            let bytes = std::fs::read(corpus.join(path))?;
+            let swf = Swf::parse(&bytes)?;
+            let (id, name) = swf.symbol(class).context("missing regression root")?;
+            let source = json!({"idx":0,"key":key,"sha256":crate::sha256(&bytes),"requests":[{"key":key,"class_name":name,"character_id":id,"frame":1,"root_timeline_frames":1}]});
+            store
+                .put("source", key, bytes, "application/octet-stream", true)
+                .await?;
+            store::write(&store,"work",key,&json!({"job_id":key,"sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":count}),false).await?;
+            let event = json!({"job_id":key,"input_key":key,"source":source});
+            let options = || {
+                ExportOptions::without_prefetch(
+                    std::env::var("AQW_TEST_FFDEC").unwrap().into(),
+                    Duration::from_secs(180),
+                )
+            };
+            let result = export_source(&store, "work", "source", &event, options()).await?;
+            let manifest: SourceManifest =
+                store::read(&store, "work", result["manifest_key"].as_str().unwrap()).await?;
+            let mut pixels = BTreeSet::new();
+            for state in manifest.states.values() {
+                let svg = store.get("work", &state.svg_key).await?.unwrap();
+                let tree = resvg::usvg::Tree::from_data(&svg, &resvg::usvg::Options::default())?;
+                let mut pixmap = resvg::tiny_skia::Pixmap::new(256, 256).unwrap();
+                let scale = 256.0 / tree.size().width().max(tree.size().height());
+                resvg::render(
+                    &tree,
+                    resvg::tiny_skia::Transform::from_scale(scale, scale),
+                    &mut pixmap.as_mut(),
+                );
+                assert!(pixmap.data().chunks_exact(4).any(|p| p[3] > 0));
+                pixels.insert(crate::sha256(pixmap.data()));
+            }
+            if key == "helm" {
+                assert!(
+                    pixels.len() > 1,
+                    "randomized flame initialization must not freeze animation"
+                );
+                assert!(!manifest
+                    .timeline_decisions
+                    .iter()
+                    .any(|d| d.class_name.contains("BasicFire")
+                        && matches!(d.selection, crate::timeline::Selection::Hold { .. })));
+            } else {
+                assert!(manifest
+                    .timeline_decisions
+                    .iter()
+                    .any(|d| d.class_name.ends_with("Weapon_2")
+                        && d.selection == crate::timeline::Selection::Hold { frame: 1 }));
+            }
+            assert_eq!(
+                export_source(&store, "work", "source", &event, options()).await?
+                    ["vector_cache_hit"],
+                true
+            );
+            println!("{path}: {} distinct raster states", pixels.len());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_BATTLEON_WRAPPED_SWF; local only"]
     async fn real_battleon_background_linkage_normalizes() -> Result<()> {
-        let source=PathBuf::from(std::env::var("AQW_TEST_BATTLEON_WRAPPED_SWF")?);
-        let bytes=std::fs::read(&source)?;
-        ensure!(crate::sha256(&bytes)=="57a1fe4b69af41a4e1bb66fb1997fa93e9c01a7b1fdbedad2a49524520cac6b7","wrong regression asset");
-        let swf=Swf::parse(&bytes)?;
-        let root=tempfile::tempdir()?;
-        let output=root.path().join("scripts");
-        Ffdec{jar:std::env::var("AQW_TEST_FFDEC")?.into(),deadline:Instant::now()+Duration::from_secs(90)}
-            .run(&root.path().join("home"),&["-export".into(),"script".into(),output.to_string_lossy().into_owned(),source.to_string_lossy().into_owned()]).await?;
-        let mut metadata=ScriptMetadata::default();
-        for path in script_files(&output)? {metadata.inspect_file(&path,&swf)?;}
-        assert_eq!(metadata.inert_background_actions.len(),1);
-        let request=SymbolRequest{key:crate::background::KEY.into(),class_name:"CharpageBackgroundStage".into(),character_id:65533,frame:1,root_timeline_frames:1};
-        let normalized=metadata.normalize(&bytes,&swf,&[request.clone()])?;
-        assert_eq!(normalized.bytes,bytes,"background geometry and timelines must remain unchanged");
-        let mut item=request;item.key="cape".into();
-        assert!(metadata.normalize(&bytes,&swf,&[item]).is_err(),"exception must remain background-only");
+        let source = PathBuf::from(std::env::var("AQW_TEST_BATTLEON_WRAPPED_SWF")?);
+        let bytes = std::fs::read(&source)?;
+        ensure!(
+            crate::sha256(&bytes)
+                == "57a1fe4b69af41a4e1bb66fb1997fa93e9c01a7b1fdbedad2a49524520cac6b7",
+            "wrong regression asset"
+        );
+        let swf = Swf::parse(&bytes)?;
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("scripts");
+        Ffdec {
+            jar: std::env::var("AQW_TEST_FFDEC")?.into(),
+            deadline: Instant::now() + Duration::from_secs(90),
+        }
+        .run(
+            &root.path().join("home"),
+            &[
+                "-export".into(),
+                "script".into(),
+                output.to_string_lossy().into_owned(),
+                source.to_string_lossy().into_owned(),
+            ],
+        )
+        .await?;
+        let mut metadata = ScriptMetadata::default();
+        for path in script_files(&output)? {
+            metadata.inspect_file(&path, &swf)?;
+        }
+        assert_eq!(metadata.inert_background_actions.len(), 1);
+        let request = SymbolRequest {
+            key: crate::background::KEY.into(),
+            class_name: "CharpageBackgroundStage".into(),
+            character_id: 65533,
+            frame: 1,
+            root_timeline_frames: 1,
+            click: false,
+            ancestor_names: Vec::new(),
+            capture_end: 2008,
+        };
+        let normalized = metadata.normalize(&bytes, &swf, &[request.clone()])?;
+        assert_eq!(
+            normalized.bytes, bytes,
+            "background geometry and timelines must remain unchanged"
+        );
+        let mut item = request;
+        item.key = "cape".into();
+        assert!(
+            metadata.normalize(&bytes, &swf, &[item]).is_err(),
+            "exception must remain background-only"
+        );
         Ok(())
     }
 
@@ -1449,5 +1803,4 @@ mod tests {
         }
         Ok(())
     }
-
 }

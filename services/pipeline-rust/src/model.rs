@@ -7,7 +7,7 @@ use serde_json::Value;
 pub const VECTOR_SCHEMA: u32 = 6;
 pub const FFDEC_VERSION: &str = "26.2.1";
 // Bump whenever effective-export corrections or the pinned renderer change.
-pub const EXPORT_POLICY: &str = "rust-effective-svg-v9-background-linkage";
+pub const EXPORT_POLICY: &str = "rust-effective-svg-v12-instance-script-state";
 pub const BOUNDS_POLICY: &str = "resvg-0.48.1-aqw-v1-cells-v2-visibility";
 // Final-container changes must not invalidate immutable intermediate caches.
 pub const FINALIZE_POLICY: &str = "webp-adjacent-runs-v1";
@@ -96,6 +96,16 @@ pub struct SymbolRequest {
     pub frame: usize,
     #[serde(default = "one")]
     pub root_timeline_frames: usize,
+    #[serde(default)]
+    pub click: bool,
+    #[serde(default)]
+    pub ancestor_names: Vec<String>,
+    #[serde(default = "default_capture_end")]
+    pub capture_end: usize,
+}
+
+fn default_capture_end() -> usize {
+    2008
 }
 
 fn one() -> usize {
@@ -130,6 +140,10 @@ pub struct SourceManifest {
     pub placement_colors: BTreeMap<String, Value>,
     #[serde(default)]
     pub timeline_decisions: Vec<crate::timeline::Decision>,
+    #[serde(default)]
+    pub host_visibility: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub timeline_warnings: Vec<String>,
 }
 
 impl SourceManifest {

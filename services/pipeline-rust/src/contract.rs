@@ -44,14 +44,30 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
     ensure!(value["schema_version"] == 1, "unsupported request schema");
     if !value["source_job_id"].is_null() {
         let raw = string(&value, "source_job_id")?;
-        ensure!(uuid::Uuid::parse_str(raw)?.to_string() == raw, "invalid source_job_id");
+        ensure!(
+            uuid::Uuid::parse_str(raw)?.to_string() == raw,
+            "invalid source_job_id"
+        );
     }
     if !value["appearance_overrides"].is_null() {
-        let fields = value["appearance_overrides"].as_object().context("invalid appearance_overrides")?;
-        ensure!(fields.len() <= 128 && serde_json::to_vec(fields)?.len() <= 32768, "appearance_overrides too large");
+        let fields = value["appearance_overrides"]
+            .as_object()
+            .context("invalid appearance_overrides")?;
+        ensure!(
+            fields.len() <= 128 && serde_json::to_vec(fields)?.len() <= 32768,
+            "appearance_overrides too large"
+        );
         for (key, value) in fields {
-            ensure!(!key.is_empty() && key.len() <= 64 && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'), "invalid appearance override key");
-            ensure!(value.as_str().is_some_and(|v| v.len() <= 2048), "invalid appearance override value");
+            ensure!(
+                !key.is_empty()
+                    && key.len() <= 64
+                    && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
+                "invalid appearance override key"
+            );
+            ensure!(
+                value.as_str().is_some_and(|v| v.len() <= 2048),
+                "invalid appearance override value"
+            );
         }
     }
     let raw = string(&value, "job_id")?;
@@ -89,6 +105,7 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
             "username",
             "base_items",
             "show_hidden",
+            "click_assets",
             "facing",
             "override",
             "complete_loop",
@@ -129,7 +146,7 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
                 .or_insert(default.clone());
         }
     }
-    let base = json!({"base_items":false,"show_hidden":false,"facing":"right","override":null,"complete_loop":true,"max_frames":360,"subframe_start":1,"zoom":2.0,"raster_size":2048,"output_size":render["raster_size"].as_u64().unwrap_or(2048),"padding":0,"output_format":"webp","rgba_compression":"zstd","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":null,"raster_backend":"resvg"});
+    let base = json!({"base_items":false,"show_hidden":false,"click_assets":[],"facing":"right","override":null,"complete_loop":true,"max_frames":360,"subframe_start":1,"zoom":2.0,"raster_size":2048,"output_size":render["raster_size"].as_u64().unwrap_or(2048),"padding":0,"output_format":"webp","rgba_compression":"zstd","avif_quality":70,"avif_speed":8,"webp_quality":85.0,"webp_method":4,"webp_lossless":null,"raster_backend":"resvg"});
     for (key, default) in base.as_object().unwrap() {
         render
             .as_object_mut()
@@ -137,6 +154,23 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
             .entry(key.clone())
             .or_insert(default.clone());
     }
+    let clicks = render["click_assets"]
+        .as_array()
+        .context("click_assets must be an array")?;
+    ensure!(
+        clicks.len() <= 8
+            && clicks.iter().all(|v| matches!(
+                v.as_str(),
+                Some(
+                    "armor" | "weapon" | "cape" | "helm" | "pet" | "ground" | "hair" | "background"
+                )
+            )),
+        "invalid click asset"
+    );
+    let mut clicks: Vec<_> = clicks.iter().filter_map(Value::as_str).collect();
+    clicks.sort();
+    clicks.dedup();
+    render["click_assets"] = json!(clicks);
     let username = string(render, "username")?
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -149,9 +183,15 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
         "invalid username"
     );
     render["username"] = username.clone().into();
-    if render["view"].is_null() { render["view"] = "character".into(); }
-    ensure!(matches!(render["view"].as_str(), Some("character" | "charpage")), "invalid render view");
-    render["presentation"] = crate::presentation::normalize(render["view"].as_str().unwrap(), &render["presentation"])?;
+    if render["view"].is_null() {
+        render["view"] = "character".into();
+    }
+    ensure!(
+        matches!(render["view"].as_str(), Some("character" | "charpage")),
+        "invalid render view"
+    );
+    render["presentation"] =
+        crate::presentation::normalize(render["view"].as_str().unwrap(), &render["presentation"])?;
     let facing = string(render, "facing")?.to_lowercase();
     ensure!(
         matches!(facing.as_str(), "left" | "right"),
@@ -178,8 +218,14 @@ pub fn request(mut value: Value, defaults: Option<&Value>) -> Result<Value> {
     );
     integer(render, "max_frames", 1, 2000)?;
     integer(render, "subframe_start", 1, 10000)?;
-    ensure!(matches!(render["output_format"].as_str(), Some("webp" | "avif")), "invalid output_format");
-    ensure!(matches!(render["rgba_compression"].as_str(), Some("none" | "zstd")), "invalid rgba_compression");
+    ensure!(
+        matches!(render["output_format"].as_str(), Some("webp" | "avif")),
+        "invalid output_format"
+    );
+    ensure!(
+        matches!(render["rgba_compression"].as_str(), Some("none" | "zstd")),
+        "invalid rgba_compression"
+    );
     integer(render, "avif_quality", 0, 100)?;
     integer(render, "avif_speed", 0, 10)?;
     integer(render, "webp_method", 0, 6)?;
@@ -270,6 +316,23 @@ mod tests {
     use super::*;
     fn sample() -> Value {
         json!({"schema_version":1,"job_id":"45cfafbd-5089-4f6d-850a-caa798ec1fcb","created_at":"2026-09-05T01:02:03Z","discord":{"user_id":"1","channel_id":"2"},"render":{"username":"Test"}})
+    }
+    #[test]
+    fn click_input_is_canonical_and_affects_render_identity() {
+        let plain = request(sample(), None).unwrap();
+        let mut clicked = sample();
+        clicked["render"]["click_assets"] = json!(["weapon", "pet", "pet"]);
+        let clicked = request(clicked, None).unwrap();
+        assert_eq!(clicked["render"]["click_assets"], json!(["pet", "weapon"]));
+        assert_ne!(
+            crate::digest(&plain["render"]).unwrap(),
+            crate::digest(&clicked["render"]).unwrap()
+        );
+        for invalid in [json!(true), json!("pet"), json!(["shop"]), json!([null])] {
+            let mut input = sample();
+            input["render"]["click_assets"] = invalid;
+            assert!(request(input, None).is_err());
+        }
     }
     #[test]
     fn username_accepts_leading_underscores_and_hyphens() {

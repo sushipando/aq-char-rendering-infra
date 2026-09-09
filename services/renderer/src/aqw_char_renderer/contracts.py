@@ -222,6 +222,7 @@ class RenderSettings:
     username: str
     base_items: bool = False
     show_hidden: bool = False
+    click_assets: tuple[str, ...] = ()
     facing: str = "right"
     override: ItemOverride | None = None
     complete_loop: bool = True
@@ -252,6 +253,7 @@ class RenderSettings:
             "username",
             "base_items",
             "show_hidden",
+            "click_assets",
             "facing",
             "override",
             "complete_loop",
@@ -303,7 +305,13 @@ class RenderSettings:
         padding = _integer(payload.get("padding", 0), "render.padding", 0, 1023)
         if padding * 2 >= output_size:
             raise ContractError("render.padding must be less than half render.output_size")
+        clicks = payload.get("click_assets", [])
+        if not isinstance(clicks, (list, tuple)) or len(clicks) > 8 or any(
+            not isinstance(c, str) or c not in {"armor", "weapon", "cape", "helm", "pet", "ground", "hair", "background"} for c in clicks
+        ):
+            raise ContractError("render.click_assets must contain asset slot names")
         return cls(
+            click_assets=tuple(sorted(set(clicks))),
             username=normalize_username(payload.get("username")),
             base_items=_boolean(payload.get("base_items", False), "render.base_items"),
             show_hidden=_boolean(payload.get("show_hidden", False), "render.show_hidden"),

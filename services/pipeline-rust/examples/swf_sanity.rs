@@ -1,5 +1,5 @@
 //! One-file subprocess used by scripts/sanity_check_swfs.py. No AWS clients.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use aqw_render_pipeline::{
     background,
     export::{Ffdec, ScriptMetadata},
@@ -17,26 +17,44 @@ async fn check(path: &Path, jar: Option<PathBuf>) -> Result<Value> {
     let is_background = path
         .file_name()
         .and_then(|p| p.to_str())
-        .is_some_and(|p| p.starts_with("cp-bg"));
+        .is_some_and(|p| p.starts_with("cp-"));
     let (bytes, bg_root) = if is_background {
         let (b, id, _) = background::wrap(&original)?;
         (b, Some(id))
     } else {
         (original, None)
     };
+    let (bytes, stage_root) = if bg_root.is_none() {
+        if let Some((b, id)) = aqw_render_pipeline::stage_asset::prepare(&bytes)? {
+            (b, Some(id))
+        } else {
+            (bytes, None)
+        }
+    } else {
+        (bytes, None)
+    };
     let swf = Swf::parse(&bytes)?;
     swf.placement_colors()?;
-    // Inspect every sprite, including unexported nested clips.
-    for id in swf.sprites.keys() {
-        swf.timeline(*id).with_context(|| format!("sprite {id}"))?;
-    }
+    // Zero-frame definitions are not failures unless the selected display tree
+    // reaches them. Keep structural inventory separate from playback validation.
+    let zero_frames: Vec<_> = swf
+        .sprites
+        .iter()
+        .filter(|(_, p)| p.get(2..4) == Some(&[0, 0]))
+        .map(|(id, _)| *id)
+        .collect();
     let mut result = json!({"status":"ok","sprites":swf.sprites.len(),"symbols":swf.symbols.len(),"scripts_checked":false});
+    result["zero_frame_sprites"] = json!(zero_frames);
+    result["stage_root"] = json!(stage_root);
     let Some(jar) = jar else {
         return Ok(result);
     };
     let temp = tempfile::tempdir()?;
     let source = temp.path().join("source.swf");
-    std::fs::write(&source, aqw_render_pipeline::swf::repair_missing_end(&bytes)?)?;
+    std::fs::write(
+        &source,
+        aqw_render_pipeline::swf::repair_missing_end(&bytes)?,
+    )?;
     let output = temp.path().join("scripts");
     Ffdec {
         jar,
@@ -72,7 +90,9 @@ async fn check(path: &Path, jar: Option<PathBuf>) -> Result<Value> {
             }
         }
     }
-    let roots = if let Some(id) = bg_root {
+    let roots = if let Some(id) = stage_root {
+        vec![(id, aqw_render_pipeline::stage_asset::CLASS.into())]
+    } else if let Some(id) = bg_root {
         vec![(id, "CharpageBackgroundStage".to_string())]
     } else {
         swf.symbols
@@ -82,8 +102,16 @@ async fn check(path: &Path, jar: Option<PathBuf>) -> Result<Value> {
             .collect()
     };
     let mut timeline_errors = Vec::new();
+    let mut successes = Vec::new();
+    let mut script_warnings = Vec::new();
     for (id, name) in &roots {
-        let (frame, frames) = swf.timeline(*id)?;
+        let (frame, frames) = match swf.timeline(*id) {
+            Ok(v) => v,
+            Err(e) => {
+                timeline_errors.push(json!({"id":id,"class":name,"error":format!("{e:#}")}));
+                continue;
+            }
+        };
         let request = SymbolRequest {
             key: if bg_root.is_some() {
                 background::KEY.into()
@@ -94,9 +122,28 @@ async fn check(path: &Path, jar: Option<PathBuf>) -> Result<Value> {
             character_id: *id,
             frame,
             root_timeline_frames: frames,
+            click: false,
+            ancestor_names: vec![
+                if name.ends_with("Head") {
+                    "head"
+                } else {
+                    "probe"
+                }
+                .into(),
+                "mcChar".into(),
+                "stage".into(),
+            ],
+            capture_end: 2008,
         };
-        if let Err(e) = metadata.normalize(&bytes, &swf, &[request]) {
-            timeline_errors.push(json!({"id":id,"class":name,"error":format!("{e:#}")}));
+        match metadata.normalize(&bytes, &swf, &[request]) {
+            Ok(normalized) => {
+                successes.push(json!({"id":id,"class":name}));
+                if !normalized.warnings.is_empty() {
+                    script_warnings
+                        .push(json!({"id":id,"class":name,"warnings":normalized.warnings}));
+                }
+            }
+            Err(e) => timeline_errors.push(json!({"id":id,"class":name,"error":format!("{e:#}")})),
         }
     }
     result["scripts_checked"] = json!(true);
@@ -104,6 +151,8 @@ async fn check(path: &Path, jar: Option<PathBuf>) -> Result<Value> {
     result["parser_errors"] = json!(errors);
     result["timeline_roots_checked"] = json!(roots.len());
     result["timeline_errors"] = json!(timeline_errors);
+    result["timeline_roots_passed"] = json!(successes);
+    result["script_warnings"] = json!(script_warnings);
     result["status"] = json!(if !errors.is_empty() {
         "parser_failed"
     } else if !timeline_errors.is_empty() {

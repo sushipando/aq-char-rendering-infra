@@ -438,3 +438,19 @@ def test_border_fade_and_hex_color_normalization():
     for color in ("red", "#123", "#11223344", "##112233", 123, "#GG0000"):
         with pytest.raises(ContractError):
             normalize_presentation("charpage", {"border_color": color})
+
+
+@pytest.mark.parametrize("clicks", [True, "pet", ["shop"], [None]])
+def test_render_settings_reject_invalid_click_slots(clicks):
+    from aqw_char_renderer.contracts import RenderSettings
+    with pytest.raises(ContractError):
+        RenderSettings.from_dict({"username": "Test", "click_assets": clicks})
+
+
+def test_render_settings_preserve_canonical_click_slots():
+    from aqw_char_renderer.contracts import RenderSettings
+    plain = RenderSettings.from_dict({"username": "Test"})
+    clicked = RenderSettings.from_dict({"username": "Test", "click_assets": ["weapon", "pet", "pet"]})
+    assert plain.click_assets == ()
+    assert clicked.click_assets == ("pet", "weapon")
+    assert plain.to_dict() != clicked.to_dict()

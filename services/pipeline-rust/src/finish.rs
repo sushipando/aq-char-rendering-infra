@@ -160,7 +160,7 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
                     .all(|hash| results.contains_key(hash)),
                 "missing symbol bounds"
             );
-            parts.insert(key.clone(),json!({"source_idx":index,"root_class":symbol.request.class_name,"character_id":symbol.request.character_id,"frame_count":symbol.schedule.len(),"root_timeline_frames":symbol.request.root_timeline_frames,"settled_stop_frame":symbol.settled_stop_frame,"color_rules":source.color_rules,"hand_visibility":source.hand_visibility,"placement_colors":source.placement_colors}));
+            parts.insert(key.clone(),json!({"source_idx":index,"root_class":symbol.request.class_name,"character_id":symbol.request.character_id,"frame_count":symbol.schedule.len(),"root_timeline_frames":symbol.request.root_timeline_frames,"settled_stop_frame":symbol.settled_stop_frame,"color_rules":source.color_rules,"hand_visibility":source.hand_visibility,"host_visibility":source.host_visibility,"timeline_warnings":source.timeline_warnings,"placement_colors":source.placement_colors}));
             symbols.insert(key, symbol);
         }
     }
@@ -227,8 +227,9 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         }
     }
     if symbols.contains_key(crate::background::KEY) {
-        item_loop = item_loop.zip(prepared["background_period"].as_u64().map(|n| n as usize))
-            .and_then(|(a,b)| geometry::lcm(a,b));
+        item_loop = item_loop
+            .zip(prepared["background_period"].as_u64().map(|n| n as usize))
+            .and_then(|(a, b)| geometry::lcm(a, b));
     }
     let detected = item_loop.zip(blink).and_then(|(a, b)| {
         if a > 0 && b > 0 {
@@ -246,7 +247,8 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         1
     };
     let count = natural_count.min(config.component_frame_cap);
-    let loop_status = crate::metadata::loop_status(count, item_loop, blink, ground.values().copied());
+    let loop_status =
+        crate::metadata::loop_status(count, item_loop, blink, ground.values().copied());
     ensure!(count > 0, "empty animation");
     let select = |key: &str, index: usize| -> Result<usize> {
         let source = if let Some(span) = ground.get(key) {
@@ -270,6 +272,13 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
         string(&prepared, "weapon_type")?,
         string(settings, "facing")?,
     );
+    layers.retain(|layer| {
+        !parts.values().any(|part| {
+            part["host_visibility"][&layer.name] == false
+                || (matches!(layer.name.as_str(), "head" | "hair" | "helm")
+                    && part["host_visibility"]["head"] == false)
+        })
+    });
     let mut tight = None;
     for layer in &layers {
         for index in 0..count {
@@ -288,12 +297,32 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     let padding = settings["padding"].as_u64().context("missing padding")?;
     let units = w.max(h) / (output - 2 * padding) as f64;
     let margin = padding as f64 * units;
-    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
-    let viewbox = crate::presentation::viewbox(&layout, [x - margin, y - margin, w + 2.0 * margin, h + 2.0 * margin]);
+    let layout = crate::presentation::normalize(
+        settings["view"].as_str().unwrap_or("character"),
+        &settings["presentation"],
+    )?;
+    let viewbox = crate::presentation::viewbox(
+        &layout,
+        [x - margin, y - margin, w + 2.0 * margin, h + 2.0 * margin],
+    );
     if symbols.contains_key(crate::background::KEY) {
         let scale = (viewbox[2] / 550.0).max(viewbox[3] / 350.0);
-        layers.insert(0, geometry::Layer { name:crate::background::KEY.into(), symbol_key:crate::background::KEY.into(), darken:false,
-            matrix:[scale,0.0,0.0,scale,viewbox[0]+(viewbox[2]-550.0*scale)/2.0+5.0*scale,viewbox[1]+(viewbox[3]-350.0*scale)/2.0] });
+        layers.insert(
+            0,
+            geometry::Layer {
+                name: crate::background::KEY.into(),
+                symbol_key: crate::background::KEY.into(),
+                darken: false,
+                matrix: [
+                    scale,
+                    0.0,
+                    0.0,
+                    scale,
+                    viewbox[0] + (viewbox[2] - 550.0 * scale) / 2.0 + 5.0 * scale,
+                    viewbox[1] + (viewbox[3] - 350.0 * scale) / 2.0,
+                ],
+            },
+        );
     }
     let frame_rate = if let Some(rate) = prepared["frame_rate"].as_f64() {
         rate
@@ -347,6 +376,15 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     }
     let compositions = component_compositions(&frames)?;
     let mut warnings = prepared["warnings"].as_array().cloned().unwrap_or_default();
+    for part in parts.values() {
+        if let Some(values) = part["timeline_warnings"].as_array() {
+            for warning in values {
+                if !warnings.contains(warning) {
+                    warnings.push(warning.clone());
+                }
+            }
+        }
+    }
     if count < natural_count {
         warnings
             .push(format!("Component raster cap limits this job to {count} output frames").into());
@@ -374,9 +412,27 @@ pub async fn finish(store: &dyn Store, config: &Config, event: &Value) -> Result
     }
     let presentation_layers = if layout["background"] == true || layout["info"] == true {
         let raster = settings["raster_size"].as_u64().unwrap();
-        let canvas = crate::presentation::canvas(viewbox, raster as u32, output as u32, raster <= output * 2);
-        Some(crate::charpage::prepare(store, &config.work_bucket, job, &prepared["fields"], settings, &layout, canvas).await?)
-    } else { None };
+        let canvas = crate::presentation::canvas(
+            viewbox,
+            raster as u32,
+            output as u32,
+            raster <= output * 2,
+        );
+        Some(
+            crate::charpage::prepare(
+                store,
+                &config.work_bucket,
+                job,
+                &prepared["fields"],
+                settings,
+                &layout,
+                canvas,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let manifest_key = format!("jobs/{job}/prepare/manifest.json");
     let batches = batches(count, config.frames_per_lambda);
     let compositions_per_batch = compositions

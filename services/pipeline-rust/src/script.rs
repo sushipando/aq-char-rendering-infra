@@ -41,6 +41,12 @@ pub struct Class {
     pub animate_layer: Option<AnimateLayer>,
     #[serde(default)]
     pub hidden_in_hand: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<crate::script_eval::RuntimeClass>,
+    #[serde(default)]
+    pub synchronized_children: Vec<String>,
+    #[serde(default)]
+    pub graphic_children: Vec<String>,
     pub frames: BTreeMap<usize, Program>,
     pub constructor: Program,
     pub unsupported: Option<String>,
@@ -52,18 +58,32 @@ pub struct Class {
 pub enum AnimateLayer {
     Plain,
     Properties,
-    Controller { pair: Option<(String, String)> },
+    Controller {
+        pair: Option<(String, String)>,
+    },
+    Pairs {
+        pairs: Vec<(String, String)>,
+        #[serde(default)]
+        graphics: Vec<String>,
+        #[serde(default)]
+        frame_limit: Option<usize>,
+        #[serde(default)]
+        masks: BTreeMap<String, String>,
+    },
+    Graphic {
+        children: Vec<String>,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Token {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Token {
     Word(String),
     Identifier(String),
     String(String),
     Punct(char),
 }
 impl Token {
-    fn word(&self) -> Option<&str> {
+    pub(crate) fn word(&self) -> Option<&str> {
         if let Self::Word(s) | Self::Identifier(s) = self {
             Some(s)
         } else {
@@ -72,7 +92,7 @@ impl Token {
     }
 }
 
-fn lex(text: &str) -> Result<Vec<Token>> {
+pub(crate) fn lex(text: &str) -> Result<Vec<Token>> {
     ensure!(
         text.len() <= 4 * 1024 * 1024,
         "ActionScript file exceeds parser limit"
@@ -185,7 +205,7 @@ pub(crate) fn inert_background_avm1(text: &str) -> Result<bool> {
     }))
 }
 
-fn close(tokens: &[Token], start: usize, left: char, right: char) -> Result<usize> {
+pub(crate) fn close(tokens: &[Token], start: usize, left: char, right: char) -> Result<usize> {
     ensure!(
         tokens.get(start) == Some(&Token::Punct(left)),
         "missing delimiter"
@@ -362,18 +382,163 @@ fn bank_pattern_matches(actual: &[Token], pattern: &str) -> bool {
     a == actual.len()
 }
 
-fn bank_idle_setup(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> bool {
-    if !bank_pattern_matches(body, BANK_IDLE)
-        || !methods.get("initPet").is_some_and(|helper| bank_pattern_matches(helper, BANK_INIT)) {
+const CAPE_BANK_IDLE: &str = "if(!this.capeInit){this.capeInit=true;this.initCape();}this.stop();this.capeInit=false;this.rootClass=MovieClip(stage.getChildAt(0));";
+
+fn bank_setup_matches(
+    body: &[Token],
+    methods: &BTreeMap<String, Vec<Token>>,
+    helper_name: &str,
+    idle: &str,
+    helper_pattern: &str,
+    allow_empty: bool,
+) -> bool {
+    let Some(helper) = methods.get(helper_name) else {
+        return false;
+    };
+    if !bank_pattern_matches(body, idle)
+        || !(allow_empty && helper.is_empty() || bank_pattern_matches(helper, helper_pattern))
+    {
         return false;
     }
-    // Even an otherwise identical property expression may execute an accessor.
-    // Also reject locally shadowed built-ins used by this recognized idiom.
-    let has_accessor = body.iter().chain(methods["initPet"].iter())
+    // Property accessors or locally shadowed host built-ins can execute code.
+    !body
+        .iter()
+        .chain(helper.iter())
         .filter_map(Token::word)
-        .any(|name| methods.contains_key(&format!("get:{name}"))
-            || methods.contains_key(&format!("set:{name}")));
-    !has_accessor && !["MovieClip", "stop"].iter().any(|name| methods.contains_key(*name))
+        .any(|name| {
+            methods.contains_key(&format!("get:{name}"))
+                || methods.contains_key(&format!("set:{name}"))
+        })
+        && !["MovieClip", "stage", "stop"]
+            .iter()
+            .any(|name| methods.contains_key(*name))
+}
+
+fn bank_idle_setup(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> bool {
+    bank_setup_matches(body, methods, "initPet", BANK_IDLE, BANK_INIT, true)
+}
+
+fn bank_cape_idle_setup(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> bool {
+    if !methods.contains_key("initCape") {
+        return false;
+    }
+    let helper = BANK_INIT.replace(
+        "MovieClip(parent).pAV",
+        "MovieClip(parent.parent.parent).pAV",
+    );
+    bank_setup_matches(body, methods, "initCape", CAPE_BANK_IDLE, &helper, false)
+}
+
+fn bank_child_idle_setup(
+    body: &[Token],
+    methods: &BTreeMap<String, Vec<Token>>,
+) -> Option<Command> {
+    if !methods.contains_key("initPet") {
+        return None;
+    }
+    let end = body.iter().position(|t| *t == Token::Punct(';'))?;
+    if !bank_idle_setup(&body[end + 1..], methods) {
+        return None;
+    }
+    let (path, args) = call(&body[..end]).ok()?;
+    let (child, control) = match path.as_slice() {
+        ["this", child, control] | [child, control] => (*child, *control),
+        _ => return None,
+    };
+    if !matches!(control, "gotoAndPlay" | "gotoAndStop")
+        || methods.contains_key(&format!("get:{child}"))
+        || methods.contains_key(&format!("set:{child}"))
+    {
+        return None;
+    }
+    let [Token::String(label)] = args else {
+        return None;
+    };
+    if !label.eq_ignore_ascii_case("idle") {
+        return None;
+    }
+    Some(Command {
+        child: Some(child.into()),
+        action: Action::Goto {
+            target: Target::Label(label.clone()),
+            play: control == "gotoAndPlay",
+        },
+    })
+}
+
+// There is no game attack dispatcher in the rendered idle view. Registering
+// with that optional host does not trigger an attack; preserve the final stop.
+fn idle_attack_registration(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> bool {
+    const SETUP: &str = r#"
+        this._stage = stage ? MovieClip(stage.getChildAt(0)) : null;
+        if(Boolean(this._stage) && Boolean(this._stage.registerAttackFrame)) {
+            this._stage.registerAttackFrame(this);
+        }
+        this.stop();
+    "#;
+    body.iter().any(|t| t.word() == Some("registerAttackFrame"))
+        && bank_pattern_matches(body, SETUP)
+        && ![
+            "_stage",
+            "stage",
+            "MovieClip",
+            "Boolean",
+            "registerAttackFrame",
+            "stop",
+        ]
+        .iter()
+        .any(|name| {
+            methods.contains_key(*name)
+                || methods.contains_key(&format!("get:{name}"))
+                || methods.contains_key(&format!("set:{name}"))
+        })
+}
+
+// Export policy: choose phase 1 for a once-only randomized looping effect.
+// Compare the complete class, including an undefined flag and the sole frame-1
+// registration. This rules out flag resets, extra controls and custom helpers.
+fn deterministic_loop_phase(
+    tokens: &[Token],
+    class_at: usize,
+    class_name: &str,
+    methods: &BTreeMap<String, Vec<Token>>,
+) -> Option<String> {
+    if methods.len() != 2 {
+        return None;
+    }
+    let callback = methods.keys().find(|name| name.as_str() != class_name)?;
+    let field=tokens.windows(6).find_map(|w| matches!(w,
+        [Token::Word(public),Token::Word(var),Token::Word(_),Token::Punct(':'),Token::Punct('*'),Token::Punct(';')]
+        if public=="public" && var=="var").then(||w[2].word()).flatten())?;
+    // Template insertion is only for ordinary identifier spellings. Quoted or
+    // punctuated names remain supported by the normal parser, not this policy.
+    if [class_name, callback.as_str(), field].iter().any(|name| {
+        !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    }) {
+        return None;
+    }
+    if [class_name, callback.as_str(), field].iter().any(|name| {
+        matches!(
+            *name,
+            "Math" | "totalFrames" | "gotoAndPlay" | "undefined" | "play" | "addFrameScript"
+        )
+    }) {
+        return None;
+    }
+    let open = (class_at + 2..tokens.len()).find(|i| tokens[*i] == Token::Punct('{'))?;
+    let end = close(tokens, open, '{', '}').ok()?;
+    let pattern = format!(
+        r#"{class_name} extends MovieClip {{
+        public var {field}:*;
+        public function {class_name}(){{super(); addFrameScript(0,this.{callback});}}
+        internal function {callback}():*{{
+            if(this.{field} == undefined){{this.{field}=true; this.gotoAndPlay(Math.ceil(Math.random()*this.totalFrames));}}
+        }}
+    }}"#
+    );
+    bank_pattern_matches(&tokens[class_at + 1..=end], &pattern).then(|| callback.clone())
 }
 
 fn compile(
@@ -382,9 +547,33 @@ fn compile(
     active: &mut BTreeSet<String>,
 ) -> Result<Vec<Command>> {
     ensure!(active.len() <= 32, "frame helper recursion limit exceeded");
-    if bank_idle_setup(body, methods) {
-        return Ok(vec![Command { child: None, action: Action::Stop }]);
+    if idle_attack_registration(body, methods) {
+        return Ok(vec![Command {
+            child: None,
+            action: Action::Stop,
+        }]);
     }
+    if let Some(child) = bank_child_idle_setup(body, methods) {
+        return Ok(vec![
+            child,
+            Command {
+                child: None,
+                action: Action::Stop,
+            },
+        ]);
+    }
+    if bank_idle_setup(body, methods) || bank_cape_idle_setup(body, methods) {
+        return Ok(vec![Command {
+            child: None,
+            action: Action::Stop,
+        }]);
+    }
+    ensure!(
+        !body.iter().any(|t| t
+            .word()
+            .is_some_and(|w| matches!(w, "visible" | "copyAvatarMC"))),
+        "visual script needs instance evaluation"
+    );
     let cleaned = without_listener_setup(body)?;
     let body = cleaned.as_slice();
     let relevant = body.iter().any(|t| {
@@ -419,7 +608,9 @@ fn compile(
         .split(|t| *t == Token::Punct(';'))
         .filter(|s| !s.is_empty())
     {
-        if click_registration(stmt) { continue; }
+        if click_registration(stmt) {
+            continue;
+        }
         let relevant = stmt.iter().any(|t| {
             t.word()
                 .is_some_and(|w| control(w) || methods.contains_key(w))
@@ -545,35 +736,62 @@ fn layer_shape(tokens: &[Token]) -> Option<(Vec<Token>, Option<(String, String)>
 }
 
 fn recognize_animate_layer(tokens: &[Token]) -> Option<AnimateLayer> {
-    let (actual,pair) = layer_shape(tokens)?;
+    let (actual, pair) = layer_shape(tokens)?;
+    static LEGACY: std::sync::OnceLock<Vec<Token>> = std::sync::OnceLock::new();
+    let legacy = LEGACY.get_or_init(|| {
+        layer_shape(&lex(include_str!("../assets/animate/layer-runtime-legacy.as")).unwrap())
+            .unwrap()
+            .0
+    });
+    if &actual == legacy {
+        return Some(AnimateLayer::Properties);
+    }
     static SHAPES: std::sync::OnceLock<Vec<Vec<Token>>> = std::sync::OnceLock::new();
-    let shapes = SHAPES.get_or_init(|| [
-        include_str!("../assets/animate/layer-runtime.as"),
-        include_str!("../assets/animate/controller.as"),
-        include_str!("../assets/animate/controller-flat-layer.as"),
-        "class C extends MovieClip {public function C(){super();}}",
-    ].iter().map(|s|layer_shape(&lex(s).expect("Animate template syntax")).expect("Animate template shape").0).collect());
-    for (index,expected) in shapes.iter().enumerate() {
-        if &actual == expected {return Some(match index {
-            0 => AnimateLayer::Properties,
-            1 => AnimateLayer::Controller{pair:None},
-            2 => AnimateLayer::Controller{pair},
-            _ => AnimateLayer::Plain,
-        });}
+    let shapes = SHAPES.get_or_init(|| {
+        [
+            include_str!("../assets/animate/layer-runtime.as"),
+            include_str!("../assets/animate/controller.as"),
+            include_str!("../assets/animate/controller-flat-layer.as"),
+            "class C extends MovieClip {public function C(){super();}}",
+        ]
+        .iter()
+        .map(|s| {
+            layer_shape(&lex(s).expect("Animate template syntax"))
+                .expect("Animate template shape")
+                .0
+        })
+        .collect()
+    });
+    for (index, expected) in shapes.iter().enumerate() {
+        if &actual == expected {
+            return Some(match index {
+                0 => AnimateLayer::Properties,
+                1 => AnimateLayer::Controller { pair: None },
+                2 => AnimateLayer::Controller { pair },
+                _ => AnimateLayer::Plain,
+            });
+        }
     }
     None
 }
 
 pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
     let mut tokens = lex(text)?;
-    let Some(class_at) = tokens.iter().position(|t| *t == Token::Word("class".into())) else {
+    let Some(class_at) = tokens
+        .iter()
+        .position(|t| *t == Token::Word("class".into()))
+    else {
         return Ok(None);
     };
-    let package_at = tokens.iter().position(|t| *t == Token::Word("package".into()));
+    let package_at = tokens
+        .iter()
+        .position(|t| *t == Token::Word("package".into()));
     // Once declaration keywords are located, quoted and unquoted references
     // must resolve to the same underlying identifier throughout compilation.
     for token in &mut tokens {
-        if let Token::Identifier(name) = token { *token = Token::Word(std::mem::take(name)); }
+        if let Token::Identifier(name) = token {
+            *token = Token::Word(std::mem::take(name));
+        }
     }
     let class_name = tokens
         .get(class_at + 1)
@@ -596,23 +814,49 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
     }
     .to_lowercase();
     let mut methods = BTreeMap::new();
+    let mut runtime = crate::script_eval::RuntimeClass::new(class_name);
     let mut at = class_at;
     while at < tokens.len() {
         if tokens[at].word() != Some("function") {
+            if matches!(tokens[at].word(), Some("var" | "const")) {
+                if let Some(end) = tokens[at..].iter().position(|t| *t == Token::Punct(';')) {
+                    runtime.fields.push(tokens[at + 1..at + end].to_vec());
+                    at += end + 1;
+                    continue;
+                }
+            }
             at += 1;
             continue;
         }
         let Some(method) = tokens.get(at + 1).and_then(Token::word) else {
             bail!("missing function name");
         };
-        let accessor = matches!(method, "get" | "set") && tokens.get(at + 2).and_then(Token::word).is_some();
+        let accessor =
+            matches!(method, "get" | "set") && tokens.get(at + 2).and_then(Token::word).is_some();
         let method_key = if accessor {
             format!("{method}:{}", tokens[at + 2].word().unwrap())
-        } else { method.to_owned() };
+        } else {
+            method.to_owned()
+        };
         let open = (at + 2..tokens.len())
             .find(|i| tokens[*i] == Token::Punct('{'))
             .context("missing function body")?;
         let end = close(&tokens, open, '{', '}')?;
+        let args_open = (at + 2..open)
+            .find(|i| tokens[*i] == Token::Punct('('))
+            .context("missing method arguments")?;
+        let args_end = close(&tokens, args_open, '(', ')')?;
+        runtime.methods.insert(
+            method_key.clone(),
+            crate::script_eval::Method {
+                parameters: tokens[args_open + 1..args_end]
+                    .split(|t| *t == Token::Punct(','))
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_vec())
+                    .collect(),
+                body: tokens[open + 1..end].to_vec(),
+            },
+        );
         ensure!(
             methods
                 .insert(method_key.clone(), tokens[open + 1..end].to_vec())
@@ -622,12 +866,19 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
         if accessor {
             // Property evaluation is not a helper call. Reject a reachable use
             // rather than silently discarding possible getter/setter effects.
-            methods.entry(tokens[at + 2].word().unwrap().to_owned())
+            methods
+                .entry(tokens[at + 2].word().unwrap().to_owned())
                 .or_insert_with(|| vec![Token::Word("throw".into()), Token::Word("stop".into())]);
         }
         at = end + 1;
     }
-    let mut class = Class { animate_layer: recognize_animate_layer(&tokens), ..Class::default() };
+    if let Some(callback) = deterministic_loop_phase(&tokens, class_at, class_name, &methods) {
+        methods.insert(callback, lex("play();")?);
+    }
+    let mut class = Class {
+        animate_layer: recognize_animate_layer(&tokens),
+        ..Class::default()
+    };
     let registrations = (|| -> Result<()> {
         let constructor = methods.get(class_name).map(Vec::as_slice).unwrap_or(&[]);
         let mut registrations = 0;
@@ -668,7 +919,10 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
                 let body = methods
                     .get(method)
                     .context("missing registered frame callback")?;
-                if frame == 1 { class.hidden_in_hand = hidden_in_hand(body); }
+                runtime.frames.insert(frame, method.clone());
+                if frame == 1 {
+                    class.hidden_in_hand = hidden_in_hand(body);
+                }
                 ensure!(
                     class
                         .frames
@@ -700,13 +954,173 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
             .collect();
         class.constructor = program(&filtered, &methods);
     }
-    if class.frames.len() != 1 || class.unsupported.is_some() { class.hidden_in_hand = None; }
+    if class.frames.len() != 1 || class.unsupported.is_some() {
+        class.hidden_in_hand = None;
+    }
+    if class.animate_layer.is_none() {
+        class.animate_layer = crate::animate::classify_generated(&runtime);
+    }
+    class.runtime = Some(runtime);
     Ok(Some((name, class)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn once_only_random_phase_keeps_looping_and_rejects_modified_classes() {
+        let source="class Flame extends MovieClip {public var started:*; public function Flame(){super(); addFrameScript(0,this.frame1);} internal function frame1():*{if(this.started==undefined){this.started=true; gotoAndPlay(Math.ceil(Math.random()*totalFrames));}}}";
+        let (_, class) = parse(source).unwrap().unwrap();
+        assert!(class.unsupported.is_none());
+        assert_eq!(
+            class.frames[&1].commands,
+            vec![Command {
+                child: None,
+                action: Action::Play
+            }]
+        );
+        for changed in [
+            source.replace("started:*;", "started:*=false;"),
+            source.replace("started=true", "started=false"),
+            source.replace("gotoAndPlay", "gotoAndStop"),
+            source.replace("Math.ceil", "Math.floor"),
+            source.replace("started", "Math"),
+            source.replace("this.started=true;", "this.started=true; stop();"),
+        ] {
+            let class = parse(&changed).unwrap().unwrap().1;
+            assert!(class.frames[&1].unsupported.is_some(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn attack_host_registration_preserves_idle_stop_only() {
+        let setup="this._stage=stage?MovieClip(stage.getChildAt(0)):null;if(Boolean(this._stage)&&Boolean(this._stage.registerAttackFrame)){this._stage.registerAttackFrame(this);}stop();";
+        let wrap = |body: &str| {
+            format!("class W {{function W(){{addFrameScript(0,this.frame1);}} function frame1(){{{body}}}}}")
+        };
+        let class = parse(&wrap(setup)).unwrap().unwrap().1;
+        assert_eq!(
+            class.frames[&1].commands,
+            vec![Command {
+                child: None,
+                action: Action::Stop
+            }]
+        );
+        for changed in [
+            setup.replace("stop();", "play();"),
+            setup.replace("registerAttackFrame", "doAnything"),
+            format!("{setup} gotoAndPlay(3);"),
+        ] {
+            assert!(parse(&wrap(&changed)).unwrap().unwrap().1.frames[&1]
+                .unsupported
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn bank_cape_setup_preserves_stop_and_rejects_side_effects() {
+        let helper = BANK_INIT.replace(
+            "MovieClip(parent).pAV",
+            "MovieClip(parent.parent.parent).pAV",
+        );
+        let source = |body: &str, init: &str| {
+            format!("class Cape {{function Cape(){{addFrameScript(0,this.frame1);}}function frame1(){{{body}}}function initCape(){{{init}}}}}")
+        };
+        for body in [
+            CAPE_BANK_IDLE.to_owned(),
+            CAPE_BANK_IDLE.replace("this.", ""),
+        ] {
+            let class = parse(&source(&body, &helper)).unwrap().unwrap().1;
+            assert_eq!(
+                class.frames[&1].commands,
+                vec![Command {
+                    child: None,
+                    action: Action::Stop
+                }]
+            );
+        }
+        for (body, init) in [
+            (format!("{CAPE_BANK_IDLE} visible=false;"), helper.clone()),
+            (
+                CAPE_BANK_IDLE.to_owned(),
+                helper.replace("buttonMode = true", "visible = false"),
+            ),
+            (
+                CAPE_BANK_IDLE.to_owned(),
+                helper.replace("catch(e:Error) {}", "catch(e:Error) {gotoAndPlay(2);}"),
+            ),
+        ] {
+            assert!(parse(&source(&body, &init)).unwrap().unwrap().1.frames[&1]
+                .unsupported
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn bank_child_idle_control_is_preserved_not_discarded() {
+        let source = |prefix: &str, extra: &str| {
+            format!("class Pet {{function Pet(){{addFrameScript(0,this.frame1);}}function frame1(){{{prefix}{BANK_IDLE}}}function initPet(){{{BANK_INIT}}}{extra}}}")
+        };
+        let class = parse(&source("this.CCPet.gotoAndPlay(\"Idle\");", ""))
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(
+            class.frames[&1].commands,
+            vec![
+                Command {
+                    child: Some("CCPet".into()),
+                    action: Action::Goto {
+                        target: Target::Label("Idle".into()),
+                        play: true
+                    }
+                },
+                Command {
+                    child: None,
+                    action: Action::Stop
+                }
+            ]
+        );
+        for (prefix, extra) in [
+            ("this.CCPet.gotoAndPlay(target);", ""),
+            ("this.CCPet.gotoAndPlay(\"Walk\");", ""),
+            (
+                "this.CCPet.gotoAndPlay(\"Idle\");this.other.gotoAndPlay(2);",
+                "",
+            ),
+            (
+                "this.CCPet.gotoAndPlay(\"Idle\");",
+                "function get CCPet(){gotoAndPlay(2);}",
+            ),
+        ] {
+            assert!(parse(&source(prefix, extra)).unwrap().unwrap().1.frames[&1]
+                .unsupported
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn empty_pet_initializer_cannot_hide_render_changes() {
+        let source="class Pet {function Pet(){addFrameScript(0,this.frame1);} function initPet(){} function frame1(){if(!petInit){petInit=true;initPet();}stop();}}";
+        assert_eq!(
+            parse(source).unwrap().unwrap().1.frames[&1].commands,
+            vec![Command {
+                child: None,
+                action: Action::Stop
+            }]
+        );
+        assert!(parse(&source.replace(
+            "function initPet(){}",
+            "function initPet(){gotoAndPlay(2);}"
+        ))
+        .unwrap()
+        .unwrap()
+        .1
+        .frames[&1]
+            .unsupported
+            .is_some());
+    }
+
     #[test]
     fn click_callback_is_not_executed_but_stop_is_preserved() {
         let source = |registration: &str| format!("class Button {{function Button(){{addFrameScript(0,this.frame1);}} function frame1(){{{registration}; stop();}} function onClick(){{MovieClip(parent).play();}}}}");
@@ -722,7 +1136,6 @@ mod tests {
             assert!(class.frames[&1].unsupported.is_some(), "{registration}");
         }
     }
-
 
     #[test]
     fn ffdec_identifiers_keep_constructor_and_callback_identity() {
@@ -825,34 +1238,72 @@ mod tests {
                 .unwrap().unwrap().1
         };
         for (body, helper) in [
-            (BANK_IDLE.replace("this.", ""), BANK_INIT.replace("this.", "")),
-            (BANK_IDLE.replace("this.petInit", "petInit"), BANK_INIT.replace("this.avatar", "avatar")),
+            (
+                BANK_IDLE.replace("this.", ""),
+                BANK_INIT.replace("this.", ""),
+            ),
+            (
+                BANK_IDLE.replace("this.petInit", "petInit"),
+                BANK_INIT.replace("this.avatar", "avatar"),
+            ),
         ] {
             let c = fixture(&body, &helper, "");
             assert!(c.frames[&8].unsupported.is_none());
-            assert_eq!(c.frames[&8].commands, vec![Command {child:None, action:Action::Stop}]);
+            assert_eq!(
+                c.frames[&8].commands,
+                vec![Command {
+                    child: None,
+                    action: Action::Stop
+                }]
+            );
         }
         let c = fixture(BANK_IDLE, BANK_INIT, "");
         assert!(c.frames[&8].unsupported.is_none());
-        assert_eq!(c.frames[&8].commands, vec![Command {child:None, action:Action::Stop}]);
+        assert_eq!(
+            c.frames[&8].commands,
+            vec![Command {
+                child: None,
+                action: Action::Stop
+            }]
+        );
         assert!(c.frames[&28].unsupported.is_some());
-        for helper in [BANK_INIT.replace("buttonMode = true", "visible = false"),
+        for helper in [
+            BANK_INIT.replace("buttonMode = true", "visible = false"),
             BANK_INIT.replace("this.avatar = MovieClip(parent).pAV;", "gotoAndPlay(29);"),
             BANK_INIT.replace("catch(e:Error) {}", "catch(e:Error) { return; }"),
-            String::new()] {
-            assert!(fixture(BANK_IDLE, &helper, "").frames[&8].unsupported.is_some());
+        ] {
+            assert!(fixture(BANK_IDLE, &helper, "").frames[&8]
+                .unsupported
+                .is_some());
         }
-        for body in [BANK_IDLE.replace("!this.petInit", "this.petInit"),
+        for body in [
+            BANK_IDLE.replace("!this.petInit", "this.petInit"),
             BANK_IDLE.replace("this.petInit", "other.petInit"),
             BANK_IDLE.replace("this.initPet", "other.this.initPet"),
             BANK_IDLE.replace("this.initPet();", "this.initPet();this.visible=false;"),
-            "if(!this.petInit){this.petInit=true;this.initPet();stop();}".into()] {
-            assert!(fixture(&body, BANK_INIT, "").frames[&8].unsupported.is_some());
+            "if(!this.petInit){this.petInit=true;this.initPet();stop();}".into(),
+        ] {
+            assert!(fixture(&body, BANK_INIT, "").frames[&8]
+                .unsupported
+                .is_some());
         }
-        for name in ["petInit", "rootClass", "avatar", "btnBank", "onBankClick", "stage", "parent"] {
+        for name in [
+            "petInit",
+            "rootClass",
+            "avatar",
+            "btnBank",
+            "onBankClick",
+            "stage",
+            "parent",
+        ] {
             for kind in ["get", "set"] {
                 let extra = format!("function {kind} {name}(){{gotoAndPlay(29);}}");
-                assert!(fixture(BANK_IDLE, BANK_INIT, &extra).frames[&8].unsupported.is_some(), "{kind} {name}");
+                assert!(
+                    fixture(BANK_IDLE, BANK_INIT, &extra).frames[&8]
+                        .unsupported
+                        .is_some(),
+                    "{kind} {name}"
+                );
             }
         }
     }

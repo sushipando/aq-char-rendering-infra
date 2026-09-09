@@ -256,6 +256,9 @@ fn name_similarity(a: &str, b: &str) -> f64 {
 }
 
 fn infer_link(swf: &Swf, remote: &str, slot: &str, gender: &str) -> Result<String> {
+    if swf.symbols.is_empty() && slot != "armor" {
+        return Ok(crate::stage_asset::CLASS.into());
+    }
     let names: BTreeSet<_> = swf
         .symbols
         .iter()
@@ -425,8 +428,12 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     let cosmetics = !settings["base_items"]
         .as_bool()
         .context("invalid base_items")?;
-    ensure!(!request["appearance"].is_null(), "SourceFetch must populate appearance before prepare");
-    let mut fields: BTreeMap<String, String> = serde_json::from_value(request["appearance"].clone())?;
+    ensure!(
+        !request["appearance"].is_null(),
+        "SourceFetch must populate appearance before prepare"
+    );
+    let mut fields: BTreeMap<String, String> =
+        serde_json::from_value(request["appearance"].clone())?;
     if settings["show_hidden"] == true {
         let flags = field(&fields, "ia1", "0").parse::<u32>().unwrap_or(0);
         fields.insert("ia1".into(), (flags & !7).to_string());
@@ -495,7 +502,33 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
     let mut source_swfs = BTreeMap::new();
     let mut records = BTreeMap::new();
     for (slot, asset) in &assets {
-        let (record, bytes) = source(store, config, &catalog, &asset.remote_path).await?;
+        let (mut record, mut bytes) = source(store, config, &catalog, &asset.remote_path).await?;
+        if slot != "armor" {
+            if let Some((prepared, _)) = crate::stage_asset::prepare(&bytes)? {
+                let sha = crate::sha256(&prepared);
+                let key = format!(
+                    "dynamic-assets/{}/{}/{sha}.swf",
+                    config.dataset_version,
+                    crate::stage_asset::POLICY
+                );
+                record = SourceObject {
+                    key: key.clone(),
+                    sha256: sha,
+                    size: prepared.len(),
+                    remote_path: record.remote_path,
+                };
+                store
+                    .put(
+                        &config.source_bucket,
+                        &key,
+                        prepared.clone(),
+                        "application/x-shockwave-flash",
+                        true,
+                    )
+                    .await?;
+                bytes = prepared;
+            }
+        }
         source_swfs.insert(slot.clone(), Swf::parse(&bytes)?);
         records.insert(slot.clone(), record);
     }
@@ -530,6 +563,9 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
                 character_id: id,
                 frame: swf.timeline(id)?.0,
                 root_timeline_frames: 1,
+                click: false,
+                ancestor_names: Vec::new(),
+                capture_end: 2008,
             },
         ));
         aliases.insert((*logical).to_string(), key);
@@ -551,6 +587,9 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
                 character_id: id,
                 frame,
                 root_timeline_frames: if slot == "weapon" { span } else { 1 },
+                click: false,
+                ancestor_names: Vec::new(),
+                capture_end: 2008,
             },
         ));
         aliases.insert(slot.into(), slot.into());
@@ -573,31 +612,148 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
                     character_id: id,
                     frame: swf.timeline(id)?.0,
                     root_timeline_frames: 1,
+                    click: false,
+                    ancestor_names: Vec::new(),
+                    capture_end: 2008,
                 },
             ));
             aliases.insert("backhair".into(), "backhair".into());
         }
     }
-    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
+    let layout = crate::presentation::normalize(
+        settings["view"].as_str().unwrap_or("character"),
+        &settings["presentation"],
+    )?;
     let bg_index = crate::charpage::background_index(&serde_json::to_value(&fields)?);
     let mut background_period = None;
     if layout["background"] == true {
         if let Some(bg) = crate::background::record(bg_index) {
             let remote = format!("etc/chardetail/bgs/{}", bg["file"].as_str().unwrap());
             let (original, bytes) = source(store, config, &catalog, &remote).await?;
-            ensure!(original.sha256 == bg["sha256"].as_str().unwrap(), "background source checksum mismatch");
+            ensure!(
+                original.sha256 == bg["sha256"].as_str().unwrap(),
+                "background source checksum mismatch"
+            );
             let (bytes, id, period) = crate::background::wrap(&bytes)?;
             background_period = period;
             let sha = crate::sha256(&bytes);
-            let key = format!("dynamic-assets/{}/presentation/{}/{sha}.swf", config.dataset_version, crate::background::POLICY);
-            let record = SourceObject { key:key.clone(), sha256:sha, size:bytes.len(), remote_path:remote };
-            store.put(&config.source_bucket, &key, bytes, "application/x-shockwave-flash", true).await?;
+            let key = format!(
+                "dynamic-assets/{}/presentation/{}/{sha}.swf",
+                config.dataset_version,
+                crate::background::POLICY
+            );
+            let record = SourceObject {
+                key: key.clone(),
+                sha256: sha,
+                size: bytes.len(),
+                remote_path: remote,
+            };
+            store
+                .put(
+                    &config.source_bucket,
+                    &key,
+                    bytes,
+                    "application/x-shockwave-flash",
+                    true,
+                )
+                .await?;
             records.insert(crate::background::KEY.into(), record);
-            requests.push((crate::background::KEY.into(), SymbolRequest {key:crate::background::KEY.into(), class_name:"CharpageBackgroundStage".into(), character_id:id, frame:1, root_timeline_frames:1}));
+            requests.push((
+                crate::background::KEY.into(),
+                SymbolRequest {
+                    key: crate::background::KEY.into(),
+                    class_name: "CharpageBackgroundStage".into(),
+                    character_id: id,
+                    frame: 1,
+                    root_timeline_frames: 1,
+                    click: false,
+                    ancestor_names: Vec::new(),
+                    capture_end: 2008,
+                },
+            ));
         }
     }
     records.insert("character".into(), character.clone());
-    let mut unique: BTreeMap<(String, u16, usize, usize), String> = BTreeMap::new();
+    // Render each placement with its own host name. Shared symbols may branch on it.
+    for part in ["shoulder", "hand", "thigh", "shin"] {
+        let key = format!("armor_{part}");
+        if let Some((slot, original)) = requests.iter_mut().find(|(_, r)| r.key == key) {
+            original.ancestor_names = vec![format!("front{part}"), "mcChar".into(), "stage".into()];
+            let mut back = original.clone();
+            back.key = format!("armor_back_{part}");
+            back.ancestor_names[0] = format!("back{part}");
+            let slot = slot.clone();
+            aliases.insert(format!("back_{part}"), back.key.clone());
+            requests.push((slot, back));
+        }
+    }
+    let weapon_kind = assets
+        .get("weapon")
+        .map(|a| a.weapon_type.to_lowercase())
+        .unwrap_or_default();
+    if matches!(weapon_kind.as_str(), "dagger" | "gauntlet") {
+        if let Some((slot, original)) = requests.iter_mut().find(|(_, r)| r.key == "weapon") {
+            original.ancestor_names = vec![
+                if weapon_kind == "gauntlet" {
+                    "fronthand"
+                } else {
+                    "weapon"
+                }
+                .into(),
+                "mcChar".into(),
+                "stage".into(),
+            ];
+            let mut back = original.clone();
+            back.key = "weapon_back".into();
+            back.ancestor_names[0] = if weapon_kind == "gauntlet" {
+                "backhand"
+            } else {
+                "weaponOff"
+            }
+            .into();
+            aliases.insert(
+                if weapon_kind == "gauntlet" {
+                    "gauntlet_back"
+                } else {
+                    "weapon_off"
+                }
+                .into(),
+                back.key.clone(),
+            );
+            let slot = slot.clone();
+            requests.push((slot, back));
+        }
+    }
+    for (slot, r) in &mut requests {
+        r.capture_end = (settings["subframe_start"].as_u64().unwrap_or(1)
+            + settings["max_frames"].as_u64().unwrap_or(360)
+            + 7) as usize;
+        r.click = settings["click_assets"].as_array().is_some_and(|a| {
+            a.iter().any(|v| {
+                v.as_str()
+                    == Some(if slot == crate::background::KEY {
+                        "background"
+                    } else {
+                        slot
+                    })
+            })
+        });
+        if r.ancestor_names.is_empty() {
+            let holder = match r.key.as_str() {
+                "armor_idle_foot" => "idlefoot",
+                "armor_back_foot" => "backfoot",
+                "armor_back_robe" => "backrobe",
+                k => k.strip_prefix("armor_").unwrap_or(k),
+            };
+            r.ancestor_names = vec![holder.into()];
+            if matches!(r.key.as_str(), "hair" | "helm") {
+                r.ancestor_names.push("head".into());
+            }
+            r.ancestor_names.extend(["mcChar".into(), "stage".into()]);
+        }
+    }
+    let mut unique: BTreeMap<(String, u16, usize, usize, Vec<String>, bool), String> =
+        BTreeMap::new();
     let mut remapped = BTreeMap::new();
     let mut grouped: BTreeMap<String, (SourceObject, Vec<SymbolRequest>)> = BTreeMap::new();
     for (slot, request) in requests {
@@ -607,6 +763,8 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
             request.character_id,
             request.frame,
             request.root_timeline_frames,
+            request.ancestor_names.clone(),
+            request.click,
         );
         if let Some(previous) = unique.get(&identity) {
             remapped.insert(request.key, previous.clone());
@@ -636,18 +794,41 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         .map(|a| a.weapon_type.clone())
         .unwrap_or_else(|| "Sword".into());
     let mut image_settings = settings.clone();
-    image_settings.as_object_mut().unwrap().remove("rgba_compression");
+    image_settings
+        .as_object_mut()
+        .unwrap()
+        .remove("rgba_compression");
     let hash = crate::digest(
         &json!({"schema_version":1,"renderer_version":config.renderer_version,"character_renderer_sha256":character.sha256,"ffdec_version":FFDEC_VERSION,"export_policy":EXPORT_POLICY,"finalize_policy":FINALIZE_POLICY,"libwebp_version":"1.5.0","asset_dataset_version":config.dataset_version,"appearance":{"gender":gender,"visibility":fields.get("ia1"),"colors":fields.iter().filter(|(k,_)|k.starts_with("intColor")).collect::<BTreeMap<_,_>>(),"assets":assets,"sources":sources,"override":settings["override"]},"settings":image_settings,"bounds_policy":BOUNDS_POLICY}),
     )?;
     let metadata = crate::metadata::display(&serde_json::to_value(&fields)?, settings)?;
-    let hash = crate::digest(&(&hash, aqw_component_raster::region::POLICY, crate::metadata::POLICY, metadata))?;
-    let layout = crate::presentation::normalize(settings["view"].as_str().unwrap_or("character"), &settings["presentation"])?;
+    let hash = crate::digest(&(
+        &hash,
+        aqw_component_raster::region::POLICY,
+        crate::metadata::POLICY,
+        metadata,
+    ))?;
+    let layout = crate::presentation::normalize(
+        settings["view"].as_str().unwrap_or("character"),
+        &settings["presentation"],
+    )?;
     let hash = if layout["background"] == true || layout["info"] == true {
-        crate::digest(&(&hash, crate::charpage::POLICY, crate::presentation::POLICY, fields.get("bgindex"), fields.get("strFaction")))?
-    } else { hash };
+        crate::digest(&(
+            &hash,
+            crate::charpage::POLICY,
+            crate::presentation::POLICY,
+            fields.get("bgindex"),
+            fields.get("strFaction"),
+        ))?
+    } else {
+        hash
+    };
     let avif = settings["output_format"] == "avif";
-    let hash = if avif { crate::digest(&(&hash, crate::avif::POLICY))? } else { hash };
+    let hash = if avif {
+        crate::digest(&(&hash, crate::avif::POLICY))?
+    } else {
+        hash
+    };
     let extension = if avif { "avif" } else { "webp" };
     let quality = settings[if avif { "avif_quality" } else { "webp_quality" }]
         .as_f64()
@@ -677,7 +858,10 @@ pub async fn resolve(store: &dyn Store, config: &Config, request: &Value) -> Res
         .as_u64()
         .context("invalid max_frames")? as usize;
     let complete = settings["complete_loop"] == true;
-    let precomputed = if complete && request["cache"]["animation"] == true && !(layout["background"] == true && bg_index > 0) {
+    let precomputed = if complete
+        && request["cache"]["animation"] == true
+        && !(layout["background"] == true && bg_index > 0)
+    {
         precomputed_loop(store, &config.source_bucket, &sources, max).await?
     } else {
         None
