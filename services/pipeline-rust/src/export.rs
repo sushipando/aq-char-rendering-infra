@@ -437,7 +437,22 @@ pub struct ScriptMetadata {
 }
 
 impl ScriptMetadata {
-    fn inspect_file(&mut self, path: &Path, swf: &Swf) -> Result<()> {
+    /// Shared production policy for local diagnostics and AWS export.
+    pub fn normalize(&self, source: &[u8], swf: &Swf, requests: &[SymbolRequest]) -> Result<crate::timeline::Normalized> {
+        let mut allowed_actions = BTreeSet::new();
+        if !self.inert_background_actions.is_empty()
+            && requests.iter().all(|r| r.key == crate::background::KEY) {
+            let body = crate::swf::decompress(source)?;
+            let stage_offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
+            let as3 = crate::swf::tags(&body, stage_offset)?.iter().any(|(code, data)|
+                *code == 69 && data.first().is_some_and(|flags| flags & 8 != 0));
+            if !as3 { allowed_actions.clone_from(&self.inert_background_actions); }
+        }
+        let scripts = crate::animate::validated_scripts(source, swf, &self.timelines)?;
+        crate::timeline::normalize_with_avm1(source, swf, &scripts, requests, &allowed_actions)
+    }
+
+    pub fn inspect_file(&mut self, path: &Path, swf: &Swf) -> Result<()> {
         let text = std::fs::read_to_string(path)?;
         self.inspect(&text)?;
         // FFDec's AVM1 filenames identify a sprite and frame, not an AS3 class.
@@ -828,7 +843,7 @@ pub async fn export_source(
     );
     let swf = Swf::parse(&bytes)?;
     let source_path = temporary.path().join("source.swf");
-    tokio::fs::write(&source_path, &bytes).await?;
+    tokio::fs::write(&source_path, crate::swf::repair_missing_end(&bytes)?).await?;
     let ffdec = Ffdec {
         jar,
         deadline: started + timeout,
@@ -866,16 +881,7 @@ pub async fn export_source(
         }
         computed
     };
-    let mut allowed_actions = BTreeSet::new();
-    if !metadata.inert_background_actions.is_empty()
-        && normalization_requests.iter().all(|r| r.key == crate::background::KEY) {
-        let body = crate::swf::decompress(&bytes)?;
-        let stage_offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
-        let as3 = crate::swf::tags(&body, stage_offset)?.iter().any(|(code, data)|
-            *code == 69 && data.first().is_some_and(|flags| flags & 8 != 0));
-        if !as3 { allowed_actions.clone_from(&metadata.inert_background_actions); }
-    }
-    let normalized = crate::timeline::normalize_with_avm1(&bytes, &swf, &metadata.timelines, &normalization_requests, &allowed_actions)?;
+    let normalized = metadata.normalize(&bytes, &swf, &normalization_requests)?;
     let selected: BTreeSet<_> = requests.iter().map(|r| r.key.as_str()).collect();
     let effective_requests: Vec<_> = normalized.requests.iter()
         .filter(|r| selected.contains(r.key.as_str())).cloned().collect();
@@ -1116,6 +1122,62 @@ mod tests {
         assert_eq!(ranges(&[3, 1, 2, 3, 8, 9]), "1-3,8-9");
     }
 
+
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_BATTLEON_WRAPPED_SWF; local only"]
+    async fn real_battleon_background_linkage_normalizes() -> Result<()> {
+        let source=PathBuf::from(std::env::var("AQW_TEST_BATTLEON_WRAPPED_SWF")?);
+        let bytes=std::fs::read(&source)?;
+        ensure!(crate::sha256(&bytes)=="57a1fe4b69af41a4e1bb66fb1997fa93e9c01a7b1fdbedad2a49524520cac6b7","wrong regression asset");
+        let swf=Swf::parse(&bytes)?;
+        let root=tempfile::tempdir()?;
+        let output=root.path().join("scripts");
+        Ffdec{jar:std::env::var("AQW_TEST_FFDEC")?.into(),deadline:Instant::now()+Duration::from_secs(90)}
+            .run(&root.path().join("home"),&["-export".into(),"script".into(),output.to_string_lossy().into_owned(),source.to_string_lossy().into_owned()]).await?;
+        let mut metadata=ScriptMetadata::default();
+        for path in script_files(&output)? {metadata.inspect_file(&path,&swf)?;}
+        assert_eq!(metadata.inert_background_actions.len(),1);
+        let request=SymbolRequest{key:crate::background::KEY.into(),class_name:"CharpageBackgroundStage".into(),character_id:65533,frame:1,root_timeline_frames:1};
+        let normalized=metadata.normalize(&bytes,&swf,&[request.clone()])?;
+        assert_eq!(normalized.bytes,bytes,"background geometry and timelines must remain unchanged");
+        let mut item=request;item.key="cape".into();
+        assert!(metadata.normalize(&bytes,&swf,&[item]).is_err(),"exception must remain background-only");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AQW_TEST_FFDEC and AQW_TEST_BOA_SWF; local only"]
+    async fn real_static_animate_layer_export_preserves_authored_effects() -> Result<()> {
+        let bytes=std::fs::read(std::env::var("AQW_TEST_BOA_SWF")?)?;
+        ensure!(crate::sha256(&bytes)=="5597b4544d0bd72afccb7e8cd7d7c785f81dc7f31aa9bf9de1eebeeb6c5e8b62","wrong regression asset");
+        let root=tempfile::tempdir()?;
+        let store=FsStore(root.path().join("objects"));
+        let source=json!({"idx":0,"key":"boa.swf","sha256":crate::sha256(&bytes),"requests":[{"key":"weapon","class_name":"BoAEnergy","character_id":26,"frame":1,"root_timeline_frames":1}]});
+        store.put("source","boa.swf",bytes.clone(),"application/octet-stream",true).await?;
+        store::write(&store,"work","input.json",&json!({"job_id":"boa","sources":[source.clone()],"settings":{"zoom":1.0,"subframe_start":1},"export_frame_count":1}),false).await?;
+        let event=json!({"job_id":"boa","input_key":"input.json","source":source});
+        let options=|| ExportOptions::without_prefetch(std::env::var("AQW_TEST_FFDEC").unwrap().into(),Duration::from_secs(180));
+        let result=export_source(&store,"work","source",&event,options()).await?;
+        let manifest:SourceManifest=store::read(&store,"work",result["manifest_key"].as_str().unwrap()).await?;
+        let meta:ScriptMetadata=store::read(&store,"work",&format!("source-metadata/{EXPORT_POLICY}/{FFDEC_VERSION}/{}.json",crate::sha256(&bytes))).await?;
+        let swf=Swf::parse(&bytes)?;
+        let requests:Vec<SymbolRequest>=serde_json::from_value(event["source"]["requests"].clone())?;
+        let normalized=meta.normalize(&bytes,&swf,&requests)?;
+        assert_eq!(normalized.bytes,bytes,"all authored filters, blends, placements and geometry must remain intact");
+        assert_eq!(manifest.states.len(),1);
+        let state=manifest.states.values().next().unwrap();
+        let svg=store.get("work",&state.svg_key).await?.unwrap();
+        assert!(std::str::from_utf8(&svg)?.contains("filter"),"authored glow effects missing from SVG");
+        let tree=resvg::usvg::Tree::from_data(&svg,&resvg::usvg::Options::default())?;
+        let mut pixmap=resvg::tiny_skia::Pixmap::new(256,256).unwrap();
+        let scale=256.0/tree.size().width().max(tree.size().height());
+        resvg::render(&tree,resvg::tiny_skia::Transform::from_scale(scale,scale),&mut pixmap.as_mut());
+        assert!(pixmap.data().chunks_exact(4).any(|p|p[3]>0));
+        if let Ok(path)=std::env::var("AQW_TEST_BOA_PREVIEW") {pixmap.save_png(path)?;}
+        assert_eq!(export_source(&store,"work","source",&event,options()).await?["vector_cache_hit"],true);
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires AQW_TEST_FFDEC, AQW_TEST_SCYTHE_SWF, AQW_TEST_BG18_WRAPPED_SWF; no AWS"]

@@ -38,10 +38,21 @@ pub struct Program {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Class {
     #[serde(default)]
+    pub animate_layer: Option<AnimateLayer>,
+    #[serde(default)]
     pub hidden_in_hand: Option<String>,
     pub frames: BTreeMap<usize, Program>,
     pub constructor: Program,
     pub unsupported: Option<String>,
+}
+
+/// Recognition is only a candidate; animate::validated_scripts proves the SWF
+/// placements are equivalent before allowing any generated callbacks to be skipped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnimateLayer {
+    Plain,
+    Properties,
+    Controller { pair: Option<(String, String)> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,7 +176,13 @@ pub(crate) fn inert_background_avm1(text: &str) -> Result<bool> {
     ] {
         if tokens == lex(pattern)? { return Ok(true); }
     }
-    Ok(false)
+    // Linkage is descriptive metadata here, not a lookup or executable expression.
+    // Require the entire setup program; only this one literal value may vary.
+    let linkage = lex(r#"var isProp = true; var strLinkage = ""; mouseEnabled = false; mouseChildren = false;"#)?;
+    Ok(tokens.len() == linkage.len() && tokens.iter().zip(&linkage).all(|(actual, expected)| {
+        if matches!(expected, Token::String(_)) { matches!(actual, Token::String(_)) }
+        else { actual == expected }
+    }))
 }
 
 fn close(tokens: &[Token], start: usize, left: char, right: char) -> Result<usize> {
@@ -262,6 +279,24 @@ fn listener_registration(stmt: &[Token]) -> bool {
     let valid = matches!(args, [Token::String(_), Token::Punct(','), Token::Word(this), Token::Punct('.'), Token::Word(_)] if this == "this");
     let valid_flag = matches!(args, [Token::String(_), Token::Punct(','), Token::Word(this), Token::Punct('.'), Token::Word(_), Token::Punct(','), Token::Word(flag)] if this == "this" && matches!(flag.as_str(), "true" | "false"));
     valid || valid_flag
+}
+
+// Literal click-listener registration stores a callback; it does not call it.
+// Do not exempt frame/timer events, computed receivers, or callback expressions.
+fn click_registration(stmt: &[Token]) -> bool {
+    let Ok((path, args)) = call(stmt) else { return false; };
+    if !matches!(path.as_slice(), ["this", _, "addEventListener"] | [_, "addEventListener"]) {
+        return false;
+    }
+    let parts: Vec<_> = args.split(|t| *t == Token::Punct(',')).collect();
+    if !matches!(parts.len(), 2 | 5) { return false; }
+    if parts[0] != lex("MouseEvent.CLICK").unwrap() { return false; }
+    let handler = parts[1];
+    if !matches!(handler, [Token::Word(_)] | [Token::Word(_), Token::Punct('.'), Token::Word(_)])
+        || (handler.len() == 3 && handler[0].word() != Some("this")) { return false; }
+    parts.len() == 2 || (parts[2] == lex("false").unwrap()
+        && parts[3] == lex("0").unwrap()
+        && (parts[4] == lex("true").unwrap() || parts[4] == lex("false").unwrap()))
 }
 
 fn without_listener_setup(body: &[Token]) -> Result<Vec<Token>> {
@@ -384,6 +419,7 @@ fn compile(
         .split(|t| *t == Token::Punct(';'))
         .filter(|s| !s.is_empty())
     {
+        if click_registration(stmt) { continue; }
         let relevant = stmt.iter().any(|t| {
             t.word()
                 .is_some_and(|w| control(w) || methods.contains_key(w))
@@ -476,6 +512,58 @@ fn program(body: &[Token], methods: &BTreeMap<String, Vec<Token>>) -> Program {
     }
 }
 
+fn layer_shape(tokens: &[Token]) -> Option<(Vec<Token>, Option<(String, String)>)> {
+    let at = tokens.iter().position(|t| *t == Token::Word("class".into()))?;
+    let name = tokens.get(at+1)?.word()?;
+    let mut names = BTreeMap::from([(name.to_owned(), "CanonicalClass".to_owned())]);
+    let vars: Vec<_> = tokens.windows(5).filter_map(|w|
+        (w[0].word()==Some("public") && w[1].word()==Some("var") && w[3]==Token::Punct(':') && w[4].word()==Some("MovieClip"))
+        .then(||w[2].word().map(str::to_owned)).flatten()).collect();
+    let pair = if vars.len() == 2 {
+        let prop = vars.iter().find(|n|n.ends_with("_prop_"))?;
+        let object = prop.strip_suffix("_prop_")?;
+        if !vars.iter().any(|n|n==object) {return None;}
+        names.insert(object.into(), "layer".into());
+        names.insert(prop.clone(), "layer_prop_".into());
+        let setters: Vec<_> = tokens.windows(2).filter_map(|w|
+            (w[0].word()==Some("function")).then(||w[1].word()).flatten())
+            .filter(|n|n.starts_with("__setProp_")).collect();
+        if setters.len()!=2 {return None;}
+        // Generated setters occur in object/property declaration order. Their
+        // complete bodies are checked by the canonical template comparison.
+        names.insert(setters[0].into(), "initObject".into());
+        names.insert(setters[1].into(), "initProperties".into());
+        Some((object.into(),prop.clone()))
+    } else if vars.is_empty() { None } else {return None;};
+    let open = (at+2..tokens.len()).find(|i|tokens[*i]==Token::Punct('{'))?;
+    let end = close(tokens,open,'{','}').ok()?;
+    let canonical = tokens[at+1..=end].iter().map(|t| match t {
+        Token::Word(w) | Token::Identifier(w) if names.contains_key(w) => Token::Word(names[w].clone()),
+        t => t.clone(),
+    }).collect();
+    Some((canonical,pair))
+}
+
+fn recognize_animate_layer(tokens: &[Token]) -> Option<AnimateLayer> {
+    let (actual,pair) = layer_shape(tokens)?;
+    static SHAPES: std::sync::OnceLock<Vec<Vec<Token>>> = std::sync::OnceLock::new();
+    let shapes = SHAPES.get_or_init(|| [
+        include_str!("../assets/animate/layer-runtime.as"),
+        include_str!("../assets/animate/controller.as"),
+        include_str!("../assets/animate/controller-flat-layer.as"),
+        "class C extends MovieClip {public function C(){super();}}",
+    ].iter().map(|s|layer_shape(&lex(s).expect("Animate template syntax")).expect("Animate template shape").0).collect());
+    for (index,expected) in shapes.iter().enumerate() {
+        if &actual == expected {return Some(match index {
+            0 => AnimateLayer::Properties,
+            1 => AnimateLayer::Controller{pair:None},
+            2 => AnimateLayer::Controller{pair},
+            _ => AnimateLayer::Plain,
+        });}
+    }
+    None
+}
+
 pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
     let mut tokens = lex(text)?;
     let Some(class_at) = tokens.iter().position(|t| *t == Token::Word("class".into())) else {
@@ -539,7 +627,7 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
         }
         at = end + 1;
     }
-    let mut class = Class::default();
+    let mut class = Class { animate_layer: recognize_animate_layer(&tokens), ..Class::default() };
     let registrations = (|| -> Result<()> {
         let constructor = methods.get(class_name).map(Vec::as_slice).unwrap_or(&[]);
         let mut registrations = 0;
@@ -619,6 +707,22 @@ pub fn parse(text: &str) -> Result<Option<(String, Class)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn click_callback_is_not_executed_but_stop_is_preserved() {
+        let source = |registration: &str| format!("class Button {{function Button(){{addFrameScript(0,this.frame1);}} function frame1(){{{registration}; stop();}} function onClick(){{MovieClip(parent).play();}}}}");
+        let class = parse(&source("this.btnButton.addEventListener(MouseEvent.CLICK,this.onClick,false,0,true)")).unwrap().unwrap().1;
+        assert!(class.frames[&1].unsupported.is_none());
+        assert_eq!(class.frames[&1].commands, vec![Command{child:None, action:Action::Stop}]);
+        for registration in [
+            "this.btnButton.addEventListener(Event.ENTER_FRAME,this.onClick,false,0,true)",
+            "this.btnButton.addEventListener(MouseEvent.CLICK,this.onClick(),false,0,true)",
+            "this.onClick()",
+        ] {
+            let class = parse(&source(registration)).unwrap().unwrap().1;
+            assert!(class.frames[&1].unsupported.is_some(), "{registration}");
+        }
+    }
+
 
     #[test]
     fn ffdec_identifiers_keep_constructor_and_callback_identity() {
@@ -644,6 +748,23 @@ mod tests {
         assert!(inert_background_avm1("var isProp=true; mouseEnabled=false; mouseChildren=false;").unwrap());
         for text in [format!("{color} stop();"), color.replace("mcSetColor", "gotoAndStop"), color.replace("{}", "{play();}"), "_visible=false;".into(), "gotoAndStop(2);".into()] {
             assert!(!inert_background_avm1(&text).unwrap(), "{text}");
+        }
+    }
+    #[test]
+    fn background_linkage_accepts_only_literal_metadata() {
+        let source = r#"var isProp=true; var strLinkage="BushZ"; mouseEnabled=false; mouseChildren=false;"#;
+        for name in ["BushZ", "Another_prop-17", "", "日本語"] {
+            assert!(inert_background_avm1(&source.replace("BushZ", name)).unwrap());
+        }
+        for changed in [
+            source.replace("\"BushZ\"", "getLinkage()"),
+            source.replace("\"BushZ\"", "other.name"),
+            source.replace("\"BushZ\"", "\"Bush\"+\"Z\""),
+            source.replace("strLinkage", "_visible"),
+            source.replace("mouseEnabled=false", "mouseEnabled=true"),
+            format!("{source} stop();"),
+        ] {
+            assert!(!inert_background_avm1(&changed).unwrap(), "{changed}");
         }
     }
     #[test]

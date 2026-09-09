@@ -14,14 +14,14 @@ pub(crate) fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
     ))
 }
 
-pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+fn decode(data: &[u8]) -> Result<(Vec<u8>, bool)> {
     ensure!(data.len() >= 12, "truncated SWF");
     let declared = u32::from_le_bytes(data[4..8].try_into()?) as usize;
     ensure!(
         (12..=128 * 1024 * 1024).contains(&declared),
         "invalid SWF size"
     );
-    let body = match &data[..3] {
+    let mut body = match &data[..3] {
         b"FWS" => data[8..].to_vec(),
         b"CWS" => {
             let mut output = Vec::new();
@@ -32,8 +32,39 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         }
         _ => bail!("only FWS/CWS sources are supported"),
     };
+    let repair = body.len() + 10 == declared;
+    if repair {
+        // Only a complete stream ending on a complete final ShowFrame may be
+        // missing the two-byte End tag. Never relax arbitrary length mismatches.
+        if &data[..3] == b"CWS" {
+            let mut decoder = flate2::Decompress::new(true);
+            let mut checked = vec![0; body.len() + 1];
+            let status = decoder.decompress(&data[8..], &mut checked, flate2::FlushDecompress::Finish)?;
+            ensure!(status == flate2::Status::StreamEnd && decoder.total_in() as usize == data.len()-8,
+                "incomplete or trailing compressed SWF data");
+        }
+        let offset = (5 + 4 * (body.first().context("missing SWF stage")? >> 3) as usize).div_ceil(8) + 4;
+        let entries = tags(&body, offset)?;
+        ensure!(entries.last() == Some(&(1, &[][..])) && !entries.iter().any(|(code,_)| *code == 0)
+            && entries.iter().filter(|(code,_)| *code == 1).count() == u16_at(&body, offset-2)? as usize,
+            "SWF size mismatch is not a missing final End tag");
+        body.extend_from_slice(&[0,0]);
+    }
     ensure!(body.len() + 8 == declared, "SWF declared size mismatch");
-    Ok(body)
+    Ok((body, repair))
+}
+
+pub fn decompress(data: &[u8]) -> Result<Vec<u8>> { Ok(decode(data)?.0) }
+
+/// Preserve valid originals; repair only the bounded missing-End compatibility case.
+/// Cached source hashes continue to describe the original bytes.
+pub fn repair_missing_end(data: &[u8]) -> Result<Vec<u8>> {
+    let (body, repaired) = decode(data)?;
+    if !repaired { return Ok(data.to_vec()); }
+    let mut result = data[..8].to_vec();
+    result[..3].copy_from_slice(b"FWS");
+    result.extend(body);
+    Ok(result)
 }
 
 pub fn tags(data: &[u8], mut offset: usize) -> Result<Vec<(u16, &[u8])>> {
@@ -316,6 +347,22 @@ pub(crate) fn instance(code: u16, data: &[u8]) -> Result<Option<(u16, Option<u16
     Ok(Some((depth, id, name, flags & 1 != 0)))
 }
 
+/// Strict neutral advanced-layer placement: identity matrix, no color transform,
+/// ratio, masking or clip actions. Preserve and compare every remaining effect byte.
+pub(crate) fn flat_layer_style(code: u16, data: &[u8]) -> Result<Vec<u8>> {
+    ensure!(matches!(code,26|70), "Animate layers: unsupported placement type");
+    ensure!(data.first()==Some(&0x26), "Animate layers: non-neutral placement flags");
+    let mut offset = if code==26 {5} else {6}; // flags, depth, character
+    let flags2 = if code==70 {data[1]} else {0};
+    ensure!(flags2 & !7 == 0,"Animate layers: unsupported visibility/3D/class placement");
+    ensure!(data.get(offset)==Some(&0),"Animate layers: nonidentity layer matrix");
+    offset+=1;
+    cstring(data,&mut offset)?;
+    let mut signature = vec![flags2];
+    signature.extend_from_slice(&data[offset..]);
+    Ok(signature)
+}
+
 pub(crate) fn write_tag(output: &mut Vec<u8>, code: u16, data: &[u8]) {
     let short = data.len().min(63) as u16;
     output.extend_from_slice(&(code << 6 | short).to_le_bytes());
@@ -325,7 +372,7 @@ pub(crate) fn write_tag(output: &mut Vec<u8>, code: u16, data: &[u8]) {
 
 /// Replace only DefineSprite payloads, preserving the stage header and all other tags.
 pub(crate) fn replace_sprites(source: &[u8], replacements: &BTreeMap<u16, Vec<u8>>) -> Result<Vec<u8>> {
-    if replacements.is_empty() { return Ok(source.to_vec()); }
+    if replacements.is_empty() { return repair_missing_end(source); }
     let body = decompress(source)?;
     let offset = (5 + 4 * (body[0] as usize >> 3)).div_ceil(8) + 4;
     let mut result = Vec::from(&source[..8]);
@@ -388,6 +435,40 @@ fn placement(code: u16, data: &[u8]) -> Result<Option<Placement>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repair_only_complete_stream_missing_final_end() {
+        use std::io::Write;
+        let body = vec![0,0,24,1,0,64,0]; // stage + one complete ShowFrame
+        let make = |body: &[u8], compressed: bool, declared: usize| {
+            let mut bytes = if compressed {b"CWS\x09".to_vec()} else {b"FWS\x09".to_vec()};
+            bytes.extend_from_slice(&(declared as u32).to_le_bytes());
+            if compressed {
+                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(),flate2::Compression::default());
+                encoder.write_all(body).unwrap();
+                bytes.extend(encoder.finish().unwrap());
+            } else {bytes.extend(body);}
+            bytes
+        };
+        for compressed in [false,true] {
+            let bytes = make(&body,compressed,body.len()+10);
+            let repaired = super::repair_missing_end(&bytes).unwrap();
+            assert_eq!(&repaired[..3],b"FWS");
+            assert_eq!(&repaired[8..body.len()+8],body.as_slice());
+            assert_eq!(&repaired[repaired.len()-2..],&[0,0]);
+            assert_eq!(super::repair_missing_end(&repaired).unwrap(),repaired);
+            assert!(super::decompress(&make(&body,compressed,body.len()+11)).is_err());
+            let mut wrong_frames = body.clone(); wrong_frames[3]=2;
+            assert!(super::decompress(&make(&wrong_frames,compressed,body.len()+10)).is_err());
+            let mut ended = body.clone(); ended.extend([0,0]);
+            assert!(super::decompress(&make(&ended,compressed,ended.len()+10)).is_err());
+            let mut truncated_tag = body.clone(); truncated_tag.extend([0x85,0,1]);
+            assert!(super::decompress(&make(&truncated_tag,compressed,truncated_tag.len()+10)).is_err());
+        }
+        let mut incomplete_stream = make(&body,true,body.len()+10);
+        incomplete_stream.truncate(incomplete_stream.len()-2);
+        assert!(super::decompress(&incomplete_stream).is_err());
+    }
+
     use super::*;
     use std::io::Write;
 
