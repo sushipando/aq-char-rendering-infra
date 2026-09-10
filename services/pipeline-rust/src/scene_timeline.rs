@@ -10,7 +10,7 @@ use crate::{
     timeline::{Decision, Normalized, Selection},
 };
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 struct Clip {
     frames: Vec<Display>,
     labels: BTreeMap<String, usize>,
@@ -39,6 +39,7 @@ struct Scene<'a> {
     old_labels: bool,
     host_visibility: BTreeMap<String, bool>,
     warnings: Vec<String>,
+    avm1_queue: VecDeque<(u16, Vec<crate::avm1::Control>)>,
 }
 impl Scene<'_> {
     fn work(&mut self) -> Result<()> {
@@ -274,6 +275,9 @@ impl Scene<'_> {
             self.nodes.get_mut(&id).unwrap().ran = true;
             let context = self.context(id);
             let class = self.clips[&id].class.clone();
+            if let Some(actions) = class.avm1_frames.get(&context.frame) {
+                self.avm1_queue.push_back((id, actions.clone()));
+            }
             let commands = if Self::runtime(&class) {
                 let mut e = Evaluator::new(
                     class.runtime.as_ref().unwrap(),
@@ -445,6 +449,50 @@ impl Scene<'_> {
         }
         Ok(false)
     }
+    fn drain_avm1(&mut self) -> Result<()> {
+        use crate::avm1::Control;
+        let mut callbacks = 10_000usize;
+        while let Some((id, actions)) = self.avm1_queue.pop_front() {
+            callbacks = callbacks
+                .checked_sub(1)
+                .context("AVM1 callback work limit exceeded")?;
+            self.work()?;
+            if !self.nodes[&id].active {
+                continue;
+            }
+            for control in actions {
+                let frame = self.nodes[&id].frame;
+                let total = self.clips[&id].frames.len();
+                let action = match control {
+                    Control::Stop => Action::Stop,
+                    Control::Play => Action::Play,
+                    Control::Goto { frame, play } => Action::Goto {
+                        target: Target::Frame(frame),
+                        play,
+                    },
+                    Control::Next if frame < total => Action::Goto {
+                        target: Target::Frame(frame + 1),
+                        play: false,
+                    },
+                    Control::Previous if frame > 1 => Action::Goto {
+                        target: Target::Frame(frame - 1),
+                        play: false,
+                    },
+                    Control::Next | Control::Previous => continue,
+                };
+                // commands() updates the display immediately, but run() only queues
+                // AVM1 destination callbacks. Finish this block before draining them.
+                self.commands(
+                    id,
+                    vec![Command {
+                        child: None,
+                        action,
+                    }],
+                )?;
+            }
+        }
+        Ok(())
+    }
     fn capture(&mut self) -> Result<()> {
         for (id, n) in &mut self.nodes {
             if !n.active {
@@ -551,7 +599,7 @@ impl Scene<'_> {
         for id in self.roots.clone() {
             self.run(id)?;
         }
-        Ok(())
+        self.drain_avm1()
     }
     fn signature(&self) -> Result<String> {
         let values: Vec<_> = self
@@ -614,15 +662,18 @@ pub(crate) fn normalize(
         old_labels: source[3] < 11,
         host_visibility: BTreeMap::new(),
         warnings: Vec::new(),
+        avm1_queue: VecDeque::new(),
     };
     for r in &isolated.requests {
         scene.attach(r.character_id, None, if r.click { 1 } else { r.frame })?;
-        scene.nodes.get_mut(&r.character_id).unwrap().playing =
-            r.root_timeline_frames > 1 || scene.clips[&r.character_id].class.frames.len() > 0;
+        scene.nodes.get_mut(&r.character_id).unwrap().playing = r.root_timeline_frames > 1
+            || !scene.clips[&r.character_id].class.frames.is_empty()
+            || !scene.clips[&r.character_id].class.avm1_frames.is_empty();
     }
     for id in scene.roots.clone() {
         scene.run(id)?;
     }
+    scene.drain_avm1()?;
     for r in &isolated.requests {
         if r.click {
             // Frame-one setup runs even when the render host selects a later idle label.
@@ -640,6 +691,7 @@ pub(crate) fn normalize(
                 )?;
             }
             scene.click(r.character_id)?;
+            scene.drain_avm1()?;
         }
     }
     let capture_end = requests

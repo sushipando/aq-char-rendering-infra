@@ -606,6 +606,16 @@ pub(crate) fn normalize_with_avm1(
     } else {
         (source, swf)
     };
+    if let Some(prepared) = crate::avm1::prepare(source, swf, scripts, requests, inert_actions)? {
+        let mut result = crate::scene_timeline::normalize(
+            &prepared.bytes,
+            &prepared.swf,
+            &prepared.scripts,
+            &prepared.requests,
+        )?;
+        result.warnings.extend(prepared.warnings);
+        return Ok(result);
+    }
     if requests.iter().any(|r| r.click)
         && scripts
             .values()

@@ -1,5 +1,6 @@
 //! Rust orchestration, immutable SVG export, and asynchronous resvg bounds.
 pub mod animate;
+mod avm1;
 pub mod avif;
 pub mod background;
 pub mod bounds;

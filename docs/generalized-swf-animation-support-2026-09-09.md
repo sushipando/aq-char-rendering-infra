@@ -67,6 +67,11 @@ Vector export policy is `rust-effective-svg-v12-instance-script-state`. The poli
 
 ## Validation and limits
 
+Follow-up: [AVM1 playback support](avm1-timeline-controls-2026-09-09.md) adds direct
+bytecode decoding for older SWF playback controls and an exact Shadowfall
+background regression. It advances the export policy to v13; the corpus results
+below describe the earlier v12 investigation.
+
 The regression suite covers independent placement context, one-time click initialization, later Idle selection, UI-only clicks, generated/custom callback combinations, Graphic wrapping, retained child identity, effect clearing, request validation and retry inheritance. Real local SWFs are exported with FFDec and rasterized with resvg in a separate ignored regression test. These checks validate code paths and nonempty/changing pixels; they are not a full Flash/Ruffle pixel-conformance suite.
 
 The broad recheck completed with **1,193 `ok` and six `timeline_review`**, out of 1,199 previously flagged unique contents/policies. It is saved at:

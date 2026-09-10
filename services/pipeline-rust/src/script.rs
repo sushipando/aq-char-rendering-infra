@@ -37,6 +37,9 @@ pub struct Program {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Class {
+    /// Decoded AVM1 callbacks are queued after the current action block finishes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub avm1_frames: BTreeMap<usize, Vec<crate::avm1::Control>>,
     #[serde(default)]
     pub animate_layer: Option<AnimateLayer>,
     #[serde(default)]
