@@ -124,6 +124,11 @@ fn render_group(
         crate::mask::apply(mask, ctx, transform, &mut sub_pixmap);
     }
 
+    if group.blend_mode() == usvg::BlendMode::AqwAdd {
+        additive_blend(sub_pixmap.as_ref(), pixmap, ibbox.x(), ibbox.y(), group.opacity().get());
+        return Some(());
+    }
+
     let paint = tiny_skia::PixmapPaint {
         opacity: group.opacity().get(),
         blend_mode: convert_blend_mode(group.blend_mode()),
@@ -145,6 +150,8 @@ fn render_group(
 pub fn convert_blend_mode(mode: usvg::BlendMode) -> tiny_skia::BlendMode {
     match mode {
         usvg::BlendMode::Normal => tiny_skia::BlendMode::SourceOver,
+        // Group rendering handles the differing RGB/alpha equations above.
+        usvg::BlendMode::AqwAdd => unreachable!("AQW Add requires separate RGB/alpha blending"),
         usvg::BlendMode::Multiply => tiny_skia::BlendMode::Multiply,
         usvg::BlendMode::Screen => tiny_skia::BlendMode::Screen,
         usvg::BlendMode::Overlay => tiny_skia::BlendMode::Overlay,
@@ -160,6 +167,37 @@ pub fn convert_blend_mode(mode: usvg::BlendMode) -> tiny_skia::BlendMode {
         usvg::BlendMode::Saturation => tiny_skia::BlendMode::Saturation,
         usvg::BlendMode::Color => tiny_skia::BlendMode::Color,
         usvg::BlendMode::Luminosity => tiny_skia::BlendMode::Luminosity,
+    }
+}
+
+/// Flash Add sums premultiplied RGB but uses source-over alpha (unlike Plus).
+/// Clamp to the resulting alpha to keep the CPU image valid premultiplied RGBA.
+/// Works directly in the existing layer buffers; no extra image allocation.
+fn additive_blend(src: tiny_skia::PixmapRef, dst: &mut tiny_skia::PixmapMut,
+                  x: i32, y: i32, opacity: f32) {
+    let left = x.max(0) as usize;
+    let top = y.max(0) as usize;
+    let right = (x as i64 + src.width() as i64).min(dst.width() as i64).max(0) as usize;
+    let bottom = (y as i64 + src.height() as i64).min(dst.height() as i64).max(0) as usize;
+    let dw = dst.width() as usize;
+    let sw = src.width() as usize;
+    let amount = (opacity * 255.0 + 0.5) as u32;
+    let scale = |v: u8| ((v as u32 * amount + 127) / 255) as u8;
+    let target = dst.data_mut();
+    for row in top..bottom {
+        for col in left..right {
+            let si = ((row as i64 - y as i64) as usize * sw + (col as i64 - x as i64) as usize) * 4;
+            let di = (row * dw + col) * 4;
+            let s = &src.data()[si..si + 4];
+            let d = &mut target[di..di + 4];
+            let sa = scale(s[3]);
+            if sa == 0 { continue; }
+            let alpha = sa as u32 + (d[3] as u32 * (255 - sa as u32) + 127) / 255;
+            for c in 0..3 {
+                d[c] = (d[c] as u32 + scale(s[c]) as u32).min(alpha) as u8;
+            }
+            d[3] = alpha as u8;
+        }
     }
 }
 

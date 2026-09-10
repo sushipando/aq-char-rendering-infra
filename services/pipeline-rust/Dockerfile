@@ -42,13 +42,20 @@ COPY --from=build /opt/libwebp/bin/webpmux /opt/libwebp/bin/webpmux
 ENV CHAR_RENDER_WEBPMUX=/opt/libwebp/bin/webpmux
 CMD ["bootstrap"]
 
-# Only the source-export function carries a JVM. Bounds/control functions
-# select the runtime target above and never launch FFDec.
-FROM runtime AS exporter
+# Compile the two SVG export fixes once; the exporter only ships a headless JRE.
+FROM public.ecr.aws/lambda/provided:al2023 AS ffdec-build
 ARG FFDEC_VERSION=26.2.1
-RUN dnf install -y java-21-amazon-corretto-headless unzip && dnf clean all \
+RUN dnf install -y java-21-amazon-corretto-devel python3 unzip && dnf clean all \
     && curl -fsSL "https://github.com/jindrapetrik/jpexs-decompiler/releases/download/version${FFDEC_VERSION}/ffdec_${FFDEC_VERSION}.zip" -o /tmp/ffdec.zip \
     && echo "0333b56998a55bd83f4e0deb678a811fcdc45607582b4f5dd438309c8c3ad5ce  /tmp/ffdec.zip" | sha256sum -c - \
     && mkdir -p /opt/ffdec && unzip -q /tmp/ffdec.zip -d /opt/ffdec
+COPY pipeline-rust/ffdec/patch_svg_effects.py /tmp/patch_svg_effects.py
+RUN python3 /tmp/patch_svg_effects.py /opt/ffdec
+
+# Only the source-export function carries a JVM. Bounds/control functions
+# select the runtime target above and never launch FFDec.
+FROM runtime AS exporter
+RUN dnf install -y java-21-amazon-corretto-headless && dnf clean all
+COPY --from=ffdec-build /opt/ffdec /opt/ffdec
 ENV JAVA_TOOL_OPTIONS=-Djava.awt.headless=true
 ENV CHAR_RENDER_FFDEC_PATH=/opt/ffdec/ffdec-cli.jar

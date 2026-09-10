@@ -1,0 +1,169 @@
+diff --git a/crates/resvg/src/lib.rs b/crates/resvg/src/lib.rs
+index 79805f5..99c330e 100644
+--- a/crates/resvg/src/lib.rs
++++ b/crates/resvg/src/lib.rs
+@@ -24,6 +24,7 @@ mod image;
+ mod mask;
+ mod path;
+ mod render;
++pub mod layers;
+ 
+ /// Renders a tree onto the pixmap.
+ ///
+diff --git a/crates/resvg/src/render.rs b/crates/resvg/src/render.rs
+index 686e48c..87d463b 100644
+--- a/crates/resvg/src/render.rs
++++ b/crates/resvg/src/render.rs
+@@ -124,6 +124,11 @@ fn render_group(
+         crate::mask::apply(mask, ctx, transform, &mut sub_pixmap);
+     }
+ 
++    if group.blend_mode() == usvg::BlendMode::AqwAdd {
++        additive_blend(sub_pixmap.as_ref(), pixmap, ibbox.x(), ibbox.y(), group.opacity().get());
++        return Some(());
++    }
++
+     let paint = tiny_skia::PixmapPaint {
+         opacity: group.opacity().get(),
+         blend_mode: convert_blend_mode(group.blend_mode()),
+@@ -145,6 +150,8 @@ fn render_group(
+ pub fn convert_blend_mode(mode: usvg::BlendMode) -> tiny_skia::BlendMode {
+     match mode {
+         usvg::BlendMode::Normal => tiny_skia::BlendMode::SourceOver,
++        // Group rendering handles the differing RGB/alpha equations above.
++        usvg::BlendMode::AqwAdd => unreachable!("AQW Add requires separate RGB/alpha blending"),
+         usvg::BlendMode::Multiply => tiny_skia::BlendMode::Multiply,
+         usvg::BlendMode::Screen => tiny_skia::BlendMode::Screen,
+         usvg::BlendMode::Overlay => tiny_skia::BlendMode::Overlay,
+@@ -163,6 +170,37 @@ pub fn convert_blend_mode(mode: usvg::BlendMode) -> tiny_skia::BlendMode {
+     }
+ }
+ 
++/// Flash Add sums premultiplied RGB but uses source-over alpha (unlike Plus).
++/// Clamp to the resulting alpha to keep the CPU image valid premultiplied RGBA.
++/// Works directly in the existing layer buffers; no extra image allocation.
++fn additive_blend(src: tiny_skia::PixmapRef, dst: &mut tiny_skia::PixmapMut,
++                  x: i32, y: i32, opacity: f32) {
++    let left = x.max(0) as usize;
++    let top = y.max(0) as usize;
++    let right = (x as i64 + src.width() as i64).min(dst.width() as i64).max(0) as usize;
++    let bottom = (y as i64 + src.height() as i64).min(dst.height() as i64).max(0) as usize;
++    let dw = dst.width() as usize;
++    let sw = src.width() as usize;
++    let amount = (opacity * 255.0 + 0.5) as u32;
++    let scale = |v: u8| ((v as u32 * amount + 127) / 255) as u8;
++    let target = dst.data_mut();
++    for row in top..bottom {
++        for col in left..right {
++            let si = ((row as i64 - y as i64) as usize * sw + (col as i64 - x as i64) as usize) * 4;
++            let di = (row * dw + col) * 4;
++            let s = &src.data()[si..si + 4];
++            let d = &mut target[di..di + 4];
++            let sa = scale(s[3]);
++            if sa == 0 { continue; }
++            let alpha = sa as u32 + (d[3] as u32 * (255 - sa as u32) + 127) / 255;
++            for c in 0..3 {
++                d[c] = (d[c] as u32 + scale(s[c]) as u32).min(alpha) as u8;
++            }
++            d[3] = alpha as u8;
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+ 
+diff --git a/crates/usvg/src/parser/svgtree/mod.rs b/crates/usvg/src/parser/svgtree/mod.rs
+index 1618f32..d6c0a3f 100644
+--- a/crates/usvg/src/parser/svgtree/mod.rs
++++ b/crates/usvg/src/parser/svgtree/mod.rs
+@@ -1047,9 +1047,10 @@ impl<'a, 'input: 'a> FromValue<'a, 'input> for ImageRendering {
+ }
+ 
+ impl<'a, 'input: 'a> FromValue<'a, 'input> for BlendMode {
+-    fn parse(_: SvgNode, _: AId, value: &str) -> Option<Self> {
++    fn parse(_: SvgNode, aid: AId, value: &str) -> Option<Self> {
+         match value {
+             "normal" => Some(BlendMode::Normal),
++            "aqw-add" if aid == AId::MixBlendMode => Some(BlendMode::AqwAdd),
+             "multiply" => Some(BlendMode::Multiply),
+             "screen" => Some(BlendMode::Screen),
+             "overlay" => Some(BlendMode::Overlay),
+diff --git a/crates/usvg/src/tree/mod.rs b/crates/usvg/src/tree/mod.rs
+index 6b204f5..f32bb38 100644
+--- a/crates/usvg/src/tree/mod.rs
++++ b/crates/usvg/src/tree/mod.rs
+@@ -215,6 +215,8 @@ impl std::str::FromStr for ImageRendering {
+ #[derive(Clone, Copy, PartialEq, Debug)]
+ pub enum BlendMode {
+     Normal,
++    /// Private AQW SVG extension for Flash's additive RGB blend.
++    AqwAdd,
+     Multiply,
+     Screen,
+     Overlay,
+@@ -242,6 +244,7 @@ impl Display for BlendMode {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         let blend_mode = match self {
+             BlendMode::Normal => "normal",
++            BlendMode::AqwAdd => "aqw-add",
+             BlendMode::Multiply => "multiply",
+             BlendMode::Screen => "screen",
+             BlendMode::Overlay => "overlay",
+diff --git a/crates/resvg/src/layers.rs b/crates/resvg/src/layers.rs
+new file mode 100644
+index 0000000..989bc4f
+--- /dev/null
++++ b/crates/resvg/src/layers.rs
+@@ -0,0 +1,51 @@
++//! AQW: preserve backdrop-dependent Add operations across cached components.
++use crate::{tiny_skia, usvg};
++
++/// One ordered cached image, with its final compositing operation.
++pub struct Layer<'a> {
++    /// Apply RGB addition rather than source-over at final composition.
++    pub additive: bool,
++    nodes: Vec<(&'a usvg::Node, tiny_skia::Transform)>,
++}
++
++/// Flatten only non-isolating groups. Filters, masks and group opacity retain
++/// their own compositing scope. Consecutive source-over drawing shares a layer.
++pub fn plan(tree: &usvg::Tree) -> Vec<Layer<'_>> {
++    fn visit<'a>(nodes: &'a [usvg::Node], ts: tiny_skia::Transform, out: &mut Vec<Layer<'a>>) {
++        for node in nodes {
++            let additive = if let usvg::Node::Group(g) = node {
++                if !g.should_isolate() {
++                    visit(g.children(), ts.pre_concat(g.transform()), out);
++                    continue;
++                }
++                g.blend_mode() == usvg::BlendMode::AqwAdd
++            } else {
++                false
++            };
++            if additive || out.last().is_none_or(|l| l.additive) {
++                out.push(Layer {
++                    additive,
++                    nodes: Vec::new(),
++                });
++            }
++            out.last_mut().unwrap().nodes.push((node, ts));
++        }
++    }
++    let mut out = Vec::new();
++    visit(
++        tree.root().children(),
++        tiny_skia::Transform::identity(),
++        &mut out,
++    );
++    out
++}
++
++/// Render one layer onto transparency with its original transforms and effects.
++pub fn render(layer: &Layer<'_>, ts: tiny_skia::Transform, pixmap: &mut tiny_skia::PixmapMut) {
++    let ctx = crate::render::Context {
++        max_bbox: crate::max_filter_bbox(pixmap.width(), pixmap.height()),
++    };
++    for (node, transform) in &layer.nodes {
++        crate::render::render_node(node, &ctx, ts.pre_concat(*transform), pixmap);
++    }
++}

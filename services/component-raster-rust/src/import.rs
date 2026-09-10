@@ -460,9 +460,10 @@ fn apply_authored_color_transforms(
                 }
             };
             // Wrap the child <use> in <g filter="url(#id)">.
-            let child = node.children[index].clone();
+            let mut child = node.children[index].clone();
             let mut wrapper = Node::elem("g");
             wrapper.set("filter", format!("url(#{filter_id})"));
+            promote_blending(&mut child, &mut wrapper);
             wrapper.append(child);
             node.children[index] = wrapper;
             applied += 1;
@@ -509,14 +510,34 @@ pub fn apply_color_rules(root: &mut Node, rules: &HashMap<String, (String, Strin
             }
             // Keep tint and blend mode on the same element: wrap a filtered
             // child in a tinted group.
-            let child = parent.children[index].clone();
+            let mut child = parent.children[index].clone();
             let mut wrapper = Node::elem("g");
             wrapper.set("filter", tint_filter);
+            promote_blending(&mut child, &mut wrapper);
             wrapper.append(child);
             parent.children[index] = wrapper;
         }
     }
     visit(root, rules);
+}
+
+// A color-filter wrapper isolates its child. Blending must therefore happen
+// on the wrapper after the color transform, against the actual backdrop.
+fn promote_blending(child: &mut Node, wrapper: &mut Node) {
+    if let Some(mode) = child.get("mix-blend-mode").map(str::to_owned) {
+        child.remove_attr("mix-blend-mode");
+        wrapper.set("mix-blend-mode", mode);
+    }
+    if let Some(style) = child.get("style").map(str::to_owned) {
+        let (blend, other): (Vec<_>, Vec<_>) = style.split(';')
+            .filter(|s| !s.trim().is_empty())
+            .partition(|s| s.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("mix-blend-mode")));
+        if !blend.is_empty() {
+            wrapper.set("style", blend.join(";"));
+            child.remove_attr("style");
+            if !other.is_empty() { child.set("style", other.join(";")); }
+        }
+    }
 }
 
 /// Only placements directly inside the exported gauntlet have the hand holder

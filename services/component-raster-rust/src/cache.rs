@@ -33,7 +33,8 @@ use crate::telemetry::sha256_hex;
 /// no-CC part never collide.
 /// Schema 3: structural invisibility and prepared-tree-region allocation;
 /// bounds_key additionally scopes entries to the measured per-state hint.
-pub const CACHE_SCHEMA: &str = "3";
+// Schema 4: additive blending and color-wrapper blend placement.
+pub const CACHE_SCHEMA: &str = "4";
 
 /// Crop inputs affect allocations and potentially sampling. Never mix legacy
 /// rasters with prepared-tree-region rasters or two different measured hints.

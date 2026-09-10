@@ -53,6 +53,8 @@ pub struct BatchIndex {
 pub struct ComponentResult {
     pub task_id: String,
     #[serde(default)]
+    pub layers: Vec<ComponentLayer>,
+    #[serde(default)]
     pub empty: bool,
     #[serde(default)]
     pub png_key: Option<String>,
@@ -64,6 +66,15 @@ pub struct ComponentResult {
     pub y: i64,
     #[serde(default)]
     pub component_raster_space: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ComponentLayer {
+    pub png_key: String,
+    pub sha256: String,
+    pub x: i64,
+    pub y: i64,
+    pub blend_mode: String,
 }
 
 /// The fields of the prepare manifest the composer depends on. Extra fields

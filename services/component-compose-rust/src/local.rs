@@ -23,6 +23,8 @@ fn compact_result(record: &serde_json::Value) -> Result<ComponentResult, Compose
     let empty = record.get("empty").and_then(serde_json::Value::as_bool) == Some(true);
     let mut result = ComponentResult {
         task_id: task_id.clone(),
+        layers: serde_json::from_value(record.get("layers").cloned().unwrap_or_else(|| serde_json::json!([])))
+            .map_err(|e| ComposeError::invalid(e.to_string()))?,
         empty,
         png_key: None,
         sha256: record
@@ -42,7 +44,11 @@ fn compact_result(record: &serde_json::Value) -> Result<ComponentResult, Compose
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
     };
-    if !empty {
+    if !result.layers.is_empty() {
+        for (index,layer) in result.layers.iter_mut().enumerate() {
+            layer.png_key = format!("{LOCAL_PREFIX}{task_id}-layer-{index}");
+        }
+    } else if !empty {
         if record
             .get("png_key")
             .and_then(serde_json::Value::as_str)

@@ -191,6 +191,8 @@ impl From<ColorTransformValues> for AuthoredColorTransform {
 #[derive(Clone, Debug, Serialize)]
 pub struct RasterResult {
     pub task_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<RasterLayer>,
     pub empty: bool,
     pub x: i64,
     pub y: i64,
@@ -217,6 +219,15 @@ pub struct RasterResult {
     pub rasterize_ms: f64,
     pub crop_ms: f64,
     pub downsample_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RasterLayer {
+    pub png_key: String,
+    pub sha256: String,
+    pub x: i64,
+    pub y: i64,
+    pub blend_mode: &'static str,
 }
 
 #[cfg(test)]

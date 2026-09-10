@@ -160,7 +160,7 @@ pub async fn run_raster_task(
         .raster_backend
         .clone()
         .unwrap_or_else(|| settings.raster_backend.clone());
-    let raster_backend =
+    let mut raster_backend =
         crate::raster::RenderBackend::parse(&raster_backend_name).ok_or_else(|| {
             RasterError::invalid(format!(
                 "Unsupported render backend {raster_backend_name:?}"
@@ -243,6 +243,7 @@ pub async fn run_raster_task(
         if let Some((cached_meta, cached_png)) = crate::cache::read_cache(source, key).await? {
             let mut result = RasterResult {
                 task_id: task_id.clone(),
+                layers: Vec::new(),
                 empty: cached_meta.empty,
                 x: cached_meta.x,
                 y: cached_meta.y,
@@ -404,6 +405,10 @@ pub async fn run_raster_task(
         let _ = std::fs::write(path, &svg_bytes);
     }
     let svg_byte_count = svg_bytes.len() as u64;
+    // The private SWF Add extension belongs to the patched resvg backend.
+    // Experimental ThorVG jobs use resvg for these components as well.
+    let has_additive = svg_bytes.windows(7).any(|s| s == b"aqw-add");
+    if has_additive { raster_backend = crate::raster::RenderBackend::Resvg; }
     let filter_count_value = filter_count(&component.root);
     let svg_build_ms = elapsed_ms(svg_started);
 
@@ -413,6 +418,7 @@ pub async fn run_raster_task(
 
     let mut result = RasterResult {
         task_id: task_id.clone(),
+        layers: Vec::new(),
         empty: true,
         x: 0,
         y: 0,
@@ -458,7 +464,60 @@ pub async fn run_raster_task(
     // populated after a miss (only for appearance-independent parts).
     let mut cached_png_bytes: Option<Vec<u8>> = None;
 
-    if component.visible {
+    // Keep Add passes separate until frame composition, so they see the armor,
+    // other equipment and background. Process/encode one layer at a time.
+    let layered = if component.visible && has_additive {
+        let tree = resvg::usvg::Tree::from_data(&svg_bytes, &resvg::usvg::Options::default())
+            .map_err(|e| RasterError::Raster(e.to_string()))?;
+        let layers = resvg::layers::plan(&tree);
+        if layers.iter().any(|l| l.additive) {
+            if layers.len() > 128 { return Err(RasterError::Raster("component additive layer limit exceeded".into())); }
+            let mut total_bytes = 0u64;
+            for layer in &layers {
+                let raster_started = Instant::now();
+                let mut pixels = resvg::tiny_skia::Pixmap::new(page_width, page_height)
+                    .ok_or_else(|| RasterError::Raster("additive layer allocation".into()))?;
+                resvg::layers::render(layer, resvg::tiny_skia::Transform::identity(), &mut pixels.as_mut());
+                let mut data = pixels.take();
+                crate::raster::demultiply_u8(&mut data);
+                let image = RgbaImage::new(page_width, page_height, data);
+                timings.rasterize_ms += elapsed_ms(raster_started);
+                let crop_started = Instant::now();
+                let Some(bbox) = image.alpha_bbox(page_width, page_height) else { continue; };
+                let cropped = image.crop(bbox);
+                timings.crop_ms += elapsed_ms(crop_started);
+                let x = left + bbox.0 as i64;
+                let y = top + bbox.1 as i64;
+                let downsample_started = Instant::now();
+                let output = if component_raster_space == COMPONENT_RASTER_SPACE_OUTPUT && output_canvas != raster_canvas {
+                    downsample_component_to_output_grid(&cropped,x,y,(raster_canvas[0],raster_canvas[1]),(output_canvas[0],output_canvas[1]))
+                } else { Some((cropped,x,y)) };
+                timings.downsample_ms += elapsed_ms(downsample_started);
+                let Some((image,x,y)) = output else { continue; };
+                let bytes = encode_rgba8(image.width,image.height,&image.pixels)?;
+                let layer_index = result.layers.len();
+                let key = match &event.benchmark_output_prefix {
+                    Some(prefix) => format!("{prefix}/rasters/{task_id}-layer-{layer_index}.png"),
+                    None => format!("jobs/{}/component/rasters/{task_id}-layer-{layer_index}.png",event.job_id),
+                };
+                let upload_started = Instant::now();
+                sink.put(&key,"image/png",&bytes).await?;
+                timings.upload_ms += elapsed_ms(upload_started);
+                total_bytes += bytes.len() as u64;
+                result.layers.push(crate::contract::RasterLayer { png_key:key,sha256:sha256_hex(&bytes),x,y,
+                    blend_mode:if layer.additive {"add"} else {"normal"} });
+            }
+            result.empty = result.layers.is_empty();
+            result.width = page_width.into(); result.height = page_height.into();
+            result.bytes = Some(total_bytes);
+            result.rasterize_ms = timings.rasterize_ms;
+            result.crop_ms = timings.crop_ms;
+            result.downsample_ms = timings.downsample_ms;
+            true
+        } else { false }
+    } else { false };
+
+    if component.visible && !layered {
         let rasterize_started = Instant::now();
         let hint = task
             .raster_bounds
@@ -554,7 +613,7 @@ pub async fn run_raster_task(
     }
 
     // ---- populate the cache on a miss ---------------------------------------
-    if let Some(key) = &cache_key {
+    if let Some(key) = cache_key.as_ref().filter(|_| !has_additive) {
         let meta = crate::cache::CacheMeta {
             empty: result.empty,
             x: result.x,

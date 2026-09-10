@@ -197,6 +197,34 @@ fn sample_frame_root() -> (PathBuf, Vec<serde_json::Value>, Vec<PathBuf>) {
 }
 
 #[test]
+fn additive_sublayers_blend_with_previous_parts_and_preserve_order() {
+    let root = unique_dir("additive");
+    let mut fixture = Fixture::new(root.clone());
+    fixture.add("armor", 8,8,[32,64,128,255],0,0,false);
+    let mut layers = Vec::new();
+    for (index,(size,color,mode)) in [(5,[0,64,0,255],"normal"),(6,[128,0,0,255],"add"),(1,[255,255,255,255],"normal")].into_iter().enumerate() {
+        let bytes = Fixture::solid("effect",size,size,color,1,1);
+        std::fs::write(fixture.rasters.join(format!("effect-layer-{index}.png")), &bytes).unwrap();
+        layers.push(serde_json::json!({"png_key":format!("original/effect-layer-{index}.png"),"sha256":sha256_hex(&bytes),"x":1,"y":1,"blend_mode":mode}));
+    }
+    let record = serde_json::json!({"task_id":"effect","empty":false,"component_raster_space":"output","layers":layers});
+    std::fs::write(fixture.results.join("effect.json"),serde_json::to_vec(&record).unwrap()).unwrap();
+    fixture.write_manifest(&[serde_json::json!({"number":1,"layers":["armor","effect"],"duration_ms":40})]);
+    let output = fixture.run(&root.join("out"),1,&[]);
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let (_,_,pixels) = read_png(&root.join("out/frames/000001.png"));
+    let at = |x: usize,y: usize| &pixels[(y*256+x)*4..(y*256+x)*4+4];
+    assert_eq!(at(1,1),[255,255,255,255]);
+    assert_eq!(at(2,2),[128,64,0,255]);
+    assert_eq!(at(6,6),[160,64,128,255]);
+    assert_eq!(at(0,0),[32,64,128,255]);
+    let mut invalid = record.clone(); invalid["layers"][1]["blend_mode"] = "typo".into();
+    std::fs::write(fixture.results.join("effect.json"),serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert!(!fixture.run(&root.join("bad"),1,&[]).status.success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn local_mode_composes_every_frame_and_writes_the_batch_contract() {
     let (temp, frames, _) = sample_frame_root();
     let output = temp.join("out");

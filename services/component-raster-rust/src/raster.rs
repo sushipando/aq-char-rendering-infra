@@ -130,7 +130,7 @@ fn render_resvg_region(
     ))
 }
 
-fn demultiply_u8(pixels: &mut [u8]) {
+pub(crate) fn demultiply_u8(pixels: &mut [u8]) {
     for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = pixel[3];
         if alpha == 255 {

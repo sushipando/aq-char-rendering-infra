@@ -24,6 +24,7 @@ mod image;
 mod mask;
 mod path;
 mod render;
+pub mod layers;
 
 /// Renders a tree onto the pixmap.
 ///

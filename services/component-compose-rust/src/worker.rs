@@ -76,7 +76,6 @@ async fn fetch_components(
 ) -> Result<Vec<(String, Vec<u8>, u64)>, ComposeError> {
     let fetched = stream::iter(task_ids.iter().cloned())
         .map(|task_id| {
-            let results = results.clone();
             async move {
                 let result = results.get(&task_id).ok_or_else(|| {
                     ComposeError::invalid(format!("task {task_id} has no result"))
@@ -393,7 +392,35 @@ pub async fn run_chunk(
     }
 
     // ---- download unique components --------------------------------------
-    let unique_task_ids: Vec<String> = referenced
+    // Expand sublayers only at the PNG handoff; the workflow still has one
+    // raster task per component state and reuses each decoded layer per batch.
+    let mut expanded: HashMap<String, Vec<(String,bool)>> = HashMap::new();
+    let mut download_ids = BTreeSet::new();
+    for id in &referenced {
+        let result = results_by_task[id].clone();
+        if result.layers.is_empty() {
+            download_ids.insert(id.clone());
+            continue;
+        }
+        if result.layers.len() > 128 || result.png_key.is_some() || result.empty {
+            return Err(invalid("Invalid additive component layers"));
+        }
+        let mut entries = Vec::new();
+        for (index,layer) in result.layers.iter().enumerate() {
+            let additive = match layer.blend_mode.as_str() {
+                "normal" => false, "add" => true, _ => return Err(invalid("Unsupported component blend mode")),
+            };
+            let child = format!("{id}/layer/{index}");
+            let value = ComponentResult { task_id:child.clone(),layers:Vec::new(),empty:false,
+                png_key:Some(layer.png_key.clone()),sha256:Some(layer.sha256.clone()),x:layer.x,y:layer.y,
+                component_raster_space:result.component_raster_space.clone() };
+            if results_by_task.insert(child.clone(),value).is_some() { return Err(invalid("Duplicate additive layer ID")); }
+            download_ids.insert(child.clone());
+            entries.push((child,additive));
+        }
+        expanded.insert(id.clone(),entries);
+    }
+    let unique_task_ids: Vec<String> = download_ids
         .iter()
         .filter(|task_id| {
             let result = &results_by_task[*task_id];
@@ -448,6 +475,14 @@ pub async fn run_chunk(
             match result {
                 None => continue, // unreachable after the missing-results check
                 Some(result) if result.empty => {},
+                Some(_) if expanded.contains_key(raw_task_id) => {
+                    for (id,additive) in &expanded[raw_task_id] {
+                        let result = &results_by_task[id];
+                        let layer = images.get(id).ok_or_else(|| ComposeError::missing_png(id.clone()))?;
+                        if *additive { canvas.composite_additive(layer,result.x,result.y); }
+                        else { canvas.composite(layer,result.x,result.y); }
+                    }
+                },
                 Some(result) => {
                     let layer = images
                         .get(raw_task_id)

@@ -169,6 +169,24 @@ impl Canvas {
         }
     }
 
+    /// Flash Add: premultiplied RGB addition with source-over alpha.
+    pub fn composite_additive(&mut self, layer: &RgbaImage, x: i64, y: i64) {
+        let right = x.saturating_add(layer.width as i64).min(self.width as i64);
+        let bottom = y.saturating_add(layer.height as i64).min(self.height as i64);
+        for row in y.max(0)..bottom {
+            for col in x.max(0)..right {
+                let si = ((row-y) as usize * layer.width as usize + (col-x) as usize)*4;
+                let di = (row as usize * self.width as usize + col as usize)*4;
+                let s = &layer.pixels[si..si+4];
+                let d = &mut self.pixels[di..di+4];
+                if s[3] == 0 { continue; }
+                let a = s[3] as u32 + (d[3] as u32*(255-s[3] as u32)+127)/255;
+                for c in 0..3 { d[c] = (s[c] as u32+d[c] as u32).min(a) as u8; }
+                d[3] = a as u8;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let offset = ((y * self.width + x) * 4) as usize;

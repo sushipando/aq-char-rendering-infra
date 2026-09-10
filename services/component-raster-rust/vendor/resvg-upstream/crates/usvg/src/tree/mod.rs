@@ -215,6 +215,8 @@ impl std::str::FromStr for ImageRendering {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BlendMode {
     Normal,
+    /// Private AQW SVG extension for Flash's additive RGB blend.
+    AqwAdd,
     Multiply,
     Screen,
     Overlay,
@@ -242,6 +244,7 @@ impl Display for BlendMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let blend_mode = match self {
             BlendMode::Normal => "normal",
+            BlendMode::AqwAdd => "aqw-add",
             BlendMode::Multiply => "multiply",
             BlendMode::Screen => "screen",
             BlendMode::Overlay => "overlay",

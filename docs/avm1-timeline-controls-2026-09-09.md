@@ -1,5 +1,8 @@
 # AVM1 playback support: Shadowfall and other assets
 
+Follow-up: [River construction metadata and additive effects](render-fixes-river-and-additive-auras-2026-09-09.md)
+extends the supported inert placement metadata and supersedes the cache policy below.
+
 Job `eefaa5cb-3c61-4162-990e-9766289e3347` failed during background SVG export for
 Bloome's charpage. Fetching succeeded. The asset was `etc/chardetail/bgs/cp-shadowfall.swf`
 (background index 6), and the exception ended at sprite 145 with

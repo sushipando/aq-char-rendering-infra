@@ -44,7 +44,7 @@ fn filters(data: &[u8], at: &mut usize) -> Result<Vec<u8>> {
     }
     Ok(data[start..*at].to_vec())
 }
-fn fields(code: u16, data: &[u8]) -> Result<(u16, bool, BTreeMap<u8, Vec<u8>>)> {
+fn read_fields(code: u16, data: &[u8]) -> Result<(u16, bool, BTreeMap<u8, Vec<u8>>, usize)> {
     ensure!(
         matches!(code, 26 | 70),
         "scripted frame sequencing needs PlaceObject2/3"
@@ -56,8 +56,8 @@ fn fields(code: u16, data: &[u8]) -> Result<(u16, bool, BTreeMap<u8, Vec<u8>>)> 
         0
     };
     ensure!(
-        flags & 128 == 0 && flags2 & 0x18 == 0,
-        "clip actions/class placements require runtime support"
+        flags2 & 0x18 == 0,
+        "class placements require runtime support"
     );
     let depth = swf::u16_at(data, if code == 70 { 2 } else { 1 })?;
     let mut at = if code == 70 { 4 } else { 3 };
@@ -94,8 +94,27 @@ fn fields(code: u16, data: &[u8]) -> Result<(u16, bool, BTreeMap<u8, Vec<u8>>)> 
             fields.insert(key, take(data, &mut at, len)?);
         }
     }
-    ensure!(at == data.len(), "unparsed placement fields");
-    Ok((depth, flags & 1 != 0, fields))
+    Ok((depth, flags & 1 != 0, fields, at))
+}
+fn fields(code: u16, data: &[u8]) -> Result<(u16, bool, BTreeMap<u8, Vec<u8>>)> {
+    ensure!(
+        data.first().is_some_and(|flags| flags & 128 == 0),
+        "clip actions require runtime support"
+    );
+    let (depth, moving, fields, end) = read_fields(code, data)?;
+    ensure!(end == data.len(), "unparsed placement fields");
+    Ok((depth, moving, fields))
+}
+/// Locate the optional ClipActions tail without altering matrix/color/filter data.
+/// Callers must validate the returned actions before using the stripped placement.
+pub(crate) fn split_clip_actions(code: u16, data: &[u8]) -> Result<Option<(Vec<u8>, &[u8])>> {
+    if !matches!(code, 26 | 70 | 94) || data.first().is_none_or(|f| f & 128 == 0) {
+        return Ok(None);
+    }
+    let (_, _, _, end) = read_fields(code, data)?;
+    let mut placement = data[..end].to_vec();
+    placement[0] &= !128;
+    Ok(Some((placement, &data[end..])))
 }
 pub fn snapshots(payload: &[u8]) -> Result<Vec<Display>> {
     let mut display = Display::new();
@@ -309,6 +328,37 @@ pub fn sequence(payload: &[u8], indices: &[usize], pad_to: usize) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clip_action_split_preserves_every_placement_effect() {
+        let mut glow = vec![1, 2];
+        glow.extend([0; 15]);
+        let original = Placement {
+            generation: 0,
+            id: 22,
+            fields: BTreeMap::from([
+                (1, vec![0]), (2, vec![0]), (3, vec![42, 0]),
+                (4, b"marker\0".to_vec()), (5, vec![7, 0]),
+                (6, glow), (7, vec![3]), (8, vec![1]),
+                (9, vec![0]), (10, vec![11, 22, 33, 44]),
+            ]),
+        };
+        let mut encoded = Vec::new();
+        original.write(&mut encoded, 6, false, None);
+        let tags = swf::tags(&encoded, 0).unwrap();
+        let (code, plain) = tags[0];
+        let mut with_actions = plain.to_vec();
+        with_actions[0] |= 128;
+        let actions = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        with_actions.extend(actions);
+        let (stripped, tail) = split_clip_actions(code, &with_actions).unwrap().unwrap();
+        assert_eq!(stripped, plain);
+        assert_eq!(tail, actions);
+        assert_eq!(fields(code, &stripped).unwrap(), fields(code, plain).unwrap());
+        for end in 0..plain.len() {
+            assert!(split_clip_actions(code, &with_actions[..end]).is_err()
+                || end == 0);
+        }
+    }
     #[test]
     fn backward_jump_clears_effects_without_recreating_surviving_child() {
         let plain = Placement {

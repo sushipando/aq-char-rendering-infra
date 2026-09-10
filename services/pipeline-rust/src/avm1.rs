@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct Prepared {
@@ -16,6 +17,7 @@ pub(crate) struct Prepared {
     pub scripts: BTreeMap<String, Class>,
     pub requests: Vec<SymbolRequest>,
     pub warnings: Vec<String>,
+    pub playback: bool,
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -30,6 +32,16 @@ impl<'a> Reader<'a> {
     }
     fn short(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into()?))
+    }
+    fn long(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+    fn event_flags(&mut self, version: u8) -> Result<u32> {
+        if version >= 6 {
+            self.long()
+        } else {
+            Ok(self.short()?.into())
+        }
     }
     fn string(&mut self) -> Result<String> {
         let end = self
@@ -50,6 +62,9 @@ impl<'a> Reader<'a> {
 enum Literal {
     Number(f64),
     String(String),
+    Bool,
+    Null,
+    Undefined,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +81,7 @@ struct Compiler<'a> {
     total: usize,
     commands: Vec<Control>,
     warnings: Vec<String>,
+    custom_fields: Option<BTreeSet<String>>,
 }
 impl Compiler<'_> {
     fn goto(&mut self, frame: usize, play: bool) {
@@ -104,6 +120,7 @@ impl Compiler<'_> {
                     return Ok(());
                 }
             }
+            _ => bail!("unsupported AVM1 nonnumeric frame target"),
         };
         let frame = number + i64::from(bias);
         // AVM1 nonpositive gotos have no effect, including on the play state.
@@ -152,6 +169,19 @@ impl Compiler<'_> {
                 0x17 => {
                     stack.pop().context("AVM1 Pop stack underflow")?;
                 }
+                0x1d if self.custom_fields.is_some() => {
+                    let _value = stack.pop().context("AVM1 SetVariable value missing")?;
+                    let Literal::String(name) =
+                        stack.pop().context("AVM1 SetVariable name missing")?
+                    else {
+                        bail!("AVM1 construction property must be a literal name");
+                    };
+                    ensure!(
+                        custom_property(&name),
+                        "AVM1 construction property {name:?} may affect display/runtime behavior"
+                    );
+                    self.custom_fields.as_mut().unwrap().insert(name);
+                }
                 0x4c => stack.push(
                     stack
                         .last()
@@ -184,6 +214,12 @@ impl Compiler<'_> {
                             1 => Literal::Number(
                                 f32::from_le_bytes(operands.take(4)?.try_into()?) as f64
                             ),
+                            2 => Literal::Null,
+                            3 => Literal::Undefined,
+                            5 => {
+                                operands.byte()?;
+                                Literal::Bool
+                            }
                             6 => {
                                 // SWF doubles store the two little-endian 32-bit words high first.
                                 let bytes = operands.take(8)?;
@@ -236,6 +272,138 @@ impl Compiler<'_> {
     }
 }
 
+/// Only plain custom slots are inert. Native properties, callback/method names,
+/// target paths and prototype manipulation must never be silently discarded.
+fn custom_property(name: &str) -> bool {
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '$')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    !name.starts_with("on")
+        && ![
+            "enabled",
+            "usehandcursor",
+            "tabenabled",
+            "tabchildren",
+            "tabindex",
+            "focusenabled",
+            "cacheasbitmap",
+            "opaquebackground",
+            "scrollrect",
+            "scale9grid",
+            "filters",
+            "transform",
+            "blendmode",
+            "constructor",
+            "prototype",
+            "watch",
+            "unwatch",
+            "tostring",
+            "valueof",
+            "hasownproperty",
+            "isprototypeof",
+            "propertyisenumerable",
+            "play",
+            "stop",
+            "nextframe",
+            "prevframe",
+            "gotoandplay",
+            "gotoandstop",
+            "geturl",
+            "unloadmovie",
+            "loadvariables",
+            "loadmovie",
+            "attachmovie",
+            "swapdepths",
+            "localtoglobal",
+            "globaltolocal",
+            "hittest",
+            "getbounds",
+            "getbytesloaded",
+            "getbytestotal",
+            "getdepth",
+            "attachaudio",
+            "duplicatemovieclip",
+            "removemovieclip",
+            "startdrag",
+            "stopdrag",
+            "getnexthighestdepth",
+            "getinstanceatdepth",
+            "getswfversion",
+            "attachbitmap",
+            "getrect",
+            "createemptymovieclip",
+            "beginfill",
+            "beginbitmapfill",
+            "setmask",
+            "hitarea",
+            "addproperty",
+            "begingradientfill",
+            "endfill",
+            "moveto",
+            "lineto",
+            "curveto",
+            "linestyle",
+            "linegradientstyle",
+            "clear",
+            "createtextfield",
+            "gettextsnapshot",
+        ]
+        .contains(&name.as_str())
+}
+
+fn construction_metadata(
+    bytes: &[u8],
+    version: u8,
+    budget: &mut usize,
+) -> Result<BTreeSet<String>> {
+    let mut reader = Reader(bytes);
+    ensure!(reader.short()? == 0, "invalid ClipActions reserved field");
+    let all = reader.event_flags(version)?;
+    let mut observed = 0;
+    let mut fields = BTreeSet::new();
+    loop {
+        *budget = budget
+            .checked_sub(1)
+            .context("AVM1 clip action work limit exceeded")?;
+        let flags = reader.event_flags(version)?;
+        if flags == 0 {
+            break;
+        }
+        // Load, Initialize, Construct. Other events require event dispatch support.
+        ensure!(
+            flags & !(0x80 | 0x4000 | 0x40000) == 0,
+            "unsupported AVM1 clip events 0x{flags:x}"
+        );
+        observed |= flags;
+        let size = reader.long()? as usize;
+        let actions = reader.take(size)?;
+        let mut compiler = Compiler {
+            labels: &BTreeMap::new(),
+            total: 1,
+            commands: vec![],
+            warnings: vec![],
+            custom_fields: Some(BTreeSet::new()),
+        };
+        compiler.block(actions, budget)?;
+        ensure!(
+            compiler.commands.is_empty() && compiler.warnings.is_empty(),
+            "AVM1 construction playback needs lifecycle execution"
+        );
+        fields.extend(compiler.custom_fields.unwrap());
+    }
+    ensure!(
+        reader.0.is_empty() && observed == all,
+        "invalid ClipActions flags or trailing bytes"
+    );
+    Ok(fields)
+}
+
 /// Translate the requested display trees only. Approved background setup remains
 /// byte-hash-bound; all other DoActions must be fully decoded. Runtime action tags
 /// are removed only after their commands have been captured for timeline baking.
@@ -247,11 +415,14 @@ pub(crate) fn prepare(
     inert: &BTreeSet<String>,
 ) -> Result<Option<Prepared>> {
     // Most SWFs have no AVM1 actions. Avoid copying their source/metadata.
-    if !swf
-        .sprites
-        .values()
-        .any(|p| swf::tags(p, 4).is_ok_and(|tags| tags.iter().any(|(code, _)| *code == 12)))
-    {
+    if !swf.sprites.values().any(|p| {
+        swf::tags(p, 4).is_ok_and(|tags| {
+            tags.iter().any(|(code, data)| {
+                *code == 12
+                    || matches!(code, 26 | 70 | 94) && data.first().is_some_and(|f| f & 128 != 0)
+            })
+        })
+    }) {
         return Ok(None);
     }
     let body = swf::decompress(source)?;
@@ -276,7 +447,39 @@ pub(crate) fn prepare(
         let Some(payload) = swf.sprites.get(&id) else {
             continue;
         };
-        let tags = swf::tags(payload, 4)?;
+        let mut tags = Vec::new();
+        let mut stripped_placement = false;
+        let mut frame = 1;
+        for (code, data) in swf::tags(payload, 4)? {
+            let data = if let Some((placement, actions)) =
+                crate::display::split_clip_actions(code, data)?
+            {
+                let fields = construction_metadata(actions, source[3], &mut budget)
+                    .with_context(|| format!("AVM1 placement: sprite {id}, frame {frame}"))?;
+                let (depth, child, _, _) =
+                    swf::instance(code, &placement)?.context("missing clip-action placement")?;
+                ensure!(
+                    child.is_some_and(|n| swf.sprites.contains_key(&n)),
+                    "AVM1 construction metadata requires an explicit MovieClip placement"
+                );
+                // The supported frame bytecode never reads custom slots; any attempted
+                // GetVariable/GetMember, function call or AS2 initializer still fails.
+                ensure!(
+                    scripts.is_empty(),
+                    "cannot omit AVM1 construction metadata beside AS3 callbacks"
+                );
+                warnings.push(format!("AVM1 nonvisual construction metadata: sprite {id}, frame {frame}, depth {depth}, fields {fields:?}"));
+                stripped_placement = true;
+                translated = true;
+                Cow::Owned(placement)
+            } else {
+                Cow::Borrowed(data)
+            };
+            tags.push((code, data));
+            if code == 1 {
+                frame += 1;
+            }
+        }
         let mut labels = BTreeMap::new();
         let mut frame = 1;
         for (code, data) in &tags {
@@ -307,9 +510,10 @@ pub(crate) fn prepare(
             total,
             commands: Vec::new(),
             warnings: Vec::new(),
+            custom_fields: None,
         };
         let mut frame = 1;
-        let mut removed = false;
+        let mut removed = stripped_placement;
         let mut frame_script = false;
         for (code, data) in tags {
             if code == 12 {
@@ -318,11 +522,11 @@ pub(crate) fn prepare(
                     "AVM1 action outside timeline: sprite {id}, frame {frame}"
                 );
                 removed = true;
-                if inert.contains(&crate::sha256(data)) {
+                if inert.contains(&crate::sha256(&data)) {
                     continue;
                 }
                 compiler
-                    .block(data, &mut budget)
+                    .block(&data, &mut budget)
                     .with_context(|| format!("AVM1 timeline: sprite {id}, frame {frame}"))?;
                 translated = true;
                 frame_script = true;
@@ -341,7 +545,7 @@ pub(crate) fn prepare(
                 frame_script = false;
                 frame += 1;
             }
-            swf::write_tag(&mut rewritten, code, data);
+            swf::write_tag(&mut rewritten, code, &data);
         }
         warnings.extend(
             compiler
@@ -369,6 +573,12 @@ pub(crate) fn prepare(
             );
         }
     }
+    let playback = programs.values().any(|class| {
+        class
+            .avm1_frames
+            .values()
+            .any(|actions| !actions.is_empty())
+    });
     let mut scripts = scripts.clone();
     let mut symbols = swf.symbols.clone();
     let mut requests = requests.to_vec();
@@ -402,6 +612,7 @@ pub(crate) fn prepare(
         scripts,
         requests,
         warnings,
+        playback,
     }))
 }
 
@@ -425,6 +636,7 @@ mod tests {
             total: 5,
             commands: vec![],
             warnings: vec![],
+            custom_fields: None,
         };
         compiler.block(bytes, &mut 1000)?;
         Ok(compiler.commands)
@@ -839,5 +1051,169 @@ mod tests {
             .warnings
             .iter()
             .any(|s| s.contains("unknown frame label")));
+    }
+
+    fn metadata_block(fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut bytes = vec![];
+        for (name, value) in fields {
+            let mut operands = vec![0];
+            operands.extend(name.as_bytes());
+            operands.extend([0, 0]);
+            operands.extend(value.as_bytes());
+            operands.push(0);
+            bytes.extend(action(0x96, &operands));
+            bytes.push(0x1d);
+        }
+        bytes.push(0);
+        bytes
+    }
+    fn clip_records(version: u8, flags: u32, block: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, 0];
+        let flag_bytes = flags.to_le_bytes();
+        let width = if version >= 6 { 4 } else { 2 };
+        bytes.extend(&flag_bytes[..width]);
+        bytes.extend(&flag_bytes[..width]);
+        bytes.extend((block.len() as u32).to_le_bytes());
+        bytes.extend(block);
+        bytes.extend(vec![0; width]);
+        bytes
+    }
+    fn scripted_place(id: u16, depth: u16, records: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0x86];
+        payload.extend(depth.to_le_bytes());
+        payload.extend(id.to_le_bytes());
+        payload.push(0);
+        payload.extend(records);
+        tag(26, &payload)
+    }
+    #[test]
+    fn accepts_literal_custom_data_for_initial_lifecycle_events() {
+        for (version, flags) in [(5, 0x80), (5, 0x4000), (6, 0x40000), (9, 0x44080)] {
+            let block = metadata_block(&[("destinationZone", "Field1"), ("spawnPad", "Right")]);
+            let fields =
+                construction_metadata(&clip_records(version, flags, &block), version, &mut 1000)
+                    .unwrap();
+            assert_eq!(
+                fields,
+                BTreeSet::from(["destinationZone".into(), "spawnPad".into()])
+            );
+        }
+    }
+    #[test]
+    fn custom_data_does_not_authorize_native_properties_paths_or_callbacks() {
+        for name in [
+            "_alpha",
+            "_visible",
+            "_x",
+            "filters",
+            "TRANSFORM",
+            "blendMode",
+            "cacheAsBitmap",
+            "scale9Grid",
+            "__proto__",
+            "prototype",
+            "constructor",
+            "onEnterFrame",
+            "stop",
+            "setMask",
+            "addProperty",
+            "this.tCell",
+            "parent:tPad",
+            "a/b",
+        ] {
+            let bytes = clip_records(9, 0x40000, &metadata_block(&[(name, "value")]));
+            assert!(
+                construction_metadata(&bytes, 9, &mut 1000).is_err(),
+                "{name}"
+            );
+        }
+        // Even otherwise valid metadata cannot silently swallow a playback instruction.
+        let mut block = metadata_block(&[("zone", "Field1")]);
+        block.pop();
+        block.extend([7, 0]);
+        assert!(construction_metadata(&clip_records(9, 0x40000, &block), 9, &mut 1000).is_err());
+        let mut block = metadata_block(&[("zone", "Field1")]);
+        block.pop();
+        block.extend([0x3d, 0]);
+        assert!(construction_metadata(&clip_records(9, 0x40000, &block), 9, &mut 1000).is_err());
+    }
+    #[test]
+    fn rejects_unhandled_events_and_malformed_clip_records() {
+        let block = metadata_block(&[("destination", "Field1")]);
+        for flags in [1, 2, 0x20000, 0x40002] {
+            assert!(construction_metadata(&clip_records(9, flags, &block), 9, &mut 1000).is_err());
+        }
+        let good = clip_records(9, 0x40000, &block);
+        for end in 0..good.len() {
+            assert!(construction_metadata(&good[..end], 9, &mut 1000).is_err());
+        }
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(construction_metadata(&extra, 9, &mut 1000).is_err());
+        let mut reserved = good.clone();
+        reserved[0] = 1;
+        assert!(construction_metadata(&reserved, 9, &mut 1000).is_err());
+        let mut flags = good;
+        flags[2] = 0x80;
+        assert!(construction_metadata(&flags, 9, &mut 1000).is_err());
+    }
+    #[test]
+    fn placement_only_metadata_keeps_geometry_and_fast_path() {
+        let left = clip_records(
+            9,
+            0x40000,
+            &metadata_block(&[("zone", "One"), ("pad", "Right")]),
+        );
+        let right = clip_records(
+            9,
+            0x40000,
+            &metadata_block(&[("zone", "Two"), ("pad", "Left")]),
+        );
+        let (bytes, swf) = movie(vec![
+            (
+                1,
+                vec![[scripted_place(2, 1, &left), scripted_place(2, 2, &right)].concat()],
+            ),
+            (2, vec![place(101, 1), place(102, 1)]),
+        ]);
+        let prepared = prepare(
+            &bytes,
+            &swf,
+            &BTreeMap::new(),
+            &[request()],
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!prepared.playback);
+        assert_eq!(prepared.swf.sprites[&2], swf.sprites[&2]);
+        let expected = movie(vec![
+            (1, vec![[place(2, 1), place(2, 2)].concat()]),
+            (2, vec![place(101, 1), place(102, 1)]),
+        ])
+        .1;
+        assert_eq!(prepared.swf.sprites[&1], expected.sprites[&1]);
+        let normalized = timeline::normalize(&bytes, &swf, &BTreeMap::new(), &[request()]).unwrap();
+        assert_eq!(
+            Swf::parse(&normalized.bytes).unwrap().sprites,
+            expected.sprites
+        );
+        assert_eq!(normalized.warnings.len(), 2);
+    }
+    #[test]
+    fn omitted_custom_data_cannot_be_read_by_animation_code() {
+        let records = clip_records(9, 0x40000, &metadata_block(&[("pose", "2")]));
+        let mut read = action(0x96, b"\x00pose\0");
+        read.push(0x1c);
+        read.extend(action(0x9f, &[1]));
+        read.push(0);
+        let (bytes, swf) = movie(vec![
+            (1, vec![scripted_place(2, 1, &records)]),
+            (2, vec![actions(&read), vec![]]),
+        ]);
+        let err = timeline::normalize(&bytes, &swf, &BTreeMap::new(), &[request()])
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("opcode 0x1c"));
     }
 }

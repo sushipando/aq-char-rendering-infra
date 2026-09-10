@@ -55,12 +55,25 @@ pub async fn collect(store: &dyn Store, bucket: &str, event: &Value) -> Result<V
             if result["empty"] != true {
                 ensure!(result["x"].as_i64().is_some() && result["y"].as_i64().is_some(), "missing placement for {id}");
                 ensure!(result["component_raster_space"] == manifest["component_raster_space"], "component coordinate space mismatch for {id}");
-                let png_key = format!("jobs/{job}/component/rasters/{id}.png");
-                ensure!(string(&result, "png_key")? == png_key, "unexpected PNG key for {id}");
-                let sha = string(&result, "sha256")?;
-                ensure!(sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit()), "invalid PNG checksum for {id}");
+                let layers = result.get("layers").and_then(Value::as_array);
+                if let Some(layers) = layers.filter(|v| !v.is_empty()) {
+                    ensure!(layers.len() <= 128 && result["png_key"].is_null(), "invalid layered component {id}");
+                    for (index,layer) in layers.iter().enumerate() {
+                        let png_key = format!("jobs/{job}/component/rasters/{id}-layer-{index}.png");
+                        ensure!(string(layer,"png_key")? == png_key, "unexpected layer PNG key for {id}");
+                        ensure!(matches!(layer["blend_mode"].as_str(),Some("normal" | "add")), "invalid layer blend for {id}");
+                        ensure!(layer["x"].as_i64().is_some() && layer["y"].as_i64().is_some(), "missing layer placement for {id}");
+                        let sha = string(layer,"sha256")?;
+                        ensure!(sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit()), "invalid layer checksum for {id}");
+                    }
+                } else {
+                    let png_key = format!("jobs/{job}/component/rasters/{id}.png");
+                    ensure!(string(&result, "png_key")? == png_key, "unexpected PNG key for {id}");
+                    let sha = string(&result, "sha256")?;
+                    ensure!(sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit()), "invalid PNG checksum for {id}");
+                }
             }
-            let fields = ["task_id", "empty", "png_key", "sha256", "x", "y", "component_raster_space"];
+            let fields = ["task_id", "empty", "png_key", "sha256", "x", "y", "component_raster_space", "layers"];
             let compact: serde_json::Map<String, Value> = fields.into_iter()
                 .filter_map(|name| result.get(name).map(|value| (name.into(), value.clone()))).collect();
             Ok::<_, anyhow::Error>(Value::Object(compact))
@@ -112,6 +125,26 @@ mod tests {
     }
     fn event(job: &str) -> Value {
         json!({"job_id":job,"manifest_key":format!("jobs/{job}/prepare/manifest.json")})
+    }
+
+    #[tokio::test]
+    async fn layered_handoff_keeps_order_and_rejects_foreign_rasters() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = FsStore(dir.path().into());
+        fixture(&store,1).await?;
+        let result_key = format!("jobs/{JOB}/component/results/t0.json");
+        let record = json!({"task_id":"t0","empty":false,"x":0,"y":0,"component_raster_space":"output","result_key":result_key,
+            "layers":[{"png_key":format!("jobs/{JOB}/component/rasters/t0-layer-0.png"),"sha256":"a".repeat(64),"x":4,"y":5,"blend_mode":"add"}]});
+        store::write(&store,"work",&result_key,&record,false).await?;
+        let output = collect(&store,"work",&event(JOB)).await?;
+        let saved: Value = store::read(&store,"work",string(&output,"manifest_key")?).await?;
+        assert_eq!(saved["component_results"][0]["layers"],record["layers"]);
+        for (field,value) in [("png_key",json!("jobs/foreign/component/rasters/t0-layer-0.png")),("blend_mode",json!("typo")),("sha256",json!("bad"))] {
+            let mut bad = record.clone();bad["layers"][0][field] = value;
+            store::write(&store,"work",&result_key,&bad,false).await?;
+            assert!(collect(&store,"work",&event(JOB)).await.is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]
