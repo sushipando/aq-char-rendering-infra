@@ -821,6 +821,29 @@ pub fn calibrate_minimum_strokes(root: &mut Node, minimum_pixels: f64) -> usize 
     let Some(viewport_scale) = svg_viewport_scale(root) else {
         return 0;
     };
+    calibrate_minimum_strokes_at_scale(root, viewport_scale, minimum_pixels)
+}
+
+/// Calibrate a complete, zoom-1 FFDec export whose authored transforms remain
+/// intact (for example, bundled charpage artwork). FFDec's compensated widths
+/// already account for transforms inside the export. Only the additional scale
+/// from exported pixels to output pixels is needed here.
+/// Returns (calibrated paths, malformed markers).
+pub fn calibrate_exported_minimum_strokes(root: &mut Node, output_scale: f64) -> (usize, usize) {
+    if !output_scale.is_finite() || output_scale <= 0.0 {
+        return (0, 1);
+    }
+    let mut malformed = 0;
+    stroke_pass(root, 1.0, 1.0, 1.0, &mut malformed);
+    let calibrated = calibrate_minimum_strokes_at_scale(root, output_scale, 1.0);
+    (calibrated, malformed)
+}
+
+fn calibrate_minimum_strokes_at_scale(
+    root: &mut Node,
+    viewport_scale: f64,
+    minimum_pixels: f64,
+) -> usize {
     if !minimum_pixels.is_finite() || minimum_pixels <= 0.0 {
         return 0;
     }

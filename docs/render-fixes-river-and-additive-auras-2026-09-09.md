@@ -133,15 +133,19 @@ were performed during the investigation. After deployment:
 
 ## Separate finding: charpage icon outlines
 
-The left information-panel icons currently bypass character stroke calibration.
+**Follow-up:** this gap is now fixed; see
+[charpage icon stroke correction](charpage-icon-strokes-2026-09-09.md).
+The original investigation below describes the behavior before that correction.
+
+The left information-panel icons bypassed character stroke calibration.
 [charpage.rs](../services/pipeline-rust/src/charpage.rs) renders the bundled
 `chrome.svgz` and faction SVGs directly. Character assets use
 `prepare_minimum_strokes` and `calibrate_minimum_strokes` in the component import
 and build path.
 
 The equipment chrome has five FFDec minimum-stroke markers; Good has six and
-Chaos has ten. Those compensated widths currently enlarge with output scale.
+Chaos has ten. Those compensated widths enlarged with output scale.
 The numeric widths inside SVG definitions must be interpreted with their
 transforms, not as final screen pixels. Evil has no such markers or stroked
-paths: its outlines are filled geometry. The icon calibration gap is confirmed
-and remains unchanged in this fix.
+paths: its outlines are filled geometry. The River/additive-aura commit did not
+change these icons; the follow-up corrects them and also covers Neutral.

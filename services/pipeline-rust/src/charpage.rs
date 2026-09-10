@@ -4,7 +4,7 @@ use anyhow::{ensure, Context, Result};
 use resvg::{tiny_skia, usvg};
 use serde_json::{json, Value};
 
-pub const POLICY: &str = "charpage-v3-border-options";
+pub const POLICY: &str = "charpage-v4-icon-strokes";
 // characterB stage is 550x350; pMC is registered at (338.05, 304.2).
 pub const VIEWBOX: [f64; 4] = [-338.05, -304.2, 550.0, 350.0];
 const BACKGROUNDS: &[&[u8]] = &[
@@ -65,6 +65,33 @@ fn options() -> usvg::Options<'static> {
     options
 }
 
+fn drawing_tree(bytes: &[u8], options: &usvg::Options, scale: f32) -> Result<usvg::Tree> {
+    use aqw_component_raster::{import::calibrate_exported_minimum_strokes, svg};
+    use std::borrow::Cow;
+
+    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        Cow::Owned(usvg::decompress_svgz(bytes)?)
+    } else {
+        Cow::Borrowed(bytes)
+    };
+    // Generated text and artwork with filled outlines have no FFDec markers.
+    // Keep their original parse/render path, including authored text strokes.
+    let marker = b"has-small-stroke";
+    if !bytes.windows(marker.len()).any(|window| window == marker) {
+        return Ok(usvg::Tree::from_data(&bytes, options)?);
+    }
+    // build_charpage_assets.py exports at zoom 1, retaining the full placement
+    // transforms. Use the character renderer's calibration before usvg expands
+    // <use> references and converts strokes to render geometry.
+    let mut document = svg::parse(&bytes)?;
+    let (_, malformed) = calibrate_exported_minimum_strokes(&mut document.root, scale as f64);
+    ensure!(malformed == 0, "invalid charpage minimum-stroke metadata");
+    Ok(usvg::Tree::from_data(
+        svg::serialize(&document).as_bytes(),
+        options,
+    )?)
+}
+
 fn draw(
     bytes: &[u8],
     options: &usvg::Options,
@@ -72,8 +99,8 @@ fn draw(
     x: f32,
     y: f32,
 ) -> Result<()> {
-    let tree = usvg::Tree::from_data(bytes, options)?;
     let scale = (canvas.width() as f32 / 550.0).min(canvas.height() as f32 / 350.0);
+    let tree = drawing_tree(bytes, options, scale)?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, x * scale, y * scale),
@@ -328,6 +355,9 @@ pub async fn prepare(
     }
     Ok(record)
 }
+
+#[cfg(test)]
+mod stroke_tests;
 
 #[cfg(test)]
 mod tests {
